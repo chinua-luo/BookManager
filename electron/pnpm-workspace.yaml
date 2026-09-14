@@ -1,0 +1,13 @@
+minimumReleaseAgeExclude:
+  - '@file-viewer/core@3.0.2'
+  - '@file-viewer/doc@3.0.2'
+  - '@file-viewer/pptx@3.0.2'
+  - '@file-viewer/renderer-epub@3.0.2'
+  - '@file-viewer/renderer-image@3.0.2'
+  - '@file-viewer/renderer-pdf@3.0.2'
+  - '@file-viewer/renderer-pptx@3.0.2'
+  - '@file-viewer/renderer-spreadsheet@3.0.2'
+  - '@file-viewer/renderer-text@3.0.2'
+  - '@file-viewer/renderer-word@3.0.2'
+  - '@file-viewer/vite-plugin@3.0.2'
+  - '@file-viewer/web@3.0.2'

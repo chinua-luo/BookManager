@@ -1,0 +1,27 @@
+{
+  "name": "bookmanager-electron",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "main.mjs",
+  "scripts": {
+    "build": "vite build",
+    "start": "pnpm build && electron .",
+    "dev": "vite --host 127.0.0.1"
+  },
+  "dependencies": {
+    "@file-viewer/renderer-epub": "3.0.2",
+    "@file-viewer/renderer-image": "3.0.2",
+    "@file-viewer/renderer-pdf": "3.0.2",
+    "@file-viewer/renderer-pptx": "3.0.2",
+    "@file-viewer/renderer-spreadsheet": "3.0.2",
+    "@file-viewer/renderer-text": "3.0.2",
+    "@file-viewer/renderer-word": "3.0.2",
+    "@file-viewer/web": "3.0.2"
+  },
+  "devDependencies": {
+    "@file-viewer/vite-plugin": "3.0.2",
+    "electron": "44.2.0",
+    "vite": "8.0.0"
+  }
+}
