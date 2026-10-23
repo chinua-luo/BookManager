@@ -54,6 +54,7 @@ Electron 只通过 `document_id` 请求文件，Python 后端负责解析实际 
 - `items`：文件夹内的镜像文件，保存名称、备注、标签和文档引用。
 
 替换某个文档的底层内容后，所有引用该 `document` 的镜像会同步更新。
+使用系统默认程序打开文件后，可点击“保存打开缓存改动”，主动将已修改的缓存副本按新 Hash 写回底层文件；所有镜像随即同步更新。
 
 ## 安装与运行
 
@@ -77,7 +78,13 @@ pnpm start
 python run.py
 ```
 
-Windows 可双击 `start_windows.bat`。macOS/Linux 可使用 `python3 run.py`。PDF 处理需要 PyMuPDF，DJVU 完整预览需要系统安装 DjVuLibre。
+Windows 可双击 `start_windows.bat`。macOS 可以生成一个不显示终端的桌面快捷方式：
+
+```bash
+python3 tools/create_macos_launcher.py
+```
+
+生成后可直接双击桌面的 `BookManager.app`。该快捷方式和实际 Electron 程序使用同一个应用身份，重复打开只会聚焦现有窗口，固定到程序坞后也不会产生第二个图标。首次更新旧快捷方式后，需要从程序坞移除旧图标，再将当前图标固定一次。快捷方式依赖当前项目位置，移动项目或更换 Python 环境后需要重新生成。Linux 可使用 `python3 run.py`。程序仅启动 Electron 界面；PDF 元数据提取使用 `pypdf`。DJVU 由 Electron 内置的 DjVu.js 直接预览，不依赖 PyMuPDF 或系统 DjVuLibre。若希望从 DJVU 文本层自动提取命名信息，仍可选装 DjVuLibre 的 `djvutxt`。
 
 ## 数据目录
 
@@ -100,8 +107,10 @@ tmp/             导入和渲染过程中的临时文件
 当前基础验证命令：
 
 ```bash
+python -m unittest discover -s tests -v
 python -m compileall -q bookmanager run.py
 cd electron
+pnpm test
 pnpm build
 ```
 

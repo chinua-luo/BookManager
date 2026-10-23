@@ -16,10 +16,12 @@ The preview build includes only these File Viewer renderers:
 - XLSX / spreadsheet
 - PPTX
 - Common images and text
+- DJVU (DjVu.js, executed locally in Electron)
 
-DJVU remains a Python-side fallback. The bridge renders its first two pages using
-the existing PyMuPDF/DjVuLibre path and passes only the rendered page images to the
-Electron renderer.
+DJVU uses the vendored DjVu.js library and viewer. It reads the same authenticated
+`document_id` URL as the other renderers, decodes in a Web Worker, and presents a
+continuous-scroll preview. It does not expose the Blob path and does not require
+PyMuPDF or a system DjVuLibre installation for previewing.
 
 ## Development
 
@@ -35,3 +37,6 @@ and `py -3` on Windows. Set `BOOKMANAGER_PYTHON` to override the Python executab
 
 The bridge follows the data location selected by the existing Python application.
 Set `BOOKMANAGER_DATA_HOME` only when testing a different library location.
+
+Third-party browser assets and their licenses are listed in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
+import sys
 import zipfile
 from dataclasses import dataclass
 from html import unescape
@@ -11,6 +13,7 @@ from typing import Optional
 from xml.etree import ElementTree
 
 from .epub import epub_member_index, epub_package_dir, resolve_epub_member
+from .file_security import validate_supported_document
 from .naming import StructuredFileName, infer_structured_file_name, parse_edition_number, split_series_number
 
 
@@ -27,11 +30,36 @@ class MetadataResult:
 def extract_metadata(path: Path, max_pages: int = 5) -> MetadataResult:
     path = Path(path)
     fallback = infer_structured_file_name(path.name)
+    if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+        return MetadataResult(fallback, False, "当前格式暂不支持内容提取，已使用文件名识别。")
+    try:
+        validate_supported_document(path)
+        completed = subprocess.run(
+            [sys.executable, "-m", "bookmanager.metadata_worker", str(path.resolve()), str(max_pages)],
+            capture_output=True,
+            text=True,
+            timeout=40,
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else "解析进程异常退出"
+            raise ValueError(detail[:300])
+        payload = json.loads(completed.stdout)
+        parts = StructuredFileName(**payload["parts"])
+        return MetadataResult(parts, bool(payload["extracted"]), str(payload["message"]))
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
+        return MetadataResult(fallback, False, f"内容提取失败，已使用文件名识别：{exc}")
+
+
+def _extract_metadata_in_process(path: Path, max_pages: int = 5) -> MetadataResult:
+    path = Path(path)
+    fallback = infer_structured_file_name(path.name)
     suffix = path.suffix.lower()
     if suffix not in SUPPORTED_EXTENSIONS:
         return MetadataResult(fallback, False, "当前格式暂不支持内容提取，已使用文件名识别。")
 
     try:
+        validate_supported_document(path)
         if suffix == ".epub":
             return _extract_epub(path, fallback, max_pages)
         if suffix == ".pdf":
@@ -136,14 +164,7 @@ def _extract_pdf(path: Path, fallback: StructuredFileName, max_pages: int) -> Me
         text = "\n".join((page.extract_text() or "") for page in reader.pages[:max_pages])
         backend = "pypdf"
     except Exception:
-        try:
-            import pymupdf  # type: ignore
-
-            with pymupdf.open(str(path)) as document:
-                text = "\n".join(document[index].get_text() for index in range(min(max_pages, document.page_count)))
-            backend = "PyMuPDF"
-        except Exception:
-            return MetadataResult(fallback, False, "未安装 pypdf/PyMuPDF，或 PDF 没有可提取文本；请手动输入。")
+        return MetadataResult(fallback, False, "未安装 pypdf，或 PDF 没有可提取文本；请手动输入。")
 
     parts = _parts_from_metadata_text(fallback=fallback, text=text)
     if not text.strip():

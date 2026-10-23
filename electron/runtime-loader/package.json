@@ -1,0 +1,6 @@
+{
+  "name": "bookmanager-electron-loader",
+  "private": true,
+  "type": "module",
+  "main": "loader.mjs"
+}

@@ -61,8 +61,12 @@ def start_electron() -> bool:
     return True
 
 
-if __name__ == "__main__":
-    if not start_electron():
-        from bookmanager.app import main as tkinter_main
+def main() -> int:
+    if start_electron():
+        return 0
+    print("BookManager requires the bundled Electron runtime for this platform.")
+    return 1
 
-        tkinter_main()
+
+if __name__ == "__main__":
+    raise SystemExit(main())

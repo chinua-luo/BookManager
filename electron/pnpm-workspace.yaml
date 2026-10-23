@@ -11,3 +11,5 @@ minimumReleaseAgeExclude:
   - '@file-viewer/renderer-word@3.0.2'
   - '@file-viewer/vite-plugin@3.0.2'
   - '@file-viewer/web@3.0.2'
+overrides:
+  dompurify: 3.4.17

@@ -7,6 +7,8 @@ import mimetypes
 import os
 import shutil
 import sqlite3
+import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +20,7 @@ from .naming import (
     normalize_structured_file_name,
     parse_structured_file_name,
 )
+from .file_security import validate_supported_document
 
 
 PROJECT_LIBRARY_HOME = Path(__file__).resolve().parent.parent
@@ -33,6 +36,7 @@ LIBRARY_DATA_NAMES = (
     "open_cache",
     "render_cache",
     "tmp",
+    "logs",
 )
 
 CACHE_POLICIES = {
@@ -74,6 +78,8 @@ CACHE_POLICIES = {
 }
 CACHE_POLICY_NAMES = tuple(CACHE_POLICIES)
 OPEN_CACHE_MANIFEST = ".bookmanager-open.json"
+_BLOB_WRITE_LOCK = threading.RLock()
+MAX_SEARCH_SCAN_ROWS = 50_000
 
 
 def resolve_default_library_home() -> tuple[Path, bool]:
@@ -203,6 +209,42 @@ def sha256_file(path: Path) -> tuple[str, int]:
             size += len(chunk)
             digest.update(chunk)
     return digest.hexdigest(), size
+
+
+def _atomic_copy_verified(source_path: Path, target_path: Path, expected_hash: str) -> None:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    with _BLOB_WRITE_LOCK:
+        if target_path.is_symlink():
+            raise ValueError("拒绝写入软链接目标")
+        if target_path.exists():
+            current_hash, _size = sha256_file(target_path)
+            if current_hash == expected_hash:
+                return
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=".bookmanager-tmp-",
+                dir=target_path.parent,
+                delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                with source_path.open("rb") as source:
+                    shutil.copyfileobj(source, temporary, length=1024 * 1024)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            copied_hash, _size = sha256_file(temporary_path)
+            if copied_hash != expected_hash:
+                raise OSError("Blob 完整性校验失败")
+            try:
+                temporary_path.chmod(0o600)
+            except OSError:
+                pass
+            os.replace(temporary_path, target_path)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -351,15 +393,44 @@ class LibraryStore:
         self.db_path = self.home / "library.db"
         self.home.mkdir(parents=True, exist_ok=True)
         self.blob_dir.mkdir(parents=True, exist_ok=True)
+        self._secure_library_permissions()
+        self._cleanup_stale_temporary_files()
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self._init_schema()
+        self._secure_library_permissions()
         if self.migrated_legacy_library:
             self._rewrite_legacy_blob_paths()
 
     def close(self) -> None:
         self.conn.close()
+
+    def _secure_library_permissions(self) -> None:
+        for directory in (self.home, self.blob_dir):
+            try:
+                directory.chmod(0o700)
+            except OSError:
+                pass
+        for path in (self.db_path, self.db_path.with_name("library.db-wal"), self.db_path.with_name("library.db-shm")):
+            if path.exists() and not path.is_symlink():
+                try:
+                    path.chmod(0o600)
+                except OSError:
+                    pass
+
+    def _cleanup_stale_temporary_files(self) -> None:
+        cutoff = time.time() - 24 * 60 * 60
+        temporary_paths = list(self.blob_dir.rglob(".bookmanager-tmp-*"))
+        temporary_root = self.home / "tmp"
+        if temporary_root.is_dir() and not temporary_root.is_symlink():
+            temporary_paths.extend(path for path in temporary_root.rglob("*") if path.is_file())
+        for path in temporary_paths:
+            try:
+                if not path.is_symlink() and path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                continue
 
     def shortcuts(self) -> dict[str, str]:
         rows = self.conn.execute("SELECT action_id, accelerator FROM shortcuts").fetchall()
@@ -519,13 +590,17 @@ class LibraryStore:
             return 0
 
         changed_count = 0
-        entries: list[tuple[float, Path]] = []
+        entries: list[tuple[int, Path]] = []
         for entry in cache_root.iterdir():
             if not entry.is_dir() or entry.is_symlink():
                 continue
             try:
-                entries.append((entry.stat().st_mtime, entry))
-            except OSError:
+                manifest = json.loads((entry / OPEN_CACHE_MANIFEST).read_text(encoding="utf-8"))
+                file_name = str(manifest["file_name"])
+                if Path(file_name).name != file_name:
+                    continue
+                entries.append(((entry / file_name).stat().st_mtime_ns, entry))
+            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
                 continue
 
         # Later-edited open copies win when the same document was opened twice.
@@ -538,7 +613,6 @@ class LibraryStore:
         try:
             manifest = json.loads((cache_dir / OPEN_CACHE_MANIFEST).read_text(encoding="utf-8"))
             document_id = int(manifest["document_id"])
-            source_hash = str(manifest["source_hash"])
             file_name = str(manifest["file_name"])
         except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
             return False
@@ -552,9 +626,6 @@ class LibraryStore:
             cached_hash, _size = sha256_file(cached_path)
         except OSError:
             return False
-        if cached_hash == source_hash:
-            return False
-
         row = self.conn.execute(
             "SELECT current_hash FROM documents WHERE id = ?", (document_id,)
         ).fetchone()
@@ -1081,6 +1152,9 @@ class LibraryStore:
         tags: Iterable[str] | str = (),
     ) -> int:
         source_path = Path(source_path)
+        if source_path.is_symlink() or not source_path.is_file():
+            raise ValueError("文件路径无效或为软链接")
+        validate_supported_document(source_path)
         blob_hash, size = sha256_file(source_path)
         mime = mimetypes.guess_type(str(source_path))[0] or "application/octet-stream"
         extension = source_path.suffix.lower()
@@ -1119,6 +1193,8 @@ class LibraryStore:
         ).fetchone()
         if existing is not None:
             stored_path = Path(existing["stored_path"])
+            if stored_path.is_symlink():
+                raise ValueError("底层文件不能是软链接")
             if extension and stored_path.exists() and not stored_path.suffix:
                 renamed_path = stored_path.with_name(f"{stored_path.name}{extension}")
                 if not renamed_path.exists():
@@ -1130,15 +1206,13 @@ class LibraryStore:
                             (str(stored_path), extension, mime, blob_hash),
                         )
             elif not stored_path.exists():
-                stored_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source_path, stored_path)
+                _atomic_copy_verified(source_path, stored_path, blob_hash)
             return stored_path
 
         subdir = self.blob_dir / blob_hash[:2]
         subdir.mkdir(parents=True, exist_ok=True)
         stored_path = subdir / f"{blob_hash}{extension}"
-        if not stored_path.exists():
-            shutil.copy2(source_path, stored_path)
+        _atomic_copy_verified(source_path, stored_path, blob_hash)
         with self.conn:
             self.conn.execute(
                 """
@@ -1283,6 +1357,9 @@ class LibraryStore:
 
     def replace_document_content(self, document_id: int, source_path: Path) -> int:
         source_path = Path(source_path)
+        if source_path.is_symlink() or not source_path.is_file():
+            raise ValueError("文件路径无效或为软链接")
+        validate_supported_document(source_path)
         blob_hash, size = sha256_file(source_path)
         mime = mimetypes.guess_type(str(source_path))[0] or "application/octet-stream"
         extension = source_path.suffix.lower()
@@ -1308,20 +1385,6 @@ class LibraryStore:
                 (now, document_id),
             )
         return document_id
-
-    def replace_document_text(self, document_id: int, text: str, preferred_name: str) -> int:
-        suffix = Path(preferred_name).suffix or ".txt"
-        tmp = self.home / "tmp"
-        tmp.mkdir(exist_ok=True)
-        path = tmp / safe_name(f"edited{suffix}")
-        path.write_text(text, encoding="utf-8")
-        try:
-            return self.replace_document_content(document_id, path)
-        finally:
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
 
     def search(self, keyword: str) -> list[tuple[str, Item]]:
         keyword = keyword.strip()
@@ -1359,7 +1422,9 @@ class LibraryStore:
         main_title: str = "",
         subtitle: str = "",
         authors: str = "",
+        limit: int = 500,
     ) -> list[tuple[str, Item]]:
+        limit = max(1, min(int(limit), 5000))
         filters = (main_title.strip().lower(), subtitle.strip().lower(), authors.strip().lower())
         rows = self.conn.execute(
             """
@@ -1369,7 +1434,9 @@ class LibraryStore:
             JOIN documents d ON d.id = i.document_id
             JOIN blobs b ON b.sha256 = d.current_hash
             ORDER BY i.display_name
-            """
+            LIMIT ?
+            """,
+            (MAX_SEARCH_SCAN_ROWS,),
         ).fetchall()
         grouped: dict[int, list[Item]] = {}
         for row in rows:
@@ -1381,7 +1448,10 @@ class LibraryStore:
             matching_mirrors = [item for item in mirrors if structured_name_matches(item.name_parts, filters)]
             if not matching_mirrors:
                 continue
-            results.extend((self.folder_path(item.folder_id), item) for item in mirrors)
+            remaining = limit - len(results)
+            results.extend((self.folder_path(item.folder_id), item) for item in mirrors[:remaining])
+            if len(results) >= limit:
+                break
 
         return sorted(results, key=lambda result: (result[1].display_name.lower(), result[0].lower()))
 
@@ -1390,7 +1460,9 @@ class LibraryStore:
         main_title: str = "",
         subtitle: str = "",
         authors: str = "",
+        limit: int = 500,
     ) -> list[tuple[str, Item]]:
+        limit = max(1, min(int(limit), 5000))
         filters = (main_title.strip().lower(), subtitle.strip().lower(), authors.strip().lower())
         rows = self.conn.execute(
             """
@@ -1400,17 +1472,21 @@ class LibraryStore:
             JOIN documents d ON d.id = i.document_id
             JOIN blobs b ON b.sha256 = d.current_hash
             ORDER BY i.display_name
-            """
+            LIMIT ?
+            """,
+            (MAX_SEARCH_SCAN_ROWS,),
         ).fetchall()
-        results = [
-            (self.folder_path(item.folder_id), item)
-            for row in rows
-            for item in [self._item_from_row(row)]
-            if structured_name_matches(item.name_parts, filters)
-        ]
+        results: list[tuple[str, Item]] = []
+        for row in rows:
+            item = self._item_from_row(row)
+            if structured_name_matches(item.name_parts, filters):
+                results.append((self.folder_path(item.folder_id), item))
+                if len(results) >= limit:
+                    break
         return sorted(results, key=lambda result: (result[1].display_name.lower(), result[0].lower()))
 
-    def search_tagged_items(self, tag_query: str) -> list[tuple[str, Item]]:
+    def search_tagged_items(self, tag_query: str, limit: int = 500) -> list[tuple[str, Item]]:
+        limit = max(1, min(int(limit), 5000))
         query = tag_query.strip()
         if not query:
             return []
@@ -1425,8 +1501,9 @@ class LibraryStore:
             JOIN tags t ON t.id = it.tag_id
             WHERE lower(t.name) LIKE ?
             ORDER BY i.display_name
+            LIMIT ?
             """,
-            (f"%{query.lower()}%",),
+            (f"%{query.lower()}%", limit),
         ).fetchall()
         results = [(self.folder_path(row["folder_id"]), self._item_from_row(row)) for row in rows]
         return sorted(results, key=lambda result: (result[1].display_name.lower(), result[0].lower()))

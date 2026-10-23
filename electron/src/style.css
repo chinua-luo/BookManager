@@ -57,11 +57,12 @@ h2 { font-size: 13px; }
 .preview-panel { display: grid; grid-template-rows: 36px minmax(0, 1fr); min-width: 0; min-height: 0; overflow: hidden; padding: 10px 12px; }
 .preview-surface { min-width: 0; min-height: 0; overflow: hidden; background: #fff; border: 1px solid #d9dfe2; }
 .viewer-host { width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden; }
+.viewer-host[hidden], .djvu-viewer-host[hidden] { display: none !important; }
+.text-preview { width: 100%; height: 100%; margin: 0; overflow: auto; padding: 14px; white-space: pre-wrap; color: #26353e; background: #fff; font: 13px/1.55 ui-monospace, Menlo, monospace; }
 .folder-summary { max-width: 440px; margin: 36px auto; padding: 20px; }
 .folder-summary dl { display: grid; grid-template-columns: 1fr auto; gap: 10px 20px; }
 .folder-summary dt { color: #69737b; }.folder-summary dd { margin: 0; font-variant-numeric: tabular-nums; }
-.djvu-preview { display: grid; justify-items: center; gap: 16px; padding: 16px; background: #e8ecee; }
-.djvu-preview img { max-width: 100%; height: auto; box-shadow: 0 1px 5px #0004; }
+.djvu-viewer-host { width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden; background: #e8ecee; }
 .epub-preview { display: grid; justify-items: center; gap: 16px; height: 100%; overflow: auto; padding: 16px; background: #e8ecee; }
 .epub-preview img { max-width: 100%; height: auto; box-shadow: 0 1px 5px #0004; }
 .epub-preview pre { width: min(820px, 100%); margin: 0; padding: 18px; overflow: auto; white-space: pre-wrap; color: #26353e; background: #fff; font: 14px/1.6 ui-monospace, Menlo, monospace; }

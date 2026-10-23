@@ -6,6 +6,9 @@ import pptxRenderer from '@file-viewer/renderer-pptx'
 import spreadsheetRenderer from '@file-viewer/renderer-spreadsheet'
 import textRenderer from '@file-viewer/renderer-text'
 import wordRenderer from '@file-viewer/renderer-word'
+import { createDjvuPreview, isDjvuExtension } from './djvu-preview.js'
+import { bindFileActivation } from './file-activation.js'
+import { createPreviewCoordinator } from './preview-coordinator.js'
 import './style.css'
 
 const $ = selector => document.querySelector(selector)
@@ -15,7 +18,7 @@ const previewTitle = $('#preview-title'); const preview = $('#preview'); const s
 const appMenu = $('#app-menu'); const contextElement = $('#context-menu'); const modalRoot = $('#modal-root')
 const workspace = $('.workspace'); const workspaceSplitter = $('#workspace-splitter')
 const textExtensions = new Set(['.txt', '.md', '.py', '.json', '.xml', '.html', '.htm', '.css', '.js', '.csv', '.log'])
-let tree = []; let selectedFolderId = null; let selectedItem = null; let contextTarget = null; let editable = null; let shortcuts = {}
+let tree = []; let selectedFolderId = null; let selectedItem = null; let contextTarget = null; let shortcuts = {}; let doubleClickDelayMs = 600
 const sortModes = new Map()
 
 function setSidebarWidth(requestedWidth, persist = false) {
@@ -56,10 +59,13 @@ window.addEventListener('resize', () => {
 
 const viewerHost = document.createElement('div'); viewerHost.className = 'viewer-host'; preview.append(viewerHost)
 const viewer = mountViewer(viewerHost, { options: { rendererMode: 'replace', renderers: [pdfRenderer, wordRenderer, spreadsheetRenderer, pptxRenderer, ebookRenderer, imageRenderer, textRenderer], locale: 'zh-CN', theme: 'light', toolbar: false, search: false, fit: 'width', pdf: { defaultNavigationVisible: false, thumbnails: false } } })
+viewerHost.hidden = true
+const djvuHost = document.createElement('div'); djvuHost.className = 'djvu-viewer-host'; djvuHost.hidden = true; preview.append(djvuHost)
+const djvuPreview = createDjvuPreview(djvuHost)
 
 function message(value) { status.textContent = value }
 function error(errorValue) { console.error(errorValue); message(`操作失败：${errorValue instanceof Error ? errorValue.message : errorValue}`) }
-function html(value) { return String(value).replace(/[&<>'"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]) }
+function element(tag, className = '', text = '') { const node = document.createElement(tag); if (className) node.className = className; node.textContent = String(text); return node }
 function size(value) { const units = ['B', 'KB', 'MB', 'GB']; let number = Number(value) || 0; for (const unit of units) { if (number < 1024 || unit === 'GB') return unit === 'B' ? `${number} B` : `${number.toFixed(1)} ${unit}`; number /= 1024 } }
 function closeMenus() { appMenu.querySelectorAll('details').forEach(menu => { menu.open = false }) }
 function findFolder(id, nodes = tree, parents = []) { for (const folder of nodes) { if (folder.id === id) return { folder, parents }; const found = findFolder(id, folder.children || [], [...parents, folder]); if (found) return found } return null }
@@ -80,17 +86,59 @@ function setPreviewTitle(title) {
     })
   })
 }
-function clearPreview() { editable = null; viewerHost.hidden = true; preview.replaceChildren() }
-function showPreviewNode(node) { clearPreview(); preview.replaceChildren(node) }
-function showViewerHost() { clearPreview(); preview.replaceChildren(viewerHost); viewerHost.hidden = false }
-function folderSummary(payload) { setPreviewTitle(payload.folder.name); const section = document.createElement('section'); section.className = 'folder-summary'; section.innerHTML = `<h2>文件夹信息</h2><dl><dt>子文件夹</dt><dd>${payload.stats.folderCount}</dd><dt>内部文件</dt><dd>${payload.stats.itemCount}</dd><dt>底层唯一文件</dt><dd>${payload.stats.uniqueDocumentCount}</dd><dt>占用空间</dt><dd>${size(payload.stats.uniqueSize)}</dd></dl>`; showPreviewNode(section) }
+function clearPreview() { viewerHost.hidden = true; djvuHost.hidden = true; [...preview.children].forEach(node => { if (node !== viewerHost && node !== djvuHost) node.remove() }) }
+function showPreviewNode(node) { clearPreview(); preview.append(node) }
+function showViewerHost() { clearPreview(); viewerHost.hidden = false }
+function showDjvuHost() { clearPreview(); djvuHost.hidden = false }
+
+function waitForViewerLayout(isCurrent) {
+  return new Promise(resolve => {
+    const check = () => {
+      if (!isCurrent()) { resolve(false); return }
+      const bounds = viewerHost.getBoundingClientRect()
+      if (viewerHost.isConnected && bounds.width > 0 && bounds.height > 0) { resolve(true); return }
+      requestAnimationFrame(check)
+    }
+    check()
+  })
+}
+
+const previewCoordinator = createPreviewCoordinator({
+  keyOf: item => `${item.documentId}:${String(item.extension).toLowerCase()}`,
+  load: async (item, isCurrent) => {
+    const extension = item.extension.toLowerCase()
+    if (textExtensions.has(extension)) {
+      const url = await window.bookManager.documentUrl(item.documentId)
+      const content = await fetch(url).then(response => response.text())
+      if (!isCurrent()) return
+      const textPreview = document.createElement('pre'); textPreview.className = 'text-preview'; textPreview.textContent = content; showPreviewNode(textPreview)
+      return
+    }
+    if (isDjvuExtension(extension)) {
+      showDjvuHost()
+      const url = await window.bookManager.documentUrl(item.documentId)
+      if (isCurrent()) await djvuPreview.load(url, item.displayName)
+      return
+    }
+    showViewerHost()
+    if (!(await waitForViewerLayout(isCurrent))) return
+    const url = await window.bookManager.documentUrl(item.documentId)
+    if (!isCurrent()) return
+    await viewer.load({ url, filename: item.displayName, size: item.size })
+    if (isCurrent() && viewerHost.getBoundingClientRect().width > 0) {
+      await viewer.fitToView({ mode: 'width', resize: 'until-interaction' })
+    }
+  }
+})
+
+function folderSummary(payload) { previewCoordinator.invalidate(); setPreviewTitle(payload.folder.name); const section = element('section', 'folder-summary'); const details = document.createElement('dl'); for (const [label, value] of [['子文件夹', payload.stats.folderCount], ['内部文件', payload.stats.itemCount], ['底层唯一文件', payload.stats.uniqueDocumentCount], ['占用空间', size(payload.stats.uniqueSize)]]) details.append(element('dt', '', label), element('dd', '', value)); section.append(element('h2', '', '文件夹信息'), details); showPreviewNode(section) }
 
 function modal(title, content, options = {}) {
   modalRoot.hidden = false
   const cover = document.createElement('div'); cover.className = `modal-backdrop${options.nested ? ' nested' : ''}`
   const panel = document.createElement('section'); panel.className = `modal${options.wide ? ' wide' : ''}`
   const header = document.createElement('header'); header.textContent = title
-  const body = document.createElement('div'); body.className = 'modal-body'; typeof content === 'string' ? body.innerHTML = content : body.append(content)
+  const body = document.createElement('div'); body.className = 'modal-body'; body.append(content)
   const footer = document.createElement('footer'); footer.className = 'modal-footer'
   const close = () => { cover.remove(); modalRoot.hidden = !modalRoot.childElementCount }
   for (const item of options.buttons || []) { const button = document.createElement('button'); button.type = 'button'; button.className = `dialog-button${item.primary ? ' primary' : ''}${item.danger ? ' danger' : ''}`; button.textContent = item.label; button.addEventListener('click', () => item.action(close)); footer.append(button) }
@@ -107,7 +155,7 @@ function modal(title, content, options = {}) {
   cover.addEventListener('mousedown', event => { if (event.target === cover) close() }); panel.append(header, body, footer); cover.append(panel); if (options.nested) modalRoot.append(cover); else modalRoot.replaceChildren(cover)
   return { close, panel, body }
 }
-function ask(title, text, danger = false) { return new Promise(resolve => modal(title, `<p class="dialog-hint">${html(text)}</p>`, { buttons: [{ label: '取消', action: close => { close(); resolve(false) } }, { label: '确认', primary: !danger, danger, action: close => { close(); resolve(true) } }] })) }
+function ask(title, text, danger = false) { return new Promise(resolve => modal(title, element('p', 'dialog-hint', text), { buttons: [{ label: '取消', action: close => { close(); resolve(false) } }, { label: '确认', primary: !danger, danger, action: close => { close(); resolve(true) } }] })) }
 function promptValue(title, label, initial = '') { return new Promise(resolve => { const form = document.createElement('form'); form.className = 'form-stack'; const field = document.createElement('label'); field.textContent = label; const input = document.createElement('input'); input.value = initial; field.append(input); form.append(field); const dialog = modal(title, form, { buttons: [{ label: '取消', action: close => { close(); resolve(null) } }, { label: '确定', primary: true, action: close => { const value = input.value.trim(); close(); resolve(value || null) } }] }); form.addEventListener('submit', event => { event.preventDefault(); dialog.panel.querySelector('.primary').click() }); input.focus() }) }
 function tagValues(input) { return input.value.split(',').map(value => value.trim()).filter(Boolean) }
 async function openTagPicker(input) {
@@ -194,8 +242,8 @@ async function nameDialog(title, item = null, sourcePath = null) {
     const form = document.createElement('form'); form.className = 'form-grid'; const controls = {}; const keys = [['系列缩写', 'seriesAbbr'], ['编号', 'number'], ['主标题名', 'mainTitle'], ['副标题名', 'subtitle'], ['版本号', 'edition'], ['作者信息', 'authors'], ['扩展名', 'extension']]
     if (sourcePath) { const paste = document.createElement('label'); paste.className = 'span-2'; paste.textContent = '复制文本识别名称字符段'; const textarea = document.createElement('textarea'); textarea.rows = 2; const apply = document.createElement('button'); apply.type = 'button'; apply.className = 'dialog-button'; apply.textContent = '应用文本'; apply.addEventListener('click', async () => { const value = textarea.value.trim(); if (!value) { message('请先粘贴名称文本。'); return } try { const result = await window.bookManager.post('/api/name-parse', { text: value }); const includesExtension = /\.[A-Za-z0-9]{1,10}\s*$/.test(value); keys.forEach(([, key]) => { if (key !== 'extension' || includesExtension) controls[key].value = result.nameParts[key] || '' }); languageSelect.value = result.nameParts.editionLanguage || languageSelect.value; refreshPreview() } catch (issue) { error(issue) } }); paste.append(textarea, apply); form.append(paste) }
     for (const [label, key] of keys) { const field = document.createElement('label'); field.textContent = label; const input = document.createElement('input'); input.value = candidate[key] || (key === 'edition' ? '1' : ''); input.addEventListener('input', refreshPreview); field.append(input); form.append(field); controls[key] = input }
-    const language = document.createElement('label'); language.textContent = '版本语言'; const languageSelect = document.createElement('select'); languageSelect.className = 'dialog-select'; languageSelect.innerHTML = '<option>英文</option><option>中文</option>'; languageSelect.value = candidate.editionLanguage || '英文'; languageSelect.addEventListener('change', refreshPreview); language.append(languageSelect); form.append(language)
-    const caseOption = document.createElement('label'); caseOption.textContent = '主、副标题格式'; const caseSelect = document.createElement('select'); caseSelect.className = 'dialog-select'; caseSelect.innerHTML = '<option>原样</option><option>驼峰化</option>'; caseOption.append(caseSelect); form.append(caseOption)
+    const language = document.createElement('label'); language.textContent = '版本语言'; const languageSelect = document.createElement('select'); languageSelect.className = 'dialog-select'; languageSelect.append(new Option('英文'), new Option('中文')); languageSelect.value = candidate.editionLanguage || '英文'; languageSelect.addEventListener('change', refreshPreview); language.append(languageSelect); form.append(language)
+    const caseOption = document.createElement('label'); caseOption.textContent = '主、副标题格式'; const caseSelect = document.createElement('select'); caseSelect.className = 'dialog-select'; caseSelect.append(new Option('原样'), new Option('驼峰化')); caseOption.append(caseSelect); form.append(caseOption)
     const note = document.createElement('label'); note.className = 'span-2'; note.textContent = '备注（不加入文件名）'; const noteInput = document.createElement('input'); noteInput.value = item?.note || ''; note.append(noteInput); form.append(note)
     const tags = document.createElement('label'); tags.className = 'span-2'; tags.textContent = '标签（以逗号分隔，不加入文件名）'; const tagRow = document.createElement('div'); tagRow.className = 'tag-input-row'; const tagsInput = document.createElement('input'); tagsInput.value = item?.tags?.join(', ') || ''; const selectTags = document.createElement('button'); selectTags.type = 'button'; selectTags.className = 'dialog-button'; selectTags.textContent = '选择标签'; selectTags.addEventListener('click', () => openTagPicker(tagsInput).catch(error)); tagRow.append(tagsInput, selectTags); tags.append(tagRow); form.append(tags)
     const previewName = document.createElement('div'); previewName.className = 'name-preview span-2'; const metadata = document.createElement('p'); metadata.className = 'dialog-hint span-2'; form.append(previewName, metadata)
@@ -208,10 +256,7 @@ async function nameDialog(title, item = null, sourcePath = null) {
 }
 
 async function showItem(item) {
-  selectedItem = item; setPreviewTitle(item.displayName); const extension = item.extension.toLowerCase()
-  if (textExtensions.has(extension)) { const editor = document.createElement('textarea'); editor.className = 'text-editor'; editor.style.cssText = 'width:100%;height:100%;border:0;padding:14px;resize:none;font:13px/1.55 ui-monospace,Menlo,monospace'; showPreviewNode(editor); editor.value = await fetch(await window.bookManager.documentUrl(item.documentId)).then(response => response.text()); editable = { item, editor }; return }
-  if (['.djvu', '.djv'].includes(extension)) { const holder = document.createElement('div'); holder.className = 'djvu-preview'; for (const url of await window.bookManager.djvuPageUrls(item.documentId)) { const image = document.createElement('img'); image.src = url; image.alt = item.displayName; holder.append(image) } showPreviewNode(holder); return }
-  showViewerHost(); await viewer.load({ url: await window.bookManager.documentUrl(item.documentId), filename: item.displayName, size: item.size })
+  selectedItem = item; setPreviewTitle(item.displayName); await previewCoordinator.show(item)
 }
 function markContentSelection(button) { contentList.querySelectorAll('.content-row.selected').forEach(row => row.classList.remove('selected')); button.classList.add('selected') }
 function fileIconClass(extension) {
@@ -226,12 +271,12 @@ function fileIconClass(extension) {
   if (['txt', 'md', 'log', 'json', 'xml', 'html', 'htm'].includes(ext)) return 'file-icon-text'
   return 'file-icon-other'
 }
-function fileRow(item) { const button = document.createElement('button'); button.className = 'content-row file-row'; button.type = 'button'; button.innerHTML = `<span class="file-icon ${fileIconClass(item.extension)}">${html(item.extension.slice(1).toUpperCase() || 'FILE')}</span><span>${html(item.listName)}</span><small>${size(item.size)}</small>`; button.addEventListener('click', () => { markContentSelection(button); showItem(item).catch(error) }); button.addEventListener('dblclick', () => openDefault(item).catch(error)); button.addEventListener('contextmenu', event => openContext(event, { kind: 'file', item })); return button }
+function fileRow(item) { const button = element('button', 'content-row file-row'); button.type = 'button'; button.append(element('span', `file-icon ${fileIconClass(item.extension)}`, item.extension.slice(1).toUpperCase() || 'FILE'), element('span', '', item.listName), element('small', '', size(item.size))); bindFileActivation(button, { select: () => markContentSelection(button), preview: () => showItem(item), open: () => openDefault(item), onError: error, delayMs: doubleClickDelayMs }); button.addEventListener('contextmenu', event => openContext(event, { kind: 'file', item })); return button }
 async function selectFolder(id) {
   selectedFolderId = id; selectedItem = null; const payload = await window.bookManager.folder(id)
   contentTitle.textContent = payload.folder.name; contentCount.textContent = `${payload.folders.length + payload.items.length} 项`; contentList.replaceChildren()
   ;[...payload.folders].sort((a, b) => a.name.localeCompare(b.name)).forEach(folder => {
-    const button = document.createElement('button'); button.className = 'content-row folder-row'; button.type = 'button'; button.innerHTML = `<span class="folder-icon">DIR</span><span>${html(folder.name)}</span>`
+    const button = element('button', 'content-row folder-row'); button.type = 'button'; button.append(element('span', 'folder-icon', 'DIR'), element('span', '', folder.name))
     button.addEventListener('click', () => { markContentSelection(button); selectFolder(folder.id).then(() => contentList.focus()).catch(error) }); button.addEventListener('contextmenu', event => openContext(event, { kind: 'folder', folder })); contentList.append(button)
   })
   sortedItems(payload.items, id).forEach(item => contentList.append(fileRow(item))); folderSummary(payload)
@@ -239,7 +284,7 @@ async function selectFolder(id) {
 function renderTree(nodes) { const list = document.createElement('ul'); nodes.forEach((folder, index) => { const item = document.createElement('li'); const details = document.createElement('details'); details.open = index === 0; const summary = document.createElement('summary'); summary.addEventListener('click', event => { if (event.target === summary) selectFolder(folder.id).catch(error) }); const button = document.createElement('button'); button.type = 'button'; button.dataset.folderId = String(folder.id); button.textContent = folder.name; button.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); selectFolder(folder.id).catch(error) }); button.addEventListener('contextmenu', event => openContext(event, { kind: 'folder', folder })); summary.append(button); details.append(summary); if (folder.children.length) details.append(renderTree(folder.children)); item.append(details); list.append(item) }); return list }
 async function refresh(select = selectedFolderId) { const data = await window.bookManager.tree(); tree = data.folders; folderTree.replaceChildren(renderTree(tree)); const id = findFolder(select) ? select : tree[0]?.id; if (id) await selectFolder(id) }
 
-async function openDefault(item = selectedItem) { if (!item) throw new Error('请先选择文件'); await window.bookManager.openDocument(item.id); message(`已用系统默认方式打开：${item.displayName}`) }
+async function openDefault(item = selectedItem) { if (!item) throw new Error('请先选择文件'); if (await window.bookManager.openDocument(item.id, item.displayName)) message(`已用系统默认方式打开：${item.displayName}`) }
 async function createFolder(parent = selectedFolderId) { const name = await promptValue('新建文件夹', '文件夹名称'); if (!name) return; const result = await window.bookManager.post('/api/folders', { parentId: parent, name }); await refresh(result.folder.id); message('已新建文件夹。') }
 async function renameFolder(folder) { const name = await promptValue('重命名文件夹', '新的文件夹名称', folder.name); if (!name) return; await window.bookManager.post(`/api/folders/${folder.id}/rename`, { name }); await refresh(folder.id); message('文件夹已重命名。') }
 async function moveFolder(folder) { const target = await chooseFolder('选择移动目标文件夹', folder.id); if (!target) return; await window.bookManager.post(`/api/folders/${folder.id}/move`, { targetFolderId: target }); await refresh(folder.id); message('文件夹已移动。') }
@@ -252,13 +297,13 @@ async function mirrorItem(item) { const target = await chooseFolder('选择镜�
 async function deleteItem(item) { if (!(await ask('删除文件', `删除当前文件夹中的镜像文件？\n${item.displayName}\n底层 Hash 文件不会删除。`, true))) return; await window.bookManager.post(`/api/items/${item.id}/delete`, {}); await refresh(selectedFolderId); message('已删除当前镜像文件。') }
 async function deleteUnderlying(item) { if (!(await ask('删除底层文件', `永久删除“${item.displayName}”的底层文件？所有镜像都会删除，此操作无法撤回。`, true))) return; const result = await window.bookManager.post(`/api/items/${item.id}/delete-underlying`, {}); await refresh(selectedFolderId); message(`已删除底层文件及 ${result.removedItemCount} 个镜像文件。`) }
 async function replaceDocument(item) { const path = await window.bookManager.selectFile(); if (!path || !(await ask('替换底层文件', '替换后所有镜像位置会显示新内容。'))) return; await window.bookManager.post(`/api/documents/${item.documentId}/replace`, { path }); await refresh(selectedFolderId); message('底层文档已替换。') }
-async function saveText() { if (!editable) { message('当前预览不是可编辑文本。'); return } await window.bookManager.post(`/api/documents/${editable.item.documentId}/replace-text`, { text: editable.editor.value, displayName: editable.item.displayName }); await refresh(selectedFolderId); message('文本已保存为新的 Hash 版本；所有镜像同步更新。') }
+async function saveOpenCacheChanges() { message('正在检查打开缓存中的改动…'); const result = await window.bookManager.post('/api/open-cache/sync', {}); await refresh(selectedFolderId); message(result.saved ? `已保存 ${result.saved} 个缓存改动，所有镜像已同步更新。` : '打开缓存中没有需要保存的改动。') }
 
 function searchResults(result) {
-  selectedItem = null; setPreviewTitle(result.kind === 'files' ? '底层文件搜索结果' : result.kind === 'tags' ? '标签搜索结果' : '镜像文件搜索结果')
+  previewCoordinator.invalidate(); selectedItem = null; setPreviewTitle(result.kind === 'files' ? '底层文件搜索结果' : result.kind === 'tags' ? '标签搜索结果' : '镜像文件搜索结果')
   const holder = document.createElement('section'); holder.className = 'search-results'; holder.style.cssText = 'height:100%;overflow:auto;padding:10px'
   const list = document.createElement('div'); list.className = 'result-list'
-  const row = entry => { const button = document.createElement('button'); button.className = 'result-row'; button.type = 'button'; button.innerHTML = `<span>${html(entry.item.displayName)}</span><small>${html(entry.folderPath)}</small><small>${size(entry.item.size)}</small>`; button.addEventListener('click', () => showItem(entry.item).catch(error)); button.addEventListener('dblclick', () => openDefault(entry.item).catch(error)); button.addEventListener('contextmenu', event => openContext(event, { kind: 'file', item: entry.item })); return button }
+  const row = entry => { const button = element('button', 'result-row'); button.type = 'button'; button.append(element('span', '', entry.item.displayName), element('small', '', entry.folderPath), element('small', '', size(entry.item.size))); bindFileActivation(button, { preview: () => showItem(entry.item), open: () => openDefault(entry.item), onError: error, delayMs: doubleClickDelayMs }); button.addEventListener('contextmenu', event => openContext(event, { kind: 'file', item: entry.item })); return button }
   if (result.kind === 'files') {
     const groups = new Map()
     result.results.forEach(entry => { const key = String(entry.item.documentId); groups.set(key, [...(groups.get(key) || []), entry]) })
@@ -308,11 +353,11 @@ async function cacheSettings() {
     { label: '保存设置', primary: true, action: async close => { const selected = value('policy').value; const requested = { openDays: Number(value('openDays').value), renderDays: Number(value('renderDays').value), maxGb: Number(value('maxBytes').value), targetGb: Number(value('targetBytes').value), clearOpenOnExit: value('clearOpenOnExit').checked }; const preset = cachePresets[selected]; const matchesPreset = preset && preset.openDays === requested.openDays && preset.renderDays === requested.renderDays && preset.maxGb === requested.maxGb && preset.targetGb === requested.targetGb && preset.clearOpenOnExit === requested.clearOpenOnExit; await window.bookManager.post('/api/settings/cache', { policy: matchesPreset ? selected : '自定义', openDays: requested.openDays, renderDays: requested.renderDays, maxBytes: Math.round(requested.maxGb * 1024 ** 3), targetBytes: Math.round(requested.targetGb * 1024 ** 3), clearOpenOnExit: requested.clearOpenOnExit }); close(); message('缓存设置已保存。') }}]
   })
 }
-function help() { modal('功能介绍', '<div class="form-stack"><p>添加：导入文件或整个文件夹。</p><p>新建文件夹：在当前文件夹下创建虚拟文件夹。</p><p>打开：用系统默认程序打开文件，或显示底层 Hash 文件。</p><p>按规则重命名：编辑系列、标题、版本、作者、备注与标签。</p><p>爬取系列：输入网址或 Springer 系列编号。</p><p>右键菜单：文件夹可新建、重命名、移动、排序、删除；文件可打开、复制、移动、镜像、替换、删除。</p></div>', { buttons: [{ label: '关闭', primary: true, action: close => close() }] }) }
-async function shortcutDialog() { shortcuts = (await window.bookManager.get('/api/shortcuts')).shortcuts || {}; const actions = [['import-file', '导入文件'], ['create-folder', '新建文件夹'], ['open-selected', '打开文件'], ['rename-selected', '按规则重命名'], ['search', '搜索'], ['crawl', '爬取系列'], ['save-text', '保存文本改动']]; const content = document.createElement('div'); content.className = 'shortcut-grid'; actions.forEach(([action, label]) => { const name = document.createElement('div'); name.textContent = label; const input = document.createElement('input'); input.readOnly = true; input.placeholder = '点击后按键设置；退格清除'; input.value = shortcuts[action] || ''; input.addEventListener('keydown', async event => { event.preventDefault(); const accelerator = event.key === 'Backspace' ? '' : `${event.metaKey || event.ctrlKey ? 'CommandOrControl+' : ''}${event.altKey ? 'Alt+' : ''}${event.shiftKey ? 'Shift+' : ''}${event.key.length === 1 ? event.key.toUpperCase() : event.key}`; try { shortcuts = (await window.bookManager.post('/api/settings/shortcuts', { action, accelerator })).shortcuts; input.value = shortcuts[action] || '' } catch (issue) { error(issue) } }); content.append(name, input) }); modal('快捷键', content, { wide: true, buttons: [{ label: '关闭', primary: true, action: close => close() }] }) }
+function help() { const content = element('div', 'form-stack'); ['添加：导入文件或整个文件夹。', '新建文件夹：在当前文件夹下创建虚拟文件夹。', '打开：用系统默认程序打开文件，或显示底层 Hash 文件。', '按规则重命名：编辑系列、标题、版本、作者、备注与标签。', '保存打开缓存改动：把经系统默认程序修改的缓存副本写回底层文件，并同步所有镜像。', '爬取系列：输入网址或 Springer 系列编号。', '右键菜单：文件夹可新建、重命名、移动、排序、删除；文件可打开、复制、移动、镜像、替换、删除。'].forEach(text => content.append(element('p', '', text))); modal('功能介绍', content, { buttons: [{ label: '关闭', primary: true, action: close => close() }] }) }
+async function shortcutDialog() { shortcuts = (await window.bookManager.get('/api/shortcuts')).shortcuts || {}; const actions = [['import-file', '导入文件'], ['create-folder', '新建文件夹'], ['open-selected', '打开文件'], ['rename-selected', '按规则重命名'], ['search', '搜索'], ['crawl', '爬取系列'], ['save-text', '保存打开缓存改动']]; const content = document.createElement('div'); content.className = 'shortcut-grid'; actions.forEach(([action, label]) => { const name = document.createElement('div'); name.textContent = label; const input = document.createElement('input'); input.readOnly = true; input.placeholder = '点击后按键设置；退格清除'; input.value = shortcuts[action] || ''; input.addEventListener('keydown', async event => { event.preventDefault(); const accelerator = event.key === 'Backspace' ? '' : `${event.metaKey || event.ctrlKey ? 'CommandOrControl+' : ''}${event.altKey ? 'Alt+' : ''}${event.shiftKey ? 'Shift+' : ''}${event.key.length === 1 ? event.key.toUpperCase() : event.key}`; try { shortcuts = (await window.bookManager.post('/api/settings/shortcuts', { action, accelerator })).shortcuts; input.value = shortcuts[action] || '' } catch (issue) { error(issue) } }); content.append(name, input) }); modal('快捷键', content, { wide: true, buttons: [{ label: '关闭', primary: true, action: close => close() }] }) }
 
-async function contextAction(action) { const target = contextTarget; closeContext(); if (!target) return; const folder = target.folder; const item = target.item; if (action === 'folder-open') return selectFolder(folder.id); if (action === 'folder-create') return createFolder(folder.id); if (action === 'folder-rename') return renameFolder(folder); if (action === 'folder-move') return moveFolder(folder); if (action === 'folder-delete') return deleteFolder(folder); if (action === 'sort-standard' || action === 'sort-series') { sortModes.set(folder.id, action === 'sort-series' ? '序列' : '标准'); await selectFolder(selectedFolderId); message(`当前文件夹及子文件夹已按“${sortModes.get(folder.id)}”排序。`); return } if (action === 'file-open') return openDefault(item); if (action === 'file-location') return window.bookManager.showLocation(item.id); if (action === 'file-copy') { await window.bookManager.copyFileName(item.displayName); message('已复制文件名。'); return } if (action === 'file-delete') return deleteItem(item); if (action === 'file-delete-underlying') return deleteUnderlying(item); if (action === 'file-rename') return renameItem(item); if (action === 'file-move') return moveItem(item); if (action === 'file-mirror') return mirrorItem(item); if (action === 'file-replace') return replaceDocument(item) }
-async function action(name) { closeMenus(); if (name === 'import-file') return importFile(); if (name === 'add-folder') return importFolder(); if (name === 'create-folder') return createFolder(); if (name === 'open-selected') return openDefault(); if (name === 'show-location-selected') { if (!selectedItem) throw new Error('请先选择文件'); return window.bookManager.showLocation(selectedItem.id) } if (name === 'rename-selected') return renameItem(); if (name === 'save-text') return saveText(); if (name === 'crawl') return crawl(); if (name === 'data-location') return dataLocation(); if (name === 'cache-settings') return cacheSettings(); if (name === 'help') return help(); if (name === 'shortcuts') return shortcutDialog(); if (name === 'search') return openSearch() }
+async function contextAction(action) { const target = contextTarget; closeContext(); if (!target) return; const folder = target.folder; const item = target.item; if (action === 'folder-open') return selectFolder(folder.id); if (action === 'folder-create') return createFolder(folder.id); if (action === 'folder-rename') return renameFolder(folder); if (action === 'folder-move') return moveFolder(folder); if (action === 'folder-delete') return deleteFolder(folder); if (action === 'sort-standard' || action === 'sort-series') { sortModes.set(folder.id, action === 'sort-series' ? '序列' : '标准'); await selectFolder(selectedFolderId); message(`当前文件夹及子文件夹已按“${sortModes.get(folder.id)}”排序。`); return } if (action === 'file-open') return openDefault(item); if (action === 'file-location') return window.bookManager.showLocation(item.id, item.displayName); if (action === 'file-copy') { await window.bookManager.copyFileName(item.displayName); message('已复制文件名。'); return } if (action === 'file-delete') return deleteItem(item); if (action === 'file-delete-underlying') return deleteUnderlying(item); if (action === 'file-rename') return renameItem(item); if (action === 'file-move') return moveItem(item); if (action === 'file-mirror') return mirrorItem(item); if (action === 'file-replace') return replaceDocument(item) }
+async function action(name) { closeMenus(); if (name === 'import-file') return importFile(); if (name === 'add-folder') return importFolder(); if (name === 'create-folder') return createFolder(); if (name === 'open-selected') return openDefault(); if (name === 'show-location-selected') { if (!selectedItem) throw new Error('请先选择文件'); return window.bookManager.showLocation(selectedItem.id, selectedItem.displayName) } if (name === 'rename-selected') return renameItem(); if (name === 'save-text') return saveOpenCacheChanges(); if (name === 'crawl') return crawl(); if (name === 'data-location') return dataLocation(); if (name === 'cache-settings') return cacheSettings(); if (name === 'help') return help(); if (name === 'shortcuts') return shortcutDialog(); if (name === 'search') return openSearch() }
 
 function moveListSelection(event, container, folderIdForParent) {
   if (!['ArrowUp', 'ArrowDown', 'ArrowLeft'].includes(event.key)) return
@@ -332,5 +377,5 @@ folderTree.addEventListener('keydown', event => moveListSelection(event, folderT
 appMenu.querySelectorAll('summary').forEach(summary => summary.addEventListener('click', () => { for (const menu of appMenu.querySelectorAll('details')) if (menu !== summary.parentElement) menu.open = false }))
 appMenu.addEventListener('click', event => { const button = event.target.closest('button[data-action]'); if (button) action(button.dataset.action).catch(error) }); $('#search-button').addEventListener('click', () => action('search').catch(error)); contextElement.addEventListener('click', event => { const button = event.target.closest('button[data-action]'); if (button) contextAction(button.dataset.action).catch(error) }); document.addEventListener('pointerdown', event => { if (!appMenu.contains(event.target)) closeMenus(); if (!contextElement.hidden && !contextElement.contains(event.target)) closeContext() }, true); window.addEventListener('resize', () => { closeMenus(); closeContext() })
 window.addEventListener('keydown', event => { if (event.target.matches('input,textarea,select')) return; const key = `${event.metaKey || event.ctrlKey ? 'CommandOrControl+' : ''}${event.altKey ? 'Alt+' : ''}${event.shiftKey ? 'Shift+' : ''}${event.key.length === 1 ? event.key.toUpperCase() : event.key}`; const name = Object.entries(shortcuts).find(([, accelerator]) => accelerator === key)?.[0]; if (name) { event.preventDefault(); action(name).catch(error) } })
-async function bootstrap() { await refresh(); shortcuts = (await window.bookManager.get('/api/shortcuts')).shortcuts || {}; message('资料库已连接') }
+async function bootstrap() { doubleClickDelayMs = await window.bookManager.doubleClickDelay(); await refresh(); shortcuts = (await window.bookManager.get('/api/shortcuts')).shortcuts || {}; message('资料库已连接') }
 bootstrap().catch(error); window.bookManager.onMenuAction(payload => { if (payload?.name) action(payload.name).catch(error) })

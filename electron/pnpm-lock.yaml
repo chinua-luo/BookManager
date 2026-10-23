@@ -4,6 +4,9 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+overrides:
+  dompurify: 3.4.17
+
 importers:
 
   .:
@@ -272,11 +275,8 @@ packages:
   dingbat-to-unicode@1.0.1:
     resolution: {integrity: sha512-98l0sW87ZT58pU4i61wa2OHwxbiYSbuxsCBozaVnYX2iCnr3bLM3fIes1/ej7h1YdOKuKt/MLs706TVnALA65w==}
 
-  dompurify@3.4.14:
-    resolution: {integrity: sha512-dVoH9z+MY+C9IilgGCk3YfFqjLi3fChm2OiKJMzh6axrJ5qwxqWaZamgmHrpv22CN/KdbZJuGEGgfQoL00LTdg==}
-
-  dompurify@3.4.15:
-    resolution: {integrity: sha512-EUBjM+B+lkDE41iE82DDSCfkoPGfXx8IxFxPMjNzm/Uk4xDet77rTN9wqlxlVg71kK7XGuUMv6wUxJUwwv+Xyw==}
+  dompurify@3.4.17:
+    resolution: {integrity: sha512-B/pSlYVHQ58kqISD/yDjuJ1yfzI34m1gF4lAod2bwSRhiN4K5Cl3H8Af7hqB2PmTL911tdEudnnXn5FnhRoz0w==}
 
   e-virt-table@1.4.15:
     resolution: {integrity: sha512-yLKQH0ftkTuQHJ9fRadf9ZL9QJSUAktdi8b3uFhwjqFd8p5VgTPBon5K8/W8kM1VZ/WyIGfNLqNgfGme0YvGAg==}
@@ -584,11 +584,11 @@ snapshots:
 
   '@file-viewer/core@3.0.2':
     dependencies:
-      dompurify: 3.4.14
+      dompurify: 3.4.17
 
   '@file-viewer/doc@3.0.2':
     dependencies:
-      dompurify: 3.4.15
+      dompurify: 3.4.17
 
   '@file-viewer/docx@0.3.29':
     dependencies:
@@ -597,7 +597,7 @@ snapshots:
   '@file-viewer/pptx@3.0.2':
     dependencies:
       dingbat-to-unicode: 1.0.1
-      dompurify: 3.4.15
+      dompurify: 3.4.17
       jszip: 3.10.1
       tinycolor2: 1.6.0
       utif: 3.1.0
@@ -636,7 +636,7 @@ snapshots:
     dependencies:
       '@file-viewer/core': 3.0.2
       '@prettier/plugin-xml': 3.4.2(prettier@3.9.6)
-      dompurify: 3.4.15
+      dompurify: 3.4.17
       highlight.js: 11.12.0
       marked: 18.0.11
       prettier: 3.9.6
@@ -767,11 +767,7 @@ snapshots:
 
   dingbat-to-unicode@1.0.1: {}
 
-  dompurify@3.4.14:
-    optionalDependencies:
-      '@types/trusted-types': 2.0.7
-
-  dompurify@3.4.15:
+  dompurify@3.4.17:
     optionalDependencies:
       '@types/trusted-types': 2.0.7
 

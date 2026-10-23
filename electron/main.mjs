@@ -1,8 +1,19 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, session, shell } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, protocol, session, shell, systemPreferences } from 'electron'
 import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
+import { readDoubleClickDelayMs } from './double-click.mjs'
+import { createDocumentProtocolHandler, DOCUMENT_SCHEME, documentUrl } from './document-protocol.mjs'
+import { assertAllowedBridgeRequest } from './ipc-policy.mjs'
+import { acquireSingleInstance } from './single-instance.mjs'
+
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: DOCUMENT_SCHEME,
+    privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true }
+  }
+])
 
 const electronDir = path.dirname(fileURLToPath(import.meta.url))
 const projectDir = process.env.BOOKMANAGER_PROJECT_DIR || path.resolve(electronDir, '..')
@@ -13,6 +24,7 @@ let bridge = null
 let bridgeUrl = null
 let mainWindow = null
 let quitting = false
+const primaryInstance = acquireSingleInstance(app, () => mainWindow)
 
 function pythonCommand() {
   if (process.env.BOOKMANAGER_PYTHON) {
@@ -27,7 +39,7 @@ function bridgeFetch(pathname, options = {}) {
   if (!bridgeUrl) throw new Error('BookManager bridge is not ready')
   return fetch(`${bridgeUrl}${pathname}`, {
     ...options,
-    headers: { 'X-BookManager-Token': token, ...(options.headers || {}) }
+    headers: { Authorization: `Bearer ${token}`, ...(options.headers || {}) }
   })
 }
 
@@ -37,13 +49,16 @@ function startBridge() {
     ...command.prefix,
     '-m', 'bookmanager.bridge',
     '--port', '0',
-    '--token', token,
     '--static-dir', staticDir
   ]
   if (process.env.BOOKMANAGER_DATA_HOME) {
     args.push('--data-home', process.env.BOOKMANAGER_DATA_HOME)
   }
-  bridge = spawn(command.executable, args, { cwd: projectDir, stdio: ['ignore', 'pipe', 'pipe'] })
+  bridge = spawn(command.executable, args, {
+    cwd: projectDir,
+    env: { ...process.env, BOOKMANAGER_BRIDGE_TOKEN: token },
+    stdio: ['ignore', 'pipe', 'pipe']
+  })
   bridge.stderr.on('data', (chunk) => console.error(`BookManager bridge: ${chunk}`))
   return new Promise((resolve, reject) => {
     let output = ''
@@ -87,7 +102,7 @@ async function readJson(pathname) {
 async function postJson(pathname, payload = {}) {
   const response = await bridgeFetch(pathname, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-BookManager-Token': token },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   })
   if (!response.ok) {
@@ -95,6 +110,14 @@ async function postJson(pathname, payload = {}) {
     throw new Error(detail.error || `请求失败 (${response.status})`)
   }
   return response.json()
+}
+
+async function logOperation(payload) {
+  try {
+    await postJson('/api/logs/events', payload)
+  } catch (error) {
+    console.error(`BookManager operation log: ${error instanceof Error ? error.message : error}`)
+  }
 }
 
 function createWindow() {
@@ -114,6 +137,10 @@ function createWindow() {
   })
   mainWindow.setMenu(Menu.getApplicationMenu())
   mainWindow.setMenuBarVisibility(true)
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  mainWindow.webContents.on('will-navigate', (event, targetUrl) => {
+    if (!bridgeUrl || new URL(targetUrl).origin !== new URL(bridgeUrl).origin) event.preventDefault()
+  })
   mainWindow.loadURL(bridgeUrl)
 }
 
@@ -123,21 +150,33 @@ function sendRendererAction(action) {
   }
 }
 
-async function openItem(itemId) {
+async function openItem(itemId, fallbackDocumentName = '') {
+  const started = performance.now()
+  let documentName = fallbackDocumentName
   try {
     const result = await readJson(`/api/items/${encodeURIComponent(itemId)}/open`)
+    documentName = result.documentName
     const error = await shell.openPath(result.path)
     if (error) throw new Error(error)
+    await logOperation({ event: 'file.open.default', message: '使用系统默认程序打开文件', documentName, result: 'success', durationMs: performance.now() - started })
+    return true
   } catch (error) {
+    await logOperation({ event: 'file.open.default', message: '使用系统默认程序打开文件', documentName, result: 'failure', error: error instanceof Error ? error.message : String(error), durationMs: performance.now() - started })
     dialog.showErrorBox('打开文件失败', error instanceof Error ? error.message : String(error))
+    return false
   }
 }
 
-async function showItemLocation(itemId) {
+async function showItemLocation(itemId, fallbackDocumentName = '') {
+  const started = performance.now()
+  let documentName = fallbackDocumentName
   try {
     const result = await readJson(`/api/items/${encodeURIComponent(itemId)}/location`)
+    documentName = result.documentName
     shell.showItemInFolder(result.path)
+    await logOperation({ event: 'file.show_underlying', message: '在文件管理器中显示底层文件', documentName, result: 'success', durationMs: performance.now() - started })
   } catch (error) {
+    await logOperation({ event: 'file.show_underlying', message: '在文件管理器中显示底层文件', documentName, result: 'failure', error: error instanceof Error ? error.message : String(error), durationMs: performance.now() - started })
     dialog.showErrorBox('打开底层位置失败', error instanceof Error ? error.message : String(error))
   }
 }
@@ -164,8 +203,8 @@ function showContextMenu(event, payload) {
         { label: '删除文件夹', click: action('delete-folder') }
       ]
     : [
-        { label: '用系统默认方式打开', click: () => openItem(payload.id) },
-        { label: '打开底层位置', click: () => showItemLocation(payload.id) },
+        { label: '用系统默认方式打开', click: () => openItem(payload.id, payload.name) },
+        { label: '打开底层位置', click: () => showItemLocation(payload.id, payload.name) },
         { label: '复制文件名', click: () => clipboard.writeText(path.parse(payload.name || '').name) },
         { type: 'separator' },
         { label: '删除', click: action('delete-item') },
@@ -198,7 +237,7 @@ function installApplicationMenu() {
       ]
     },
     { label: '按规则重命名', click: action('rename-selected') },
-    { label: '保存文本改动', click: action('save-text') },
+    { label: '保存打开缓存改动', click: action('save-text') },
     { label: '爬取系列', click: action('crawl') },
     {
       label: '设置',
@@ -225,26 +264,22 @@ ipcMain.handle('bridge:tree', () => readJson('/api/tree'))
 ipcMain.handle('bridge:folder', (_event, folderId) => readJson(`/api/folders/${encodeURIComponent(folderId)}/contents`))
 ipcMain.handle('bridge:document-url', (_event, documentId) => {
   if (!bridgeUrl) throw new Error('BookManager bridge is not ready')
-  return `${bridgeUrl}/api/documents/${encodeURIComponent(documentId)}/content?token=${token}`
+  return documentUrl(documentId)
 })
-ipcMain.handle('bridge:djvu-page-urls', (_event, documentId) => {
-  if (!bridgeUrl) throw new Error('BookManager bridge is not ready')
-  const base = `${bridgeUrl}/api/documents/${encodeURIComponent(documentId)}/djvu-pages`
-  return [`${base}/1?token=${token}`, `${base}/2?token=${token}`]
-})
-ipcMain.handle('bridge:epub-preview', (_event, documentId) => readJson(`/api/documents/${encodeURIComponent(documentId)}/epub-preview`))
-ipcMain.handle('bridge:epub-page-urls', (_event, documentId) => {
-  if (!bridgeUrl) throw new Error('BookManager bridge is not ready')
-  const base = `${bridgeUrl}/api/documents/${encodeURIComponent(documentId)}/epub-pages`
-  return [`${base}/1?token=${token}`, `${base}/2?token=${token}`]
-})
-ipcMain.handle('bridge:open-document', (_event, itemId) => openItem(itemId))
-ipcMain.handle('bridge:show-location', (_event, itemId) => showItemLocation(itemId))
+ipcMain.handle('ui:double-click-delay', () => readDoubleClickDelayMs(systemPreferences))
+ipcMain.handle('bridge:open-document', (_event, itemId, documentName) => openItem(itemId, documentName))
+ipcMain.handle('bridge:show-location', (_event, itemId, documentName) => showItemLocation(itemId, documentName))
 ipcMain.handle('clipboard:copy-file-name', (_event, name) => clipboard.writeText(path.parse(String(name || '')).name))
 ipcMain.handle('clipboard:read-text', () => clipboard.readText())
 ipcMain.handle('clipboard:write-text', (_event, text) => clipboard.writeText(String(text || '')))
-ipcMain.handle('bridge:get', (_event, pathname) => readJson(String(pathname)))
-ipcMain.handle('bridge:post', (_event, pathname, payload) => postJson(String(pathname), payload || {}))
+ipcMain.handle('bridge:get', (_event, pathname) => {
+  assertAllowedBridgeRequest('GET', pathname)
+  return readJson(pathname)
+})
+ipcMain.handle('bridge:post', (_event, pathname, payload) => {
+  assertAllowedBridgeRequest('POST', pathname, payload || {})
+  return postJson(pathname, payload || {})
+})
 ipcMain.handle('dialog:select-file', async () => {
   const result = await dialog.showOpenDialog(mainWindow, { title: '选择要导入的文件', properties: ['openFile'] })
   return result.canceled ? null : result.filePaths[0]
@@ -255,11 +290,21 @@ ipcMain.handle('dialog:select-folder', async (_event, title = '选择文件夹')
 })
 ipcMain.on('ui:context-menu', showContextMenu)
 
-app.whenReady().then(async () => {
+if (primaryInstance) app.whenReady().then(async () => {
   try {
     app.setName('BookManager')
     if (process.platform === 'darwin' && app.dock) app.dock.setIcon(appIcon)
     await startBridge()
+    protocol.handle(DOCUMENT_SCHEME, createDocumentProtocolHandler(async (documentId, range) => {
+      const upstream = await bridgeFetch(
+        `/api/documents/${encodeURIComponent(documentId)}/content`,
+        range ? { headers: { Range: range } } : {}
+      )
+      const headers = new Headers(upstream.headers)
+      headers.delete('cross-origin-resource-policy')
+      headers.set('access-control-allow-origin', bridgeUrl)
+      return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers })
+    }))
     session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false))
     installApplicationMenu()
     createWindow()
