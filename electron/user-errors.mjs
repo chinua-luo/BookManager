@@ -33,14 +33,18 @@ export function notificationFromError(value) {
   return userError(value)
 }
 export function businessError(value, context, fatal = false) {
-  const notice = fatal ? { title: '程序异常', msg: '后端服务连接失败，请重启软件', errorType: 'backend', level: 'fatal' } : userError(value, context)
+  const structured = value && typeof value === 'object' && typeof value.error_type === 'string' && typeof value.msg === 'string'
+  const titles = { unsafe_address: '安全拦截', disk_full: '磁盘空间不足', permission_denied: '权限不足', import_partial: '部分导入失败', import_failed: '导入失败', search_failed: '搜索失败', crawl_failed: '爬取失败', crawl_partial: '爬取结果提醒', crawl_fallback: '未能下载文档', cache_clear_failed: '缓存清理失败', migration_failed: '迁移失败', settings_failed: '设置保存失败', folder_operation_failed: '文件夹操作失败', document_operation_failed: '文件操作失败' }
+  const notice = structured ? { title: titles[value.error_type] || '操作提醒', msg: value.msg, errorType: value.error_type, level: value.level === 'warning' ? 'warning' : 'error' } : fatal ? { title: '程序异常', msg: '后端服务连接失败，请重启软件', errorType: 'backend', level: 'fatal' } : userError(value, context)
   return new Error(`BM_NOTICE:${JSON.stringify(notice)}`)
 }
 export function importSummary(result) {
+  if (result._notification) return result._notification
   const failed = result.errors?.length || 0
   return failed ? { level: result.fileCount ? 'warning' : 'error', title: result.fileCount ? '部分导入失败' : '导入失败', errorType: 'import_partial', msg: `共 ${result.fileCount + failed} 个文件，成功导入 ${result.fileCount} 个，${failed} 个因无法读取或导入失败被跳过` } : null
 }
 export function crawlSummary(result) {
+  if (result._notification) return result._notification
   const stats = result.stats || {}
   const messages = (result.messages || []).map(String)
   const skipped = (stats.skipped_cross_origin || 0) + (stats.skipped_safe_block || 0)

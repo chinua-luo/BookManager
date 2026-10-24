@@ -12,6 +12,8 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from .diagnostics import record_exception, silent_background
 from typing import Iterable, Optional
 
 from .naming import (
@@ -100,16 +102,20 @@ def resolve_default_library_home() -> tuple[Path, bool]:
         except OSError:
             # Keep using the intact old library instead of opening an empty new one.
             # A later launch can retry the migration without changing the source.
+            record_exception('store.recovered')
             return source, False
         return target, True
     return target, False
 
 
 def configured_library_home() -> Path | None:
+    if not SETTINGS_PATH.exists():
+        return None
     try:
         settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
         configured_path = str(settings.get("data_home", "")).strip()
     except (OSError, json.JSONDecodeError, TypeError):
+        record_exception('store.recovered')
         return None
     return Path(configured_path).expanduser() if configured_path else None
 
@@ -149,23 +155,25 @@ def migrate_library_home(source: Path, target: Path) -> None:
     except (OSError, sqlite3.Error) as exc:
         for copied_path in reversed(copied_paths):
             if copied_path.is_dir():
-                shutil.rmtree(copied_path, ignore_errors=True)
+                shutil.rmtree(copied_path, onerror=lambda _fn, _path, exc: record_exception('store.migration_cleanup_failed', exc[1]))
             else:
                 copied_path.unlink(missing_ok=True)
         try:
             target.rmdir()
         except OSError:
+            record_exception('store.recovered')
             pass
         raise OSError(f"迁移资料库失败：{exc}") from exc
 
     for name in LIBRARY_DATA_NAMES:
         source_path = source / name
         if source_path.is_dir():
-            shutil.rmtree(source_path, ignore_errors=True)
+            shutil.rmtree(source_path, onerror=lambda _fn, _path, exc: record_exception('store.migration_cleanup_failed', exc[1]))
         else:
             try:
                 source_path.unlink(missing_ok=True)
             except OSError:
+                record_exception('store.recovered')
                 pass
 
 
@@ -239,6 +247,7 @@ def _atomic_copy_verified(source_path: Path, target_path: Path, expected_hash: s
             try:
                 temporary_path.chmod(0o600)
             except OSError:
+                record_exception('store.recovered')
                 pass
             os.replace(temporary_path, target_path)
             temporary_path = None
@@ -336,6 +345,7 @@ def _name_parts_from_json(value: str) -> StructuredFileName:
     try:
         data = json.loads(value)
     except (TypeError, json.JSONDecodeError):
+        record_exception('store.recovered')
         data = {}
     return StructuredFileName(
         series_abbr=str(data.get("series_abbr", "")),
@@ -353,6 +363,7 @@ def _note_from_json(value: str) -> str:
     try:
         data = json.loads(value)
     except (TypeError, json.JSONDecodeError):
+        record_exception('store.recovered')
         return ""
     return _normalize_note(data.get("note", ""))
 
@@ -396,12 +407,16 @@ class LibraryStore:
         self._secure_library_permissions()
         self._cleanup_stale_temporary_files()
         self.conn = sqlite3.connect(str(self.db_path))
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys = ON")
-        self._init_schema()
-        self._secure_library_permissions()
-        if self.migrated_legacy_library:
-            self._rewrite_legacy_blob_paths()
+        try:
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA foreign_keys = ON")
+            self._init_schema()
+            self._secure_library_permissions()
+            if self.migrated_legacy_library:
+                self._rewrite_legacy_blob_paths()
+        except Exception:
+            self.conn.close()
+            raise
 
     def close(self) -> None:
         self.conn.close()
@@ -411,14 +426,17 @@ class LibraryStore:
             try:
                 directory.chmod(0o700)
             except OSError:
+                record_exception('store.recovered', data_home=self.home)
                 pass
         for path in (self.db_path, self.db_path.with_name("library.db-wal"), self.db_path.with_name("library.db-shm")):
             if path.exists() and not path.is_symlink():
                 try:
                     path.chmod(0o600)
                 except OSError:
+                    record_exception('store.recovered', data_home=self.home)
                     pass
 
+    @silent_background('cache.stale_temporary_cleanup_failed')
     def _cleanup_stale_temporary_files(self) -> None:
         cutoff = time.time() - 24 * 60 * 60
         temporary_paths = list(self.blob_dir.rglob(".bookmanager-tmp-*"))
@@ -430,6 +448,7 @@ class LibraryStore:
                 if not path.is_symlink() and path.is_file() and path.stat().st_mtime < cutoff:
                     path.unlink()
             except OSError:
+                record_exception('store.recovered', data_home=self.home)
                 continue
 
     def shortcuts(self) -> dict[str, str]:
@@ -583,7 +602,7 @@ class LibraryStore:
             encoding="utf-8",
         )
 
-    def sync_open_cache_changes(self) -> int:
+    def sync_open_cache_changes(self, *, strict: bool = False) -> int:
         """Write changed default-app copies back to their underlying documents."""
         cache_root = self.home / "open_cache"
         if not cache_root.is_dir():
@@ -601,20 +620,22 @@ class LibraryStore:
                     continue
                 entries.append(((entry / file_name).stat().st_mtime_ns, entry))
             except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                record_exception('store.recovered', data_home=self.home)
                 continue
 
         # Later-edited open copies win when the same document was opened twice.
         for _modified_at, entry in sorted(entries, key=lambda value: value[0]):
-            if self._sync_open_cache_entry(entry):
+            if self._sync_open_cache_entry(entry, strict=strict):
                 changed_count += 1
         return changed_count
 
-    def _sync_open_cache_entry(self, cache_dir: Path) -> bool:
+    def _sync_open_cache_entry(self, cache_dir: Path, *, strict: bool = False) -> bool:
         try:
             manifest = json.loads((cache_dir / OPEN_CACHE_MANIFEST).read_text(encoding="utf-8"))
             document_id = int(manifest["document_id"])
             file_name = str(manifest["file_name"])
         except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            record_exception('store.recovered', data_home=self.home)
             return False
 
         if Path(file_name).name != file_name:
@@ -625,6 +646,9 @@ class LibraryStore:
         try:
             cached_hash, _size = sha256_file(cached_path)
         except OSError:
+            record_exception('store.recovered', data_home=self.home)
+            if strict:
+                raise
             return False
         row = self.conn.execute(
             "SELECT current_hash FROM documents WHERE id = ?", (document_id,)
@@ -634,6 +658,9 @@ class LibraryStore:
         try:
             self.replace_document_content(document_id, cached_path)
         except (OSError, ValueError):
+            record_exception('store.recovered', data_home=self.home)
+            if strict:
+                raise
             return False
         return True
 
@@ -641,18 +668,21 @@ class LibraryStore:
         try:
             os.utime(cache_dir, None)
         except OSError:
+            record_exception('store.recovered', data_home=self.home)
             pass
 
     def clear_cache(self, cache_name: str) -> int:
         if cache_name not in {"open_cache", "render_cache"}:
             raise ValueError("未知的缓存目录")
         if cache_name == "open_cache":
-            self.sync_open_cache_changes()
+            self.sync_open_cache_changes(strict=True)
         cache_dir = self.home / cache_name
         freed_bytes = self._cache_entry_size(cache_dir)
-        shutil.rmtree(cache_dir, ignore_errors=True)
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir)
         return freed_bytes
 
+    @silent_background('cache.automatic_cleanup_failed')
     def cleanup_caches(self, trigger: str) -> int:
         """Apply the configured automatic policy and return reclaimed bytes."""
         settings = self.cache_settings()
@@ -676,7 +706,7 @@ class LibraryStore:
             for path, modified_at, size in self._cache_entries(cache_name):
                 if modified_at < cutoff:
                     if cache_name == "open_cache":
-                        self._sync_open_cache_entry(path)
+                        self._sync_open_cache_entry(path, strict=True)
                     freed_bytes += self._remove_cache_entry(path, size)
 
         usage = sum(self.cache_usage().values())
@@ -687,7 +717,7 @@ class LibraryStore:
             if usage <= target_bytes:
                 break
             if path.parent == self.home / "open_cache":
-                self._sync_open_cache_entry(path)
+                self._sync_open_cache_entry(path, strict=True)
             reclaimed = self._remove_cache_entry(path, size)
             freed_bytes += reclaimed
             usage -= reclaimed
@@ -711,9 +741,11 @@ class LibraryStore:
             try:
                 stored_path.unlink()
             except FileNotFoundError:
+                record_exception('store.recovered', data_home=self.home)
                 pass
             except OSError:
                 # Keep the database entry if its file cannot be removed.
+                record_exception('store.recovered', data_home=self.home)
                 continue
 
             with self.conn:
@@ -745,6 +777,7 @@ class LibraryStore:
             try:
                 entries.append((path, path.stat().st_mtime, self._cache_entry_size(path)))
             except OSError:
+                record_exception('store.recovered', data_home=self.home)
                 continue
         return entries
 
@@ -754,6 +787,7 @@ class LibraryStore:
             try:
                 return path.stat().st_size
             except OSError:
+                record_exception('store.recovered')
                 return 0
         if not path.is_dir():
             return 0
@@ -764,6 +798,7 @@ class LibraryStore:
             try:
                 size += child.stat().st_size
             except OSError:
+                record_exception('store.recovered')
                 continue
         return size
 
@@ -775,6 +810,7 @@ class LibraryStore:
             else:
                 path.unlink()
         except OSError:
+            record_exception('store.recovered')
             return 0
         return size
 
@@ -1330,6 +1366,7 @@ class LibraryStore:
         try:
             item.stored_path.unlink()
         except FileNotFoundError:
+            record_exception('store.recovered', data_home=self.home)
             pass
         except OSError as exc:
             raise ValueError(f"无法删除底层文件：{exc}") from exc
@@ -1410,6 +1447,7 @@ class LibraryStore:
                 try:
                     text = item.stored_path.read_text(encoding="utf-8", errors="ignore")
                 except OSError:
+                    record_exception('store.recovered', data_home=self.home)
                     continue
                 if keyword.lower() in text.lower():
                     path = self.folder_path(item.folder_id)

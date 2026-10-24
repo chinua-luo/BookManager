@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -9,6 +10,8 @@ import zipfile
 from dataclasses import dataclass
 from html import unescape
 from pathlib import Path
+
+from .diagnostics import record_exception, record_event, current_home
 from typing import Optional
 from xml.etree import ElementTree
 
@@ -40,15 +43,17 @@ def extract_metadata(path: Path, max_pages: int = 5) -> MetadataResult:
             text=True,
             timeout=40,
             check=False,
+            env={**os.environ, 'BOOKMANAGER_DIAGNOSTIC_HOME': str(current_home())},
         )
         if completed.returncode != 0:
-            detail = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else "解析进程异常退出"
-            raise ValueError(detail[:300])
+            record_event('metadata.worker_failed', stderr=completed.stderr, returncode=completed.returncode)
+            raise ValueError('解析进程异常退出')
         payload = json.loads(completed.stdout)
         parts = StructuredFileName(**payload["parts"])
         return MetadataResult(parts, bool(payload["extracted"]), str(payload["message"]))
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
-        return MetadataResult(fallback, False, f"内容提取失败，已使用文件名识别：{exc}")
+        record_exception('metadata.recovered')
+        return MetadataResult(fallback, False, "内容提取失败，已使用文件名识别，请手动补充信息。")
 
 
 def _extract_metadata_in_process(path: Path, max_pages: int = 5) -> MetadataResult:
@@ -67,7 +72,8 @@ def _extract_metadata_in_process(path: Path, max_pages: int = 5) -> MetadataResu
         if suffix in {".djvu", ".djv"}:
             return _extract_djvu(path, fallback, max_pages)
     except Exception as exc:
-        return MetadataResult(fallback, False, f"内容提取失败，已使用文件名识别：{exc}")
+        record_exception('metadata.recovered')
+        return MetadataResult(fallback, False, "内容提取失败，已使用文件名识别，请手动补充信息。")
 
     return MetadataResult(fallback, False, "未能提取内容，已使用文件名识别。")
 
@@ -99,6 +105,7 @@ def _epub_opf_path(archive: zipfile.ZipFile) -> Optional[str]:
     try:
         container = ElementTree.fromstring(archive.read("META-INF/container.xml"))
     except Exception:
+        record_exception('metadata.recovered')
         return None
     for node in container.iter():
         if node.tag.endswith("rootfile") and node.attrib.get("full-path"):
@@ -164,6 +171,7 @@ def _extract_pdf(path: Path, fallback: StructuredFileName, max_pages: int) -> Me
         text = "\n".join((page.extract_text() or "") for page in reader.pages[:max_pages])
         backend = "pypdf"
     except Exception:
+        record_exception('metadata.recovered')
         return MetadataResult(fallback, False, "未安装 pypdf，或 PDF 没有可提取文本；请手动输入。")
 
     parts = _parts_from_metadata_text(fallback=fallback, text=text)
@@ -186,7 +194,8 @@ def _extract_djvu(path: Path, fallback: StructuredFileName, max_pages: int) -> M
     command = [djvutxt, "--page=1-" + str(max_pages), str(path)]
     completed = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
     if completed.returncode != 0:
-        return MetadataResult(fallback, False, "djvutxt 未能提取 DJVU 文本；请手动输入。")
+        record_event('metadata.djvu_text_failed', error=RuntimeError('DJVU text extractor exited unsuccessfully'), returncode=completed.returncode, stderr=completed.stderr)
+        return MetadataResult(fallback, False, "未能提取 DJVU 文本，请手动输入。")
     parts = _parts_from_metadata_text(fallback=fallback, text=completed.stdout)
     extracted = _has_useful_metadata(parts, fallback)
     message = (

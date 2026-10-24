@@ -4,6 +4,8 @@ import json
 import sys
 from pathlib import Path
 
+from .diagnostics import record_exception
+
 from .metadata import _extract_metadata_in_process
 
 
@@ -11,6 +13,7 @@ def _limit_resources() -> None:
     try:
         import resource
     except ImportError:
+        record_exception('metadata_worker.recovered')
         return
     limits = (
         (resource.RLIMIT_CPU, 25, 25),
@@ -21,6 +24,7 @@ def _limit_resources() -> None:
         try:
             resource.setrlimit(resource_id, (soft, hard))
         except (OSError, ValueError):
+            record_exception('metadata_worker.recovered')
             pass
 
 

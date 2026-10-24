@@ -171,19 +171,20 @@ test('crawl warnings aggregate raw failures and explicitly identify HTML fallbac
   assert.equal(notificationFromError(businessError('fetch failed', '/api/tree', true)).level, 'fatal')
 })
 
+import { startupFailure } from '../startup-checks.mjs'
 import { EventEmitter } from 'node:events'
 const main = await readFile(new URL('../main.mjs', import.meta.url), 'utf8')
 function backendHarness() {
   const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter()
   const reports = []
   const source = main.slice(main.indexOf('function startBridge('), main.indexOf('async function responseJson('))
-  const create = new Function('spawn', 'pythonCommand', 'reportFatal', `
+  const create = new Function('spawn', 'pythonCommand', 'reportFatal', 'startupFailure', `
     let bridge = null; let bridgeUrl = null; let quitting = false;
     const staticDir = '/tmp'; const projectDir = '/tmp'; const token = 'test-token';
     ${source}
     return { startBridge, quit() { quitting = true } }
   `)
-  return { child, reports, ...create(() => child, () => ({ executable: 'python3', prefix: [] }), (...args) => reports.push(args)) }
+  return { child, reports, ...create(() => child, () => ({ executable: 'python3', prefix: [] }), (...args) => reports.push(args), startupFailure) }
 }
 
 test('production backend lifecycle reports unexpected exit but suppresses normal shutdown', async () => {
@@ -207,7 +208,7 @@ test('production backend lifecycle rejects missing Python without leaking detail
 
 test('production response boundary handles old and new error shapes and invalid JSON', async () => {
   const source = main.slice(main.indexOf('async function responseJson('), main.indexOf('async function readJson('))
-  const responseJson = new Function('businessError', 'console', `${source}; return responseJson`)(businessError, { error() {} })
+  const responseJson = new Function('businessError', 'console', 'notificationFromError', `${source}; return responseJson`)(businessError, { error() {} }, notificationFromError)
   for (const [payload, status] of [[{ error: 'Traceback: secret' }, 400], [{ ok: false, msg: 'private network' }, 200]]) {
     await assert.rejects(responseJson(new Response(JSON.stringify(payload), { status }), '/api/crawl'), error => {
       assert.doesNotMatch(notificationFromError(error).msg, /Traceback|secret/)
@@ -229,4 +230,25 @@ test('optional tag prompt distinguishes an empty submission from cancellation', 
   const cover = h.root.children[0]
   for (const fn of cover.listeners.get('mousedown')) fn({ target: cover })
   assert.equal(await cancelled, null)
+})
+
+test('backend preflight failures reject startup with the precise fatal reason', async () => {
+  const h = backendHarness(); const ready = h.startBridge()
+  h.child.stdout.emit('data', Buffer.from('{"event":"startup-error","error_type":"disk_full","log_path":"/tmp/log.jsonl"}\n'))
+  await assert.rejects(ready, error => notificationFromError(error).errorType === 'disk_full')
+  h.child.emit('exit', 1)
+  assert.equal(h.reports.length, 0)
+})
+
+test('production response boundary unwraps success and preserves structured business warnings', async () => {
+  const source = main.slice(main.indexOf('async function responseJson('), main.indexOf('async function readJson('))
+  const responseJson = new Function('businessError', 'console', 'notificationFromError', `${source}; return responseJson`)(businessError, { error() {} }, notificationFromError)
+  const body = { ok: true, level: 'success', error_type: '', msg: '', data: { folders: [{ id: 1 }] }, stats: {} }
+  assert.deepEqual(await responseJson(new Response(JSON.stringify(body)), '/api/tree'), body.data)
+  const warning = { ok: true, level: 'warning', error_type: 'import_partial', msg: '共 10 个文件，成功导入 5 个，5 个被跳过', data: { fileCount: 5 }, stats: { failed: 5 } }
+  const result = await responseJson(new Response(JSON.stringify(warning)), '/api/import/folder')
+  assert.equal(importSummary(result).msg, warning.msg)
+  const failure = { ok: false, level: 'error', error_type: 'permission_denied', msg: '无法访问所需文件，请检查文件夹权限', data: null, stats: {} }
+  await assert.rejects(responseJson(new Response(JSON.stringify(failure), { status: 400 }), '/api/tree'), error => notificationFromError(error).msg === failure.msg)
+  for (const value of [null, [], 'bad envelope']) await assert.rejects(responseJson(new Response(JSON.stringify(value)), '/api/tree'), /BM_NOTICE/)
 })

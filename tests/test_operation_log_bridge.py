@@ -50,7 +50,7 @@ class OperationLogBridgeTests(unittest.TestCase):
             data = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(self.base_url + path, data=data, headers=headers)
         with urllib.request.urlopen(request, timeout=5) as response:
-            return json.loads(response.read().decode("utf-8"))
+            return json.loads(response.read().decode("utf-8"))["data"]
 
     def records(self) -> list[dict[str, object]]:
         deadline = time.monotonic() + 2

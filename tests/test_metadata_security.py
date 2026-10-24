@@ -15,8 +15,11 @@ class MetadataSecurityTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.path = Path(self.temporary.name) / "Book.pdf"
         self.path.write_bytes(b"%PDF-1.7\n")
+        self.diagnostics = mock.patch.dict('os.environ', {'BOOKMANAGER_DIAGNOSTIC_HOME': str(self.path.parent / 'diagnostics')})
+        self.diagnostics.start()
 
     def tearDown(self) -> None:
+        self.diagnostics.stop()
         self.temporary.cleanup()
 
     def test_metadata_parser_runs_in_a_bounded_worker_process(self) -> None:
@@ -51,6 +54,18 @@ class MetadataSecurityTests(unittest.TestCase):
             result = extract_metadata(self.path)
         self.assertFalse(result.extracted)
         self.assertIn("内容提取失败", result.message)
+
+
+    def test_worker_failure_logs_full_stderr_but_returns_only_business_text(self):
+        completed = subprocess.CompletedProcess([], 1, '', 'Traceback (most recent call last):\nRuntimeError: private-parser-detail')
+        with mock.patch('bookmanager.metadata.subprocess.run', return_value=completed):
+            result = extract_metadata(self.path)
+        self.assertFalse(result.extracted)
+        self.assertNotIn('private-parser-detail', result.message)
+        self.assertNotIn('Traceback', result.message)
+        paths = list((self.path.parent / 'diagnostics' / 'logs').glob('diagnostics-*.jsonl'))
+        self.assertTrue(paths)
+        self.assertIn('private-parser-detail', paths[0].read_text())
 
 
 if __name__ == "__main__":

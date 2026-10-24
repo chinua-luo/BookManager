@@ -7,6 +7,8 @@ import { readDoubleClickDelayMs } from './double-click.mjs'
 import { createDocumentProtocolHandler, DOCUMENT_SCHEME, documentUrl } from './document-protocol.mjs'
 import { assertAllowedBridgeRequest } from './ipc-policy.mjs'
 import { acquireSingleInstance } from './single-instance.mjs'
+import { checkFrontend, startupFailure } from './startup-checks.mjs'
+import { createMainLogger } from './diagnostics.mjs'
 import { businessError, userError, notificationFromError, createFatalReporter } from './user-errors.mjs'
 
 protocol.registerSchemesAsPrivileged([
@@ -53,7 +55,7 @@ function startBridge() {
   const command = pythonCommand()
   const args = [
     ...command.prefix,
-    '-m', 'bookmanager.bridge',
+    '-m', 'bookmanager.startup',
     '--port', '0',
     '--static-dir', staticDir
   ]
@@ -68,7 +70,7 @@ function startBridge() {
   bridge.stderr.on('data', (chunk) => console.error(`BookManager bridge: ${chunk}`))
   return new Promise((resolve, reject) => {
     let output = ''
-    const timer = setTimeout(() => reject(new Error('BookManager bridge did not start in time')), 10000)
+    const timer = setTimeout(() => reject(new Error('BookManager bridge did not start in time')), 30000)
     bridge.stdout.on('data', (chunk) => {
       output += chunk.toString()
       const lines = output.split('\n')
@@ -76,6 +78,11 @@ function startBridge() {
       for (const line of lines) {
         try {
           const event = JSON.parse(line)
+          if (event.event === 'startup-error') {
+            clearTimeout(timer)
+            console.error('Backend preflight failed:', event.error_type, 'diagnostics:', event.log_path)
+            reject(startupFailure(event.error_type))
+          }
           if (event.event === 'ready') {
             clearTimeout(timer)
             bridgeUrl = `http://127.0.0.1:${event.port}`
@@ -88,13 +95,15 @@ function startBridge() {
     })
     bridge.once('error', (error) => {
       clearTimeout(timer)
-      reject(error)
+      console.error('Python process could not start:', error)
+      reject(error.code === 'ENOENT' ? startupFailure('python_missing') : error)
     })
     bridge.once('exit', (code) => {
       if (!bridgeUrl) {
         clearTimeout(timer)
         reject(new Error(`BookManager bridge exited before startup (${code ?? 'unknown'})`))
       } else if (!quitting) {
+        console.error('Backend exited unexpectedly:', code)
         reportFatal('backend', '程序异常', '后端服务意外退出，请重启软件')
       }
     })
@@ -103,9 +112,16 @@ function startBridge() {
 
 async function responseJson(response, pathname) {
   const detail = await response.json().catch(error => { console.error('Invalid bridge response:', error); throw businessError(error, pathname) })
+  if (!detail || typeof detail !== 'object' || Array.isArray(detail)) throw businessError('Invalid response envelope', pathname)
   if (!response.ok || detail.ok === false) {
     console.error('BookManager request failed:', pathname, response.status, detail)
-    throw businessError(detail.msg || detail.error, pathname)
+    throw businessError('data' in detail ? detail : detail.msg || detail.error, pathname)
+  }
+  if (typeof detail.ok === 'boolean' && 'data' in detail) {
+    if (detail.data === null || typeof detail.data !== 'object' || Array.isArray(detail.data)) throw businessError('Invalid response data', pathname)
+    const data = { ...detail.data }
+    if (detail.level === 'warning') data._notification = notificationFromError(businessError(detail, pathname))
+    return data
   }
   return detail
 }
@@ -147,6 +163,7 @@ function createWindow() {
   })
   mainWindow.setMenu(Menu.getApplicationMenu())
   mainWindow.setMenuBarVisibility(true)
+  mainWindow.webContents.on('render-process-gone', (_event, details) => { console.error('Renderer process exited:', details); if (!quitting) reportFatal('renderer', '界面异常', '界面进程意外退出，请重启软件') })
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
   mainWindow.webContents.on('will-navigate', (event, targetUrl) => {
     if (!bridgeUrl || new URL(targetUrl).origin !== new URL(bridgeUrl).origin) event.preventDefault()
@@ -305,6 +322,14 @@ ipcMain.on('ui:context-menu', showContextMenu)
 if (primaryInstance) app.whenReady().then(async () => {
   try {
     app.setName('BookManager')
+    const diagnosticsHome = path.join(app.getPath('userData'), 'diagnostics')
+    process.env.BOOKMANAGER_DIAGNOSTIC_HOME = diagnosticsHome
+    const originalError = console.error.bind(console)
+    const persistError = createMainLogger(diagnosticsHome, { token })
+    console.error = (...values) => { persistError(...values); originalError(...values) }
+    process.on('uncaughtException', error => { console.error('Uncaught main-process error:', error); reportFatal('main', '程序异常', '程序发生严重错误，请保存可保存的内容并重启软件') })
+    process.on('unhandledRejection', error => { console.error('Unhandled main-process rejection:', error); reportFatal('main', '程序异常', '程序发生严重错误，请保存可保存的内容并重启软件') })
+    await checkFrontend(staticDir)
     if (process.platform === 'darwin' && app.dock) app.dock.setIcon(appIcon)
     await startBridge()
     protocol.handle(DOCUMENT_SCHEME, createDocumentProtocolHandler(async (documentId, range) => {
@@ -322,7 +347,9 @@ if (primaryInstance) app.whenReady().then(async () => {
     createWindow()
   } catch (error) {
     console.error(error)
-    reportFatal('startup', '程序启动失败', '无法启动后端服务，请检查 Python 环境、数据目录权限和剩余磁盘空间后重试')
+    const failure = notificationFromError(error)
+    const startup = failure.level === 'fatal' ? failure : notificationFromError(startupFailure())
+    reportFatal('startup', startup.title, startup.msg)
     app.quit()
   }
 })

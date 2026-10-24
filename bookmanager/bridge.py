@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import argparse
 import hmac
 import json
 import mimetypes
 import os
 import re
 import shutil
-import sys
 import time
 import urllib.parse
 import uuid
@@ -20,6 +18,8 @@ from .crawler import crawl_into_library
 from .metadata import extract_metadata
 from .naming import StructuredFileName, build_structured_file_name, infer_structured_file_name
 from .operation_log import OperationLogger
+from .diagnostics import diagnostic_scope, record_event, record_exception
+from .responses import response_envelope
 from .store import (
     CACHE_POLICIES,
     CACHE_POLICY_NAMES,
@@ -152,12 +152,17 @@ class BridgeServer(ThreadingHTTPServer):
         self.library_home = library_home
         self.token = token
         self.static_dir = static_dir.resolve()
-        initial_store = self.open_store()
         try:
-            self.library_home = initial_store.home
-        finally:
-            initial_store.close()
+            initial_store = self.open_store()
+            try:
+                self.library_home = initial_store.home
+            finally:
+                initial_store.close()
+        except Exception:
+            self.server_close()
+            raise
         self.operation_logger = OperationLogger(self.library_home)
+        self.capabilities: dict[str, bool] = {}
 
     def open_store(self) -> LibraryStore:
         return LibraryStore(self.library_home)
@@ -166,7 +171,10 @@ class BridgeServer(ThreadingHTTPServer):
         try:
             self.operation_logger.write(**record)
         except Exception as exc:
-            print(f"BookManager operation log: {exc}", file=sys.stderr, flush=True)
+            record_exception("operation_log.write_failed", exc, data_home=self.library_home)
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        record_exception('bridge.request_thread_failed', data_home=self.library_home)
 
 
 class BridgeRequestHandler(BaseHTTPRequestHandler):
@@ -182,13 +190,31 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
+        self._response_started = False
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path.startswith("/api/"):
-            self._handle_api(parsed)
+            with diagnostic_scope(self.server.library_home):
+                try:
+                    self._handle_api(parsed)
+                except (OSError, ValueError) as exc:
+                    self._send_failure(exc, HTTPStatus.BAD_REQUEST)
+                except Exception as exc:
+                    self._send_failure(exc, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
-        self._serve_static(parsed.path)
+        with diagnostic_scope(self.server.library_home):
+            try:
+                self._serve_static(parsed.path)
+            except Exception as exc:
+                record_exception('bridge.static_failed', exc)
+                if not getattr(self, '_response_started', False):
+                    self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, 'Frontend unavailable')
 
     def do_POST(self) -> None:  # noqa: N802
+        self._response_started = False
+        with diagnostic_scope(self.server.library_home):
+            self._do_post()
+
+    def _do_post(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         if not parsed.path.startswith("/api/") or not self._authorized(parsed):
             self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "Unauthorized"})
@@ -206,12 +232,13 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             document_name = self._operation_document_name
         except (OSError, ValueError) as exc:
             self._log_request_operation(operation, started, "failure", document_name, details, exc)
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-        except Exception as exc:  # Keep unexpected errors in the Electron status area.
+            self._send_failure(exc, HTTPStatus.BAD_REQUEST)
+        except Exception as exc:  # Keep full diagnostics on disk; only curated messages cross IPC.
             self._log_request_operation(operation, started, "failure", document_name, details, exc)
-            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            self._send_failure(exc, HTTPStatus.INTERNAL_SERVER_ERROR)
         else:
-            self._log_request_operation(operation, started, "success", document_name, details)
+            failure = getattr(self, '_business_failure', '')
+            self._log_request_operation(operation, started, 'failure' if failure else 'success', document_name, details, ValueError(failure) if failure else None)
 
     def _operation_for_path(self, request_path: str) -> tuple[str, str] | None:
         if request_path == "/api/logs/events":
@@ -334,8 +361,11 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/shutdown":
             store = self.server.open_store()
             try:
-                store.cleanup_caches("exit")
-                store.cleanup_unreferenced_blobs()
+                for cleanup in (lambda: store.cleanup_caches("exit"), store.cleanup_unreferenced_blobs):
+                    try:
+                        cleanup()
+                    except Exception as exc:
+                        record_exception('cache.exit_cleanup_failed', exc)
             finally:
                 store.close()
             self._send_json(HTTPStatus.OK, {"ok": True})
@@ -512,7 +542,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
     def _sync_open_cache(self) -> None:
         store = self.server.open_store()
         try:
-            saved = store.sync_open_cache_changes()
+            saved = store.sync_open_cache_changes(strict=True)
             reclaimed = store.cleanup_unreferenced_blobs()
             self._operation_details.update({"saved_file_count": saved, "reclaimed_bytes": reclaimed})
             self._send_json(HTTPStatus.OK, {"saved": saved, "reclaimed": reclaimed})
@@ -588,7 +618,8 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                         store.add_local_file(source, target_id, infer_structured_file_name(source.name), tags=tags)
                         file_count += 1
                     except (OSError, ValueError) as exc:
-                        errors.append(f"{source.name}: {exc}")
+                        record_exception('import.file_skipped', exc, source_name=source.name)
+                        errors.append('文件无法读取或内容无效，已跳过')
         except Exception:
             store.delete_folder(root_id)
             raise
@@ -654,7 +685,14 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                     "folderId": result.folder_id,
                     "folderName": result.folder_name,
                     "downloaded": result.downloaded,
-                    "messages": result.messages,
+                    "messages": [
+                        '所有下载链接均失败，已保存源页面 HTML。' if '所有下载链接均失败' in message
+                        else '安全拦截：部分链接已跳过' if message.startswith('安全拦截')
+                        else '跳过无法访问的链接' if message.startswith('跳过')
+                        else '起始网址发生重定向，已按安全规则停止提取页面链接。' if message.startswith('起始网址发生重定向')
+                        else '爬取处理记录已保存到本地日志'
+                        for message in result.messages
+                    ],
                     "stats": result.stats,
                     "recursiveEnabled": recursive_enabled,
                 },
@@ -667,7 +705,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         try:
             settings = store.cache_settings()
             usage = store.cache_usage()
-            self._send_json(HTTPStatus.OK, {"dataHome": str(store.home), "cache": {"policy": settings.policy, "openDays": settings.open_days, "renderDays": settings.render_days, "maxBytes": settings.max_bytes, "targetBytes": settings.target_bytes, "clearOpenOnExit": settings.clear_open_on_exit, "usage": usage}})
+            self._send_json(HTTPStatus.OK, {"dataHome": str(store.home), "cache": {"policy": settings.policy, "openDays": settings.open_days, "renderDays": settings.render_days, "maxBytes": settings.max_bytes, "targetBytes": settings.target_bytes, "clearOpenOnExit": settings.clear_open_on_exit, "usage": usage}, "capabilities": self.server.capabilities})
         finally:
             store.close()
 
@@ -722,6 +760,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             raise
         self.server.library_home = target
         self.server.operation_logger.set_data_home(target)
+        record_event("data_home.migrated", data_home=target)
         self._send_json(HTTPStatus.OK, {"dataHome": str(target), "migrated": True})
 
     def _send_shortcuts(self) -> None:
@@ -763,7 +802,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             )
             self._send_json(HTTPStatus.OK, {"path": str(open_path), "documentName": item.display_name})
         except (OSError, ValueError) as exc:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            self._send_failure(exc, HTTPStatus.BAD_REQUEST)
         finally:
             store.close()
 
@@ -773,7 +812,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             item = store.get_item(item_id)
             self._send_json(HTTPStatus.OK, {"path": str(item.stored_path), "documentName": item.display_name})
         except ValueError as exc:
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+            self._send_failure(exc, HTTPStatus.NOT_FOUND)
         finally:
             store.close()
 
@@ -807,8 +846,8 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 ],
                 "items": [item_payload(item) for item in store.list_items(folder_id)],
             }
-        except ValueError:
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Folder not found"})
+        except ValueError as exc:
+            self._send_failure(exc, HTTPStatus.NOT_FOUND)
         else:
             self._send_json(HTTPStatus.OK, payload)
         finally:
@@ -917,8 +956,22 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         if include_csp:
             self.send_header("Content-Security-Policy", CONTENT_SECURITY_POLICY)
 
-    def _send_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    def end_headers(self) -> None:
+        self._response_started = True
+        super().end_headers()
+
+    def _send_failure(self, error: BaseException, status: HTTPStatus) -> None:
+        record_exception('bridge.request_failed', error, data_home=self.server.library_home, request_path=urllib.parse.urlparse(self.path).path)
+        if not getattr(self, '_response_started', False):
+            self._send_json(status, {}, error=error)
+
+    def _send_json(self, status: HTTPStatus, payload: dict[str, Any], *, error: BaseException | None = None) -> None:
+        path = urllib.parse.urlparse(self.path).path
+        if status >= 400 and error is None:
+            record_event('bridge.request_rejected', data_home=self.server.library_home, request_path=path, status=int(status))
+        envelope = response_envelope(int(status), payload, path, error=error)
+        self._business_failure = envelope['msg'] if not envelope['ok'] else ''
+        data = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
@@ -929,30 +982,8 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="BookManager Electron bridge")
-    parser.add_argument("--port", type=int, default=0)
-    parser.add_argument("--token", help=argparse.SUPPRESS)
-    parser.add_argument("--data-home")
-    parser.add_argument("--static-dir", required=True)
-    args = parser.parse_args()
-
-    token = args.token or os.environ.get("BOOKMANAGER_BRIDGE_TOKEN", "")
-    if len(token) < 32:
-        parser.error("bridge token is missing or too short")
-
-    server = BridgeServer(
-        ("127.0.0.1", args.port),
-        Path(args.data_home).expanduser().resolve() if args.data_home else None,
-        token,
-        Path(args.static_dir).expanduser(),
-    )
-    print(json.dumps({"event": "ready", "port": server.server_port}), flush=True)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
+    from .startup import main as startup_main
+    startup_main()
 
 
 if __name__ == "__main__":

@@ -13,6 +13,8 @@ import urllib.request
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
+
+from .diagnostics import record_exception
 from typing import Callable, Iterable, Optional
 
 from .store import LibraryStore, safe_name
@@ -161,6 +163,7 @@ def is_url_safe(url: str) -> bool:
     try:
         validated_url(url)
     except (OSError, UnsafeUrlError):
+        record_exception('crawler.recovered')
         return False
     return True
 
@@ -281,6 +284,7 @@ class SafeHttpClient:
                 )
                 return _PinnedResponse(connection.getresponse(), connection)
             except (OSError, http.client.HTTPException) as exc:
+                record_exception('crawler.connection_retry', exc)
                 last_error = exc
                 if connection is not None:
                     connection.close()
@@ -292,6 +296,7 @@ def _content_length(headers) -> int | None:  # noqa: ANN001
     try:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
+        record_exception('crawler.invalid_content_length')
         return None
 
 
@@ -337,6 +342,7 @@ def _crawl_temporary_root(store: LibraryStore) -> Path:
     try:
         root.chmod(0o700)
     except OSError:
+        record_exception('crawler.recovered')
         pass
     return root
 
@@ -437,9 +443,11 @@ def crawl_into_library(
                     )
                     downloads.extend(child_downloads)
                 except UnsafeUrlError as exc:
+                    record_exception('crawler.recovered')
                     stats["skipped_safe_block"] += 1
                     messages.append(f"安全拦截一级链接：{exc}")
                 except (OSError, ValueError, urllib.error.URLError) as exc:
+                    record_exception('crawler.recovered')
                     messages.append(f"跳过一级链接 {page_url}: {exc}")
 
         for link_url, label in downloads:
@@ -468,9 +476,11 @@ def crawl_into_library(
                 downloaded += 1
                 stats["success"] += 1
             except UnsafeUrlError as exc:
+                record_exception('crawler.recovered')
                 stats["skipped_safe_block"] += 1
                 messages.append(f"安全拦截下载链接：{exc}")
             except (OSError, ValueError, urllib.error.URLError) as exc:
+                record_exception('crawler.recovered')
                 messages.append(f"跳过 {link_url}: {exc}")
 
     if downloaded == 0:
@@ -505,6 +515,7 @@ def recursive_link_candidates(
         try:
             absolute = normalize_url(urllib.parse.urljoin(base_url, href))
         except (OSError, ValueError):
+            record_exception('crawler.recovered')
             stats["skipped_safe_block"] += 1
             continue
         if url_origin(absolute) != origin:
@@ -535,6 +546,7 @@ def download_candidates(
             if validator is not None:
                 absolute = validator(absolute)
         except (OSError, ValueError):
+            record_exception('crawler.recovered')
             continue
         parsed = urllib.parse.urlparse(absolute)
         suffix = Path(parsed.path).suffix.lower()
