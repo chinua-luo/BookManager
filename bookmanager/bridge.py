@@ -630,11 +630,35 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             store.close()
 
     def _crawl(self, payload: dict[str, Any]) -> None:
+        recursive_enabled = payload.get("enable_recursive") is True
         store = self.server.open_store()
         try:
-            result = crawl_into_library(store, str(payload.get("source", "")), int(payload["folderId"]))
-            self._operation_details.update({"folder_name": result.folder_name, "downloaded": result.downloaded})
-            self._send_json(HTTPStatus.OK, {"folderId": result.folder_id, "folderName": result.folder_name, "downloaded": result.downloaded, "messages": result.messages})
+            result = crawl_into_library(
+                store,
+                str(payload.get("source", "")),
+                int(payload["folderId"]),
+                follow_links=recursive_enabled,
+                sandboxed_recursive_mode=recursive_enabled,
+            )
+            self._operation_details.update(
+                {
+                    "folder_name": result.folder_name,
+                    "downloaded": result.downloaded,
+                    "recursive_enabled": recursive_enabled,
+                    **result.stats,
+                }
+            )
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "folderId": result.folder_id,
+                    "folderName": result.folder_name,
+                    "downloaded": result.downloaded,
+                    "messages": result.messages,
+                    "stats": result.stats,
+                    "recursiveEnabled": recursive_enabled,
+                },
+            )
         finally:
             store.close()
 

@@ -9,6 +9,7 @@ import wordRenderer from '@file-viewer/renderer-word'
 import { createDjvuPreview, isDjvuExtension } from './djvu-preview.js'
 import { bindFileActivation } from './file-activation.js'
 import { createPreviewCoordinator } from './preview-coordinator.js'
+import { crawlRequestPayload, recursiveEnabled } from './recursive-crawl.mjs'
 import './style.css'
 
 const $ = selector => document.querySelector(selector)
@@ -153,7 +154,7 @@ function modal(title, content, options = {}) {
     header.addEventListener('pointermove', move); header.addEventListener('pointerup', end); header.addEventListener('pointercancel', end)
   })
   cover.addEventListener('mousedown', event => { if (event.target === cover) close() }); panel.append(header, body, footer); cover.append(panel); if (options.nested) modalRoot.append(cover); else modalRoot.replaceChildren(cover)
-  return { close, panel, body }
+  return { close, panel, body, cover }
 }
 function ask(title, text, danger = false) { return new Promise(resolve => modal(title, element('p', 'dialog-hint', text), { buttons: [{ label: '取消', action: close => { close(); resolve(false) } }, { label: '确认', primary: !danger, danger, action: close => { close(); resolve(true) } }] })) }
 function promptValue(title, label, initial = '') { return new Promise(resolve => { const form = document.createElement('form'); form.className = 'form-stack'; const field = document.createElement('label'); field.textContent = label; const input = document.createElement('input'); input.value = initial; field.append(input); form.append(field); const dialog = modal(title, form, { buttons: [{ label: '取消', action: close => { close(); resolve(null) } }, { label: '确定', primary: true, action: close => { const value = input.value.trim(); close(); resolve(value || null) } }] }); form.addEventListener('submit', event => { event.preventDefault(); dialog.panel.querySelector('.primary').click() }); input.focus() }) }
@@ -324,7 +325,83 @@ function openSearch() {
   content.querySelector('[data-action="select-tags"]').addEventListener('click', () => openTagPicker(content.querySelector('input[data-kind="tags"]')).catch(error))
   modal('搜索资料库', content, { wide: true, buttons: [{ label: '取消', action: close => close() }, { label: '搜索', primary: true, action: async close => { const grouped = {}; content.querySelectorAll('input[data-kind]').forEach(input => { (grouped[input.dataset.kind] ||= {})[input.dataset.key] = input.value.trim() }); const active = Object.entries(grouped).filter(([, values]) => Object.values(values).some(Boolean)); if (active.length !== 1) { message('请仅填写一个搜索范围。'); return } close(); const [kind, values] = active[0]; searchResults(await window.bookManager.post('/api/search', { kind, ...values })) } }] })
 }
-async function crawl() { const source = await promptValue('爬取网络系列数据', '输入网址或 Springer 系列编号'); if (!source) return; message('正在爬取，请稍候…'); const result = await window.bookManager.post('/api/crawl', { source, folderId: selectedFolderId }); await refresh(result.folderId); message(`爬取完成：${result.folderName}，导入 ${result.downloaded} 个文件。`) }
+function confirmRecursiveRisk() {
+  return new Promise(resolve => {
+    let settled = false
+    let dialog
+    const finish = (confirmed, close) => {
+      if (settled) return
+      settled = true
+      document.removeEventListener('keydown', onKeyDown, true)
+      close()
+      resolve(confirmed)
+    }
+    const onKeyDown = event => {
+      if (event.key === 'Escape') finish(false, dialog.close)
+    }
+    const warning = element('p', 'dialog-hint recursive-risk-text', '开启后软件会自动抓取当前页面内的同站链接。不可信网站可能触发异常网络请求。仅用于你信任的书籍站点。')
+    dialog = modal('风险提示', warning, { nested: true, buttons: [
+      { label: '取消', action: close => finish(false, close) },
+      { label: '我已了解风险，确认开启', primary: true, action: close => finish(true, close) }
+    ] })
+    dialog.cover.addEventListener('mousedown', event => {
+      if (event.target === dialog.cover) finish(false, dialog.close)
+    })
+    document.addEventListener('keydown', onKeyDown, true)
+  })
+}
+
+function crawl() {
+  let recursiveConfirmed = false
+  let running = false
+  const form = document.createElement('form'); form.className = 'form-stack crawl-form'
+  const sourceField = document.createElement('label'); sourceField.textContent = '输入网址或 Springer 系列编号'
+  const sourceInput = document.createElement('input'); sourceInput.autocomplete = 'off'; sourceField.append(sourceInput)
+  const recursiveOption = document.createElement('label'); recursiveOption.className = 'crawl-recursive-option'
+  const checkbox = document.createElement('input'); checkbox.type = 'checkbox'
+  recursiveOption.append(checkbox, document.createTextNode('高级：抓取页面内同站链接（有安全风险）'))
+  const startButton = document.createElement('button'); startButton.type = 'submit'; startButton.className = 'dialog-button primary crawl-start'; startButton.textContent = '开始爬取'
+  const crawlStatus = element('p', 'dialog-hint crawl-status', '')
+  form.append(sourceField, recursiveOption, startButton, crawlStatus)
+  const dialog = modal('爬取网络系列数据', form, { buttons: [
+    { label: '取消', action: close => { if (!running) close() } }
+  ] })
+  checkbox.addEventListener('change', async () => {
+    if (!checkbox.checked) { recursiveConfirmed = false; return }
+    checkbox.disabled = true
+    recursiveConfirmed = await confirmRecursiveRisk()
+    if (!checkbox.isConnected) return
+    checkbox.checked = recursiveConfirmed
+    checkbox.disabled = false
+    if (!recursiveConfirmed) checkbox.focus()
+  })
+  form.addEventListener('submit', async event => {
+    event.preventDefault()
+    if (running) return
+    const source = sourceInput.value.trim()
+    if (!source) { crawlStatus.textContent = '请输入网址或 Springer 系列编号。'; sourceInput.focus(); return }
+    running = true
+    dialog.panel.querySelectorAll('input, button').forEach(control => { control.disabled = true })
+    crawlStatus.textContent = '正在爬取，请稍候…'
+    try {
+      const enabled = recursiveEnabled(checkbox.checked, recursiveConfirmed)
+      const result = await window.bookManager.post('/api/crawl', crawlRequestPayload(source, selectedFolderId, checkbox.checked, recursiveConfirmed))
+      dialog.close()
+      await refresh(result.folderId)
+      const stats = result.stats || {}
+      const summary = enabled
+        ? `；链接 ${stats.total_links || 0}，跨源丢弃 ${stats.skipped_cross_origin || 0}，安全拦截 ${stats.skipped_safe_block || 0}`
+        : ''
+      message(`爬取完成：${result.folderName}，导入 ${result.downloaded} 个文件${summary}。`)
+    } catch (issue) {
+      console.error(issue)
+      crawlStatus.textContent = `爬取失败：${issue instanceof Error ? issue.message : issue}`
+      running = false
+      dialog.panel.querySelectorAll('input, button').forEach(control => { control.disabled = false })
+    }
+  })
+  sourceInput.focus()
+}
 async function dataLocation() { const settings = await window.bookManager.get('/api/settings'); const content = document.createElement('div'); content.className = 'form-stack data-location'; const heading = document.createElement('p'); heading.className = 'dialog-hint'; heading.textContent = '当前数据位置'; const location = document.createElement('input'); location.readOnly = true; location.value = settings.dataHome; location.title = settings.dataHome; const hint = document.createElement('p'); hint.className = 'dialog-hint'; hint.textContent = '迁移目标必须是空文件夹。'; content.append(heading, location, hint); modal('数据位置', content, { buttons: [{ label: '关闭', action: close => close() }, { label: '选择新位置并迁移', primary: true, action: async close => { const path = await window.bookManager.selectFolder('选择新的数据文件夹'); if (!path || !(await ask('迁移数据', `将全部书籍数据迁移到：\n${path}`))) return; await window.bookManager.post('/api/settings/data/migrate', { path }); close(); await refresh(); message('数据已迁移到新位置。') } }] }) }
 const cachePresets = {
   '平衡模式': { openDays: 7, renderDays: 30, maxGb: 4, targetGb: 3, clearOpenOnExit: false },
@@ -353,7 +430,7 @@ async function cacheSettings() {
     { label: '保存设置', primary: true, action: async close => { const selected = value('policy').value; const requested = { openDays: Number(value('openDays').value), renderDays: Number(value('renderDays').value), maxGb: Number(value('maxBytes').value), targetGb: Number(value('targetBytes').value), clearOpenOnExit: value('clearOpenOnExit').checked }; const preset = cachePresets[selected]; const matchesPreset = preset && preset.openDays === requested.openDays && preset.renderDays === requested.renderDays && preset.maxGb === requested.maxGb && preset.targetGb === requested.targetGb && preset.clearOpenOnExit === requested.clearOpenOnExit; await window.bookManager.post('/api/settings/cache', { policy: matchesPreset ? selected : '自定义', openDays: requested.openDays, renderDays: requested.renderDays, maxBytes: Math.round(requested.maxGb * 1024 ** 3), targetBytes: Math.round(requested.targetGb * 1024 ** 3), clearOpenOnExit: requested.clearOpenOnExit }); close(); message('缓存设置已保存。') }}]
   })
 }
-function help() { const content = element('div', 'form-stack'); ['添加：导入文件或整个文件夹。', '新建文件夹：在当前文件夹下创建虚拟文件夹。', '打开：用系统默认程序打开文件，或显示底层 Hash 文件。', '按规则重命名：编辑系列、标题、版本、作者、备注与标签。', '保存打开缓存改动：把经系统默认程序修改的缓存副本写回底层文件，并同步所有镜像。', '爬取系列：输入网址或 Springer 系列编号。', '右键菜单：文件夹可新建、重命名、移动、排序、删除；文件可打开、复制、移动、镜像、替换、删除。'].forEach(text => content.append(element('p', '', text))); modal('功能介绍', content, { buttons: [{ label: '关闭', primary: true, action: close => close() }] }) }
+function help() { const content = element('div', 'form-stack'); ['添加：导入文件或整个文件夹。', '新建文件夹：在当前文件夹下创建虚拟文件夹。', '打开：用系统默认程序打开文件，或显示底层 Hash 文件。', '按规则重命名：编辑系列、标题、版本、作者、备注与标签。', '保存打开缓存改动：把经系统默认程序修改的缓存副本写回底层文件，并同步所有镜像。', '爬取系列：输入网址或 Springer 系列编号；高级选项可在确认风险后抓取当前页面的一层同站链接。', '右键菜单：文件夹可新建、重命名、移动、排序、删除；文件可打开、复制、移动、镜像、替换、删除。'].forEach(text => content.append(element('p', '', text))); modal('功能介绍', content, { buttons: [{ label: '关闭', primary: true, action: close => close() }] }) }
 async function shortcutDialog() { shortcuts = (await window.bookManager.get('/api/shortcuts')).shortcuts || {}; const actions = [['import-file', '导入文件'], ['create-folder', '新建文件夹'], ['open-selected', '打开文件'], ['rename-selected', '按规则重命名'], ['search', '搜索'], ['crawl', '爬取系列'], ['save-text', '保存打开缓存改动']]; const content = document.createElement('div'); content.className = 'shortcut-grid'; actions.forEach(([action, label]) => { const name = document.createElement('div'); name.textContent = label; const input = document.createElement('input'); input.readOnly = true; input.placeholder = '点击后按键设置；退格清除'; input.value = shortcuts[action] || ''; input.addEventListener('keydown', async event => { event.preventDefault(); const accelerator = event.key === 'Backspace' ? '' : `${event.metaKey || event.ctrlKey ? 'CommandOrControl+' : ''}${event.altKey ? 'Alt+' : ''}${event.shiftKey ? 'Shift+' : ''}${event.key.length === 1 ? event.key.toUpperCase() : event.key}`; try { shortcuts = (await window.bookManager.post('/api/settings/shortcuts', { action, accelerator })).shortcuts; input.value = shortcuts[action] || '' } catch (issue) { error(issue) } }); content.append(name, input) }); modal('快捷键', content, { wide: true, buttons: [{ label: '关闭', primary: true, action: close => close() }] }) }
 
 async function contextAction(action) { const target = contextTarget; closeContext(); if (!target) return; const folder = target.folder; const item = target.item; if (action === 'folder-open') return selectFolder(folder.id); if (action === 'folder-create') return createFolder(folder.id); if (action === 'folder-rename') return renameFolder(folder); if (action === 'folder-move') return moveFolder(folder); if (action === 'folder-delete') return deleteFolder(folder); if (action === 'sort-standard' || action === 'sort-series') { sortModes.set(folder.id, action === 'sort-series' ? '序列' : '标准'); await selectFolder(selectedFolderId); message(`当前文件夹及子文件夹已按“${sortModes.get(folder.id)}”排序。`); return } if (action === 'file-open') return openDefault(item); if (action === 'file-location') return window.bookManager.showLocation(item.id, item.displayName); if (action === 'file-copy') { await window.bookManager.copyFileName(item.displayName); message('已复制文件名。'); return } if (action === 'file-delete') return deleteItem(item); if (action === 'file-delete-underlying') return deleteUnderlying(item); if (action === 'file-rename') return renameItem(item); if (action === 'file-move') return moveItem(item); if (action === 'file-mirror') return mirrorItem(item); if (action === 'file-replace') return replaceDocument(item) }

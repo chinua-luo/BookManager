@@ -9,8 +9,10 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 from bookmanager.bridge import BridgeServer
+from bookmanager.crawler import CrawlResult
 from bookmanager.operation_log import OperationLogger
 
 
@@ -118,6 +120,20 @@ class OperationLogBridgeTests(unittest.TestCase):
         self.assertEqual(record["event"], "folder.create")
         self.assertEqual(record["result"], "failure")
         self.assertTrue(record["error"])
+
+    def test_crawl_only_enables_recursion_for_exact_boolean_true(self) -> None:
+        for requested, expected in ((True, True), (False, False), ("true", False)):
+            with self.subTest(requested=requested):
+                result = CrawlResult(2, "Series", 1, [], {"total_links": 3, "success": 1, "skipped_cross_origin": 1, "skipped_safe_block": 0})
+                with mock.patch("bookmanager.bridge.crawl_into_library", return_value=result) as crawl:
+                    response = self.request(
+                        "/api/crawl",
+                        {"source": "https://example.com", "folderId": 1, "enable_recursive": requested},
+                    )
+
+                self.assertEqual(response["recursiveEnabled"], expected)
+                self.assertEqual(crawl.call_args.kwargs["follow_links"], expected)
+                self.assertEqual(crawl.call_args.kwargs["sandboxed_recursive_mode"], expected)
 
 
 if __name__ == "__main__":
