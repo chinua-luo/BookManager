@@ -10,6 +10,8 @@ import { createDjvuPreview, isDjvuExtension } from './djvu-preview.js'
 import { bindFileActivation } from './file-activation.js'
 import { createPreviewCoordinator } from './preview-coordinator.js'
 import { crawlRequestPayload, recursiveEnabled } from './recursive-crawl.mjs'
+import { createModalManager } from './modal-manager.js'
+import { notificationFromError, importSummary, crawlSummary } from '../user-errors.mjs'
 import './style.css'
 
 const $ = selector => document.querySelector(selector)
@@ -65,7 +67,13 @@ const djvuHost = document.createElement('div'); djvuHost.className = 'djvu-viewe
 const djvuPreview = createDjvuPreview(djvuHost)
 
 function message(value) { status.textContent = value }
-function error(errorValue) { console.error(errorValue); message(`操作失败：${errorValue instanceof Error ? errorValue.message : errorValue}`) }
+const modalManager = createModalManager()
+function notice({ title, msg, errorType, level = 'error' }) {
+  message(msg)
+  if (level === 'fatal') return
+  modal(title, element('p', 'dialog-hint', msg), { level, key: errorType, dedup: true, nested: true, buttons: [{ label: '确定', primary: true, action: close => close() }] })
+}
+function error(errorValue) { console.error(errorValue); notice(notificationFromError(errorValue)) }
 function element(tag, className = '', text = '') { const node = document.createElement(tag); if (className) node.className = className; node.textContent = String(text); return node }
 function size(value) { const units = ['B', 'KB', 'MB', 'GB']; let number = Number(value) || 0; for (const unit of units) { if (number < 1024 || unit === 'GB') return unit === 'B' ? `${number} B` : `${number.toFixed(1)} ${unit}`; number /= 1024 } }
 function closeMenus() { appMenu.querySelectorAll('details').forEach(menu => { menu.open = false }) }
@@ -110,7 +118,7 @@ const previewCoordinator = createPreviewCoordinator({
     const extension = item.extension.toLowerCase()
     if (textExtensions.has(extension)) {
       const url = await window.bookManager.documentUrl(item.documentId)
-      const content = await fetch(url).then(response => response.text())
+      const content = await fetch(url).then(response => { if (!response.ok) throw new Error('预览失败'); return response.text() })
       if (!isCurrent()) return
       const textPreview = document.createElement('pre'); textPreview.className = 'text-preview'; textPreview.textContent = content; showPreviewNode(textPreview)
       return
@@ -137,14 +145,24 @@ function folderSummary(payload) { previewCoordinator.invalidate(); setPreviewTit
 function modal(title, content, options = {}) {
   modalRoot.hidden = false
   const cover = document.createElement('div'); cover.className = `modal-backdrop${options.nested ? ' nested' : ''}`
-  const panel = document.createElement('section'); panel.className = `modal${options.wide ? ' wide' : ''}`
+  const panel = document.createElement('section'); panel.className = `modal${options.wide ? ' wide' : ''}${options.level ? ` modal-${options.level}` : ''}`
   const header = document.createElement('header'); header.textContent = title
   const body = document.createElement('div'); body.className = 'modal-body'; body.append(content)
   const footer = document.createElement('footer'); footer.className = 'modal-footer'
-  const close = () => { cover.remove(); modalRoot.hidden = !modalRoot.childElementCount }
-  for (const item of options.buttons || []) { const button = document.createElement('button'); button.type = 'button'; button.className = `dialog-button${item.primary ? ' primary' : ''}${item.danger ? ' danger' : ''}`; button.textContent = item.label; button.addEventListener('click', () => item.action(close)); footer.append(button) }
+  let release = () => {}
+  const close = () => release()
+  panel.setAttribute('role', options.level === 'error' || options.level === 'warning' ? 'alertdialog' : 'dialog')
+  panel.setAttribute('aria-modal', 'true'); panel.setAttribute('aria-label', title)
+  let busy = false
+  for (const item of options.buttons || []) { const button = document.createElement('button'); button.type = 'button'; button.className = `dialog-button${item.primary ? ' primary' : ''}${item.danger ? ' danger' : ''}`; button.textContent = item.label; button.addEventListener('click', async () => {
+    if (busy) return
+    busy = true
+    const controls = [...footer.querySelectorAll('button')]; controls.forEach(control => { control.disabled = true })
+    try { await item.action(close) } catch (issue) { error(issue) }
+    finally { busy = false; controls.forEach(control => { control.disabled = false }) }
+  }); footer.append(button) }
   const primary = footer.querySelector('.primary')
-  panel.addEventListener('keydown', event => { if (event.key === 'Enter' && !event.defaultPrevented && !event.isComposing && primary) { event.preventDefault(); primary.click() } })
+  panel.addEventListener('keydown', event => { if (cover.hidden) return; if (event.key === 'Enter' && !event.defaultPrevented && !event.isComposing && primary) { event.preventDefault(); primary.click() } })
   header.addEventListener('pointerdown', event => {
     if (event.button !== 0) return
     const bounds = panel.getBoundingClientRect(); const startX = event.clientX; const startY = event.clientY; const originX = bounds.left; const originY = bounds.top
@@ -153,11 +171,27 @@ function modal(title, content, options = {}) {
     const end = () => { panel.classList.remove('dragging'); header.removeEventListener('pointermove', move); header.removeEventListener('pointerup', end); header.removeEventListener('pointercancel', end) }
     header.addEventListener('pointermove', move); header.addEventListener('pointerup', end); header.addEventListener('pointercancel', end)
   })
-  cover.addEventListener('mousedown', event => { if (event.target === cover) close() }); panel.append(header, body, footer); cover.append(panel); if (options.nested) modalRoot.append(cover); else modalRoot.replaceChildren(cover)
+  cover.addEventListener('mousedown', event => { if (event.target === cover && !busy) close() })
+  panel.addEventListener('keydown', event => {
+    if (cover.hidden) return
+    if (event.key === 'Tab') {
+      const controls = [...panel.querySelectorAll('input,button,textarea,select,[tabindex]')].filter(control => !control.disabled && control.tabIndex !== -1)
+      const first = controls[0]; const last = controls.at(-1)
+      if (controls.length && (event.shiftKey ? document.activeElement === first : document.activeElement === last)) { event.preventDefault(); (event.shiftKey ? last : first).focus() }
+    }
+    if (event.key === 'Escape' && !busy) { event.preventDefault(); close() } })
+  panel.append(header, body, footer); cover.append(panel); cover.hidden = true; modalRoot.append(cover)
+  const previousFocus = document.activeElement
+  release = modalManager.show({
+    allowChild: !options.level && !options.key,
+    show: () => { modalRoot.hidden = false; cover.hidden = false; cover.inert = false; (panel.querySelector('input,button,textarea,select') || panel).focus() },
+    hide: () => { cover.hidden = true; cover.inert = true },
+    dismiss: () => { cover.remove(); modalRoot.hidden = ![...modalRoot.children].some(child => !child.hidden); options.onDismiss?.(); if (previousFocus?.isConnected) previousFocus.focus() }
+  }, { key: options.key, dedup: options.dedup, nested: options.nested })
   return { close, panel, body, cover }
 }
-function ask(title, text, danger = false) { return new Promise(resolve => modal(title, element('p', 'dialog-hint', text), { buttons: [{ label: '取消', action: close => { close(); resolve(false) } }, { label: '确认', primary: !danger, danger, action: close => { close(); resolve(true) } }] })) }
-function promptValue(title, label, initial = '') { return new Promise(resolve => { const form = document.createElement('form'); form.className = 'form-stack'; const field = document.createElement('label'); field.textContent = label; const input = document.createElement('input'); input.value = initial; field.append(input); form.append(field); const dialog = modal(title, form, { buttons: [{ label: '取消', action: close => { close(); resolve(null) } }, { label: '确定', primary: true, action: close => { const value = input.value.trim(); close(); resolve(value || null) } }] }); form.addEventListener('submit', event => { event.preventDefault(); dialog.panel.querySelector('.primary').click() }); input.focus() }) }
+function ask(title, text, danger = false) { return new Promise(resolve => modal(title, element('p', 'dialog-hint', text), { key: `confirm:${title}:${text}`, nested: true, onDismiss: () => resolve(false), buttons: [{ label: '取消', action: close => { resolve(false); close() } }, { label: '确认', primary: !danger, danger, action: close => { resolve(true); close() } }] })) }
+function promptValue(title, label, initial = '', allowEmpty = false) { return new Promise(resolve => { const form = document.createElement('form'); form.className = 'form-stack'; const field = document.createElement('label'); field.textContent = label; const input = document.createElement('input'); input.value = initial; field.append(input); form.append(field); const dialog = modal(title, form, { onDismiss: () => resolve(null), buttons: [{ label: '取消', action: close => { close(); resolve(null) } }, { label: '确定', primary: true, action: close => { const value = input.value.trim(); resolve(value || (allowEmpty ? '' : null)); close() } }] }); form.addEventListener('submit', event => { event.preventDefault(); dialog.panel.querySelector('.primary').click() }); input.focus() }) }
 function tagValues(input) { return input.value.split(',').map(value => value.trim()).filter(Boolean) }
 async function openTagPicker(input) {
   const result = await window.bookManager.get('/api/tags'); const selected = new Map(tagValues(input).map(value => [value.toLocaleLowerCase(), value]))
@@ -231,7 +265,7 @@ async function chooseFolder(title, excludedId = null) {
       const add = folder => { if (folder.id === excludedId) return; const button = document.createElement('button'); button.type = 'button'; button.textContent = folder.id === shown.id ? `选择当前文件夹：${folder.name}` : folder.name; if (folder.id === picked) button.classList.add('selected'); button.addEventListener('click', () => { picked = folder.id; render() }); button.addEventListener('dblclick', () => { shown = folder; picked = null; render() }); list.append(button) }
       add(shown); (shown.children || []).forEach(add); content.append(crumbs, hint, list)
     }
-    render(); modal(title, content, { buttons: [{ label: '取消', action: close => { close(); resolve(null) } }, { label: '确认', primary: true, action: close => { if (!picked) { message('请先选择目标文件夹。'); return } close(); resolve(picked) } }] })
+    render(); modal(title, content, { onDismiss: () => resolve(null), buttons: [{ label: '取消', action: close => { close(); resolve(null) } }, { label: '确认', primary: true, action: close => { if (!picked) { notice({ title: '请检查输入', msg: '请先选择目标文件夹。', errorType: 'folder_required' }); return } resolve(picked); close() } }] })
   })
 }
 
@@ -241,7 +275,7 @@ async function nameDialog(title, item = null, sourcePath = null) {
   const candidate = sourcePath ? (await window.bookManager.post('/api/name-candidate', { path: sourcePath })).nameParts : (item?.nameParts || {})
   return new Promise(resolve => {
     const form = document.createElement('form'); form.className = 'form-grid'; const controls = {}; const keys = [['系列缩写', 'seriesAbbr'], ['编号', 'number'], ['主标题名', 'mainTitle'], ['副标题名', 'subtitle'], ['版本号', 'edition'], ['作者信息', 'authors'], ['扩展名', 'extension']]
-    if (sourcePath) { const paste = document.createElement('label'); paste.className = 'span-2'; paste.textContent = '复制文本识别名称字符段'; const textarea = document.createElement('textarea'); textarea.rows = 2; const apply = document.createElement('button'); apply.type = 'button'; apply.className = 'dialog-button'; apply.textContent = '应用文本'; apply.addEventListener('click', async () => { const value = textarea.value.trim(); if (!value) { message('请先粘贴名称文本。'); return } try { const result = await window.bookManager.post('/api/name-parse', { text: value }); const includesExtension = /\.[A-Za-z0-9]{1,10}\s*$/.test(value); keys.forEach(([, key]) => { if (key !== 'extension' || includesExtension) controls[key].value = result.nameParts[key] || '' }); languageSelect.value = result.nameParts.editionLanguage || languageSelect.value; refreshPreview() } catch (issue) { error(issue) } }); paste.append(textarea, apply); form.append(paste) }
+    if (sourcePath) { const paste = document.createElement('label'); paste.className = 'span-2'; paste.textContent = '复制文本识别名称字符段'; const textarea = document.createElement('textarea'); textarea.rows = 2; const apply = document.createElement('button'); apply.type = 'button'; apply.className = 'dialog-button'; apply.textContent = '应用文本'; apply.addEventListener('click', async () => { const value = textarea.value.trim(); if (!value) { notice({ title: '请检查输入', msg: '请先粘贴名称文本。', errorType: 'name_text_required' }); return } try { const result = await window.bookManager.post('/api/name-parse', { text: value }); const includesExtension = /\.[A-Za-z0-9]{1,10}\s*$/.test(value); keys.forEach(([, key]) => { if (key !== 'extension' || includesExtension) controls[key].value = result.nameParts[key] || '' }); languageSelect.value = result.nameParts.editionLanguage || languageSelect.value; refreshPreview() } catch (issue) { error(issue) } }); paste.append(textarea, apply); form.append(paste) }
     for (const [label, key] of keys) { const field = document.createElement('label'); field.textContent = label; const input = document.createElement('input'); input.value = candidate[key] || (key === 'edition' ? '1' : ''); input.addEventListener('input', refreshPreview); field.append(input); form.append(field); controls[key] = input }
     const language = document.createElement('label'); language.textContent = '版本语言'; const languageSelect = document.createElement('select'); languageSelect.className = 'dialog-select'; languageSelect.append(new Option('英文'), new Option('中文')); languageSelect.value = candidate.editionLanguage || '英文'; languageSelect.addEventListener('change', refreshPreview); language.append(languageSelect); form.append(language)
     const caseOption = document.createElement('label'); caseOption.textContent = '主、副标题格式'; const caseSelect = document.createElement('select'); caseSelect.className = 'dialog-select'; caseSelect.append(new Option('原样'), new Option('驼峰化')); caseOption.append(caseSelect); form.append(caseOption)
@@ -251,13 +285,13 @@ async function nameDialog(title, item = null, sourcePath = null) {
     function data() { const values = {}; keys.forEach(([, key]) => { values[key] = controls[key].value.trim() }); if (caseSelect.value === '驼峰化') { values.mainTitle = titleCase(values.mainTitle); values.subtitle = titleCase(values.subtitle) }; values.editionLanguage = languageSelect.value; return values }
     function refreshPreview() { previewName.textContent = nameDisplay(data()) || '待补全：文件名整体不能为空' }
     refreshPreview()
-    if (sourcePath) { metadata.textContent = '正在后台分析文件元数据…'; window.bookManager.post('/api/name-metadata', { path: sourcePath }).then(result => { metadata.textContent = result.message; if (result.extracted) keys.forEach(([, key]) => { if (!controls[key].value.trim() && result.nameParts[key]) controls[key].value = result.nameParts[key] }); refreshPreview() }).catch(value => { metadata.textContent = `内容分析失败：${value.message}` }) }
-    const dialog = modal(title, form, { wide: true, buttons: [{ label: '取消', action: close => { close(); resolve(null) } }, { label: '确定', primary: true, action: close => { const nameParts = data(); if (!nameDisplay(nameParts)) { message('文件名整体不能为空。'); return } close(); resolve({ nameParts, note: noteInput.value.trim(), tags: tagsInput.value.split(',').map(value => value.trim()).filter(Boolean) }) } }] }); form.addEventListener('submit', event => { event.preventDefault(); dialog.panel.querySelector('.primary').click() })
+    if (sourcePath) { metadata.textContent = '正在后台分析文件元数据…'; window.bookManager.post('/api/name-metadata', { path: sourcePath }).then(result => { metadata.textContent = result.extracted ? '已提取文件元数据，可检查并修改。' : '未提取到可用元数据，请手动填写名称信息。'; if (result.extracted) keys.forEach(([, key]) => { if (!controls[key].value.trim() && result.nameParts[key]) controls[key].value = result.nameParts[key] }); refreshPreview() }).catch(value => { console.error(value); metadata.textContent = '未能分析文件内容，可手动填写名称信息。' }) }
+    const dialog = modal(title, form, { wide: true, onDismiss: () => resolve(null), buttons: [{ label: '取消', action: close => { close(); resolve(null) } }, { label: '确定', primary: true, action: close => { const nameParts = data(); if (!nameDisplay(nameParts)) { notice({ title: '请检查输入', msg: '文件名整体不能为空。', errorType: 'name_required' }); return } resolve({ nameParts, note: noteInput.value.trim(), tags: tagsInput.value.split(',').map(value => value.trim()).filter(Boolean) }); close() } }] }); form.addEventListener('submit', event => { event.preventDefault(); dialog.panel.querySelector('.primary').click() })
   })
 }
 
 async function showItem(item) {
-  selectedItem = item; setPreviewTitle(item.displayName); await previewCoordinator.show(item)
+  selectedItem = item; setPreviewTitle(item.displayName); await previewCoordinator.show(item).catch(issue => { console.error(issue); notice({ title: '预览失败', msg: '该文档无法预览，请尝试使用系统默认程序打开', errorType: 'preview_failed' }) })
 }
 function markContentSelection(button) { contentList.querySelectorAll('.content-row.selected').forEach(row => row.classList.remove('selected')); button.classList.add('selected') }
 function fileIconClass(extension) {
@@ -291,7 +325,7 @@ async function renameFolder(folder) { const name = await promptValue('重命名�
 async function moveFolder(folder) { const target = await chooseFolder('选择移动目标文件夹', folder.id); if (!target) return; await window.bookManager.post(`/api/folders/${folder.id}/move`, { targetFolderId: target }); await refresh(folder.id); message('文件夹已移动。') }
 async function deleteFolder(folder) { if (!(await ask('删除文件夹', `删除“${folder.name}”及其子文件夹、镜像文件？底层 Hash 文件不会删除。`, true))) return; await window.bookManager.post(`/api/folders/${folder.id}/delete`, {}); await refresh(folder.parentId || tree[0]?.id); message('文件夹及镜像文件已删除。') }
 async function importFile() { const path = await window.bookManager.selectFile(); if (!path) return; const details = await nameDialog('导入文件', null, path); if (!details) return; await window.bookManager.post('/api/import/file', { path, folderId: selectedFolderId, ...details }); await refresh(selectedFolderId); message('已导入文件并创建镜像。') }
-async function importFolder() { const path = await window.bookManager.selectFolder('选择要添加的文件夹'); if (!path) return; const text = await promptValue('为文件夹内书籍添加标签', '标签（以逗号分隔，可留空）'); const result = await window.bookManager.post('/api/import/folder', { path, folderId: selectedFolderId, tags: text ? text.split(',') : [] }); await refresh(result.folderId); message(`已添加文件夹，导入 ${result.fileCount} 个文件。`) }
+async function importFolder() { const path = await window.bookManager.selectFolder('选择要添加的文件夹'); if (!path) return; const text = await promptValue('为文件夹内书籍添加标签', '标签（以逗号分隔，可留空）', '', true); if (text === null) return; const result = await window.bookManager.post('/api/import/folder', { path, folderId: selectedFolderId, tags: text ? text.split(',') : [] }); await refresh(result.folderId); message(`已添加文件夹，导入 ${result.fileCount} 个文件。`); const warning = importSummary(result); if (warning) notice(warning) }
 async function renameItem(item = selectedItem) { if (!item) throw new Error('请先选择文件'); const details = await nameDialog('按规则重命名', item); if (!details) return; await window.bookManager.post(`/api/items/${item.id}/rename`, details); await refresh(selectedFolderId); message('已重命名；底层文件未复制或改名。') }
 async function moveItem(item) { const target = await chooseFolder('选择移动目标文件夹'); if (!target) return; await window.bookManager.post(`/api/items/${item.id}/move`, { targetFolderId: target }); await refresh(selectedFolderId); message('镜像文件已移动。') }
 async function mirrorItem(item) { const target = await chooseFolder('选择镜像目标文件夹'); if (!target) return; await window.bookManager.post(`/api/items/${item.id}/mirror`, { targetFolderId: target }); await refresh(selectedFolderId); message('镜像已创建。') }
@@ -323,7 +357,7 @@ function openSearch() {
   const content = document.createElement('div'); content.className = 'form-stack'
   content.innerHTML = `<p class="dialog-hint">仅填写“底层文件”、“镜像文件”或“标签搜索”其中一项。</p><div class="search-columns"><section class="search-section"><h3>底层文件</h3><label>主标题<input data-kind="files" data-key="mainTitle"></label><label>副标题<input data-kind="files" data-key="subtitle"></label><label>作者名<input data-kind="files" data-key="authors"></label></section><section class="search-section"><h3>镜像文件</h3><label>主标题<input data-kind="mirrors" data-key="mainTitle"></label><label>副标题<input data-kind="mirrors" data-key="subtitle"></label><label>作者名<input data-kind="mirrors" data-key="authors"></label></section></div><section class="search-section"><h3>标签搜索</h3><label>标签名称<div class="tag-input-row"><input data-kind="tags" data-key="query"><button type="button" class="dialog-button" data-action="select-tags">选择标签</button></div></label></section>`
   content.querySelector('[data-action="select-tags"]').addEventListener('click', () => openTagPicker(content.querySelector('input[data-kind="tags"]')).catch(error))
-  modal('搜索资料库', content, { wide: true, buttons: [{ label: '取消', action: close => close() }, { label: '搜索', primary: true, action: async close => { const grouped = {}; content.querySelectorAll('input[data-kind]').forEach(input => { (grouped[input.dataset.kind] ||= {})[input.dataset.key] = input.value.trim() }); const active = Object.entries(grouped).filter(([, values]) => Object.values(values).some(Boolean)); if (active.length !== 1) { message('请仅填写一个搜索范围。'); return } close(); const [kind, values] = active[0]; searchResults(await window.bookManager.post('/api/search', { kind, ...values })) } }] })
+  modal('搜索资料库', content, { wide: true, buttons: [{ label: '取消', action: close => close() }, { label: '搜索', primary: true, action: async close => { const grouped = {}; content.querySelectorAll('input[data-kind]').forEach(input => { (grouped[input.dataset.kind] ||= {})[input.dataset.key] = input.value.trim() }); const active = Object.entries(grouped).filter(([, values]) => Object.values(values).some(Boolean)); if (active.length !== 1) { notice({ title: '搜索条件有误', msg: '请仅填写一个搜索范围。', errorType: 'search_scope' }); return } close(); const [kind, values] = active[0]; searchResults(await window.bookManager.post('/api/search', { kind, ...values })) } }] })
 }
 function confirmRecursiveRisk() {
   return new Promise(resolve => {
@@ -333,14 +367,14 @@ function confirmRecursiveRisk() {
       if (settled) return
       settled = true
       document.removeEventListener('keydown', onKeyDown, true)
-      close()
       resolve(confirmed)
+      close()
     }
     const onKeyDown = event => {
       if (event.key === 'Escape') finish(false, dialog.close)
     }
     const warning = element('p', 'dialog-hint recursive-risk-text', '开启后软件会自动抓取当前页面内的同站链接。不可信网站可能触发异常网络请求。仅用于你信任的书籍站点。')
-    dialog = modal('风险提示', warning, { nested: true, buttons: [
+    dialog = modal('风险提示', warning, { nested: true, key: 'recursive-risk', onDismiss: () => { if (!settled) { settled = true; document.removeEventListener('keydown', onKeyDown, true); resolve(false) } }, buttons: [
       { label: '取消', action: close => finish(false, close) },
       { label: '我已了解风险，确认开启', primary: true, action: close => finish(true, close) }
     ] })
@@ -379,7 +413,7 @@ function crawl() {
     event.preventDefault()
     if (running) return
     const source = sourceInput.value.trim()
-    if (!source) { crawlStatus.textContent = '请输入网址或 Springer 系列编号。'; sourceInput.focus(); return }
+    if (!source) { notice({ title: '网址无效', msg: '请输入网址或 Springer 系列编号。', errorType: 'crawl_source_required' }); sourceInput.focus(); return }
     running = true
     dialog.panel.querySelectorAll('input, button').forEach(control => { control.disabled = true })
     crawlStatus.textContent = '正在爬取，请稍候…'
@@ -393,16 +427,19 @@ function crawl() {
         ? `；链接 ${stats.total_links || 0}，跨源丢弃 ${stats.skipped_cross_origin || 0}，安全拦截 ${stats.skipped_safe_block || 0}`
         : ''
       message(`爬取完成：${result.folderName}，导入 ${result.downloaded} 个文件${summary}。`)
+      const warning = crawlSummary(result)
+      if (warning) notice(warning)
     } catch (issue) {
       console.error(issue)
-      crawlStatus.textContent = `爬取失败：${issue instanceof Error ? issue.message : issue}`
+      crawlStatus.textContent = notificationFromError(issue).msg
+      error(issue)
       running = false
       dialog.panel.querySelectorAll('input, button').forEach(control => { control.disabled = false })
     }
   })
   sourceInput.focus()
 }
-async function dataLocation() { const settings = await window.bookManager.get('/api/settings'); const content = document.createElement('div'); content.className = 'form-stack data-location'; const heading = document.createElement('p'); heading.className = 'dialog-hint'; heading.textContent = '当前数据位置'; const location = document.createElement('input'); location.readOnly = true; location.value = settings.dataHome; location.title = settings.dataHome; const hint = document.createElement('p'); hint.className = 'dialog-hint'; hint.textContent = '迁移目标必须是空文件夹。'; content.append(heading, location, hint); modal('数据位置', content, { buttons: [{ label: '关闭', action: close => close() }, { label: '选择新位置并迁移', primary: true, action: async close => { const path = await window.bookManager.selectFolder('选择新的数据文件夹'); if (!path || !(await ask('迁移数据', `将全部书籍数据迁移到：\n${path}`))) return; await window.bookManager.post('/api/settings/data/migrate', { path }); close(); await refresh(); message('数据已迁移到新位置。') } }] }) }
+async function dataLocation() { const settings = await window.bookManager.get('/api/settings'); const content = document.createElement('div'); content.className = 'form-stack data-location'; const heading = document.createElement('p'); heading.className = 'dialog-hint'; heading.textContent = '当前数据位置'; const location = document.createElement('input'); location.readOnly = true; location.value = settings.dataHome; location.title = settings.dataHome; const hint = document.createElement('p'); hint.className = 'dialog-hint'; hint.textContent = '迁移目标必须是空文件夹。'; content.append(heading, location, hint); modal('数据位置', content, { buttons: [{ label: '关闭', action: close => close() }, { label: '选择新位置并迁移', primary: true, action: async close => { const path = await window.bookManager.selectFolder('选择新的数据文件夹'); if (!path || !(await ask('迁移数据', `将全部书籍数据迁移到：\n${path}`))) return; await window.bookManager.post('/api/settings/data/migrate', { path }); close(); await refresh(); notice({ title: '迁移完成', msg: '书库数据已成功迁移到目标目录', errorType: 'migration_complete', level: 'success' }) } }] }) }
 const cachePresets = {
   '平衡模式': { openDays: 7, renderDays: 30, maxGb: 4, targetGb: 3, clearOpenOnExit: false },
   '节省磁盘模式': { openDays: 0, renderDays: 7, maxGb: 1, targetGb: 0.75, clearOpenOnExit: true },
@@ -453,6 +490,7 @@ folderTree.addEventListener('keydown', event => moveListSelection(event, folderT
 
 appMenu.querySelectorAll('summary').forEach(summary => summary.addEventListener('click', () => { for (const menu of appMenu.querySelectorAll('details')) if (menu !== summary.parentElement) menu.open = false }))
 appMenu.addEventListener('click', event => { const button = event.target.closest('button[data-action]'); if (button) action(button.dataset.action).catch(error) }); $('#search-button').addEventListener('click', () => action('search').catch(error)); contextElement.addEventListener('click', event => { const button = event.target.closest('button[data-action]'); if (button) contextAction(button.dataset.action).catch(error) }); document.addEventListener('pointerdown', event => { if (!appMenu.contains(event.target)) closeMenus(); if (!contextElement.hidden && !contextElement.contains(event.target)) closeContext() }, true); window.addEventListener('resize', () => { closeMenus(); closeContext() })
-window.addEventListener('keydown', event => { if (event.target.matches('input,textarea,select')) return; const key = `${event.metaKey || event.ctrlKey ? 'CommandOrControl+' : ''}${event.altKey ? 'Alt+' : ''}${event.shiftKey ? 'Shift+' : ''}${event.key.length === 1 ? event.key.toUpperCase() : event.key}`; const name = Object.entries(shortcuts).find(([, accelerator]) => accelerator === key)?.[0]; if (name) { event.preventDefault(); action(name).catch(error) } })
+window.addEventListener('keydown', event => { if ([...modalRoot.children].some(child => !child.hidden) || event.target.matches('input,textarea,select')) return; const key = `${event.metaKey || event.ctrlKey ? 'CommandOrControl+' : ''}${event.altKey ? 'Alt+' : ''}${event.shiftKey ? 'Shift+' : ''}${event.key.length === 1 ? event.key.toUpperCase() : event.key}`; const name = Object.entries(shortcuts).find(([, accelerator]) => accelerator === key)?.[0]; if (name) { event.preventDefault(); action(name).catch(error) } })
 async function bootstrap() { doubleClickDelayMs = await window.bookManager.doubleClickDelay(); await refresh(); shortcuts = (await window.bookManager.get('/api/shortcuts')).shortcuts || {}; message('资料库已连接') }
+window.bookManager.onBusinessError(notice)
 bootstrap().catch(error); window.bookManager.onMenuAction(payload => { if (payload?.name) action(payload.name).catch(error) })

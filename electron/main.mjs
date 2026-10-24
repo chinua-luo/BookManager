@@ -7,6 +7,7 @@ import { readDoubleClickDelayMs } from './double-click.mjs'
 import { createDocumentProtocolHandler, DOCUMENT_SCHEME, documentUrl } from './document-protocol.mjs'
 import { assertAllowedBridgeRequest } from './ipc-policy.mjs'
 import { acquireSingleInstance } from './single-instance.mjs'
+import { businessError, userError, notificationFromError, createFatalReporter } from './user-errors.mjs'
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -24,6 +25,7 @@ let bridge = null
 let bridgeUrl = null
 let mainWindow = null
 let quitting = false
+const reportFatal = createFatalReporter((title, msg) => dialog.showErrorBox(title, msg))
 const primaryInstance = acquireSingleInstance(app, () => mainWindow)
 
 function pythonCommand() {
@@ -40,6 +42,10 @@ function bridgeFetch(pathname, options = {}) {
   return fetch(`${bridgeUrl}${pathname}`, {
     ...options,
     headers: { Authorization: `Bearer ${token}`, ...(options.headers || {}) }
+  }).catch(error => {
+    console.error('BookManager bridge connection:', error)
+    if (!quitting) reportFatal('backend', '程序异常', '后端服务连接失败，请重启软件')
+    throw businessError(error, pathname, true)
   })
 }
 
@@ -88,28 +94,32 @@ function startBridge() {
       if (!bridgeUrl) {
         clearTimeout(timer)
         reject(new Error(`BookManager bridge exited before startup (${code ?? 'unknown'})`))
+      } else if (!quitting) {
+        reportFatal('backend', '程序异常', '后端服务意外退出，请重启软件')
       }
     })
   })
 }
 
+async function responseJson(response, pathname) {
+  const detail = await response.json().catch(error => { console.error('Invalid bridge response:', error); throw businessError(error, pathname) })
+  if (!response.ok || detail.ok === false) {
+    console.error('BookManager request failed:', pathname, response.status, detail)
+    throw businessError(detail.msg || detail.error, pathname)
+  }
+  return detail
+}
+
 async function readJson(pathname) {
-  const response = await bridgeFetch(pathname)
-  if (!response.ok) throw new Error(await response.text())
-  return response.json()
+  return responseJson(await bridgeFetch(pathname), pathname)
 }
 
 async function postJson(pathname, payload = {}) {
-  const response = await bridgeFetch(pathname, {
+  return responseJson(await bridgeFetch(pathname, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
-  })
-  if (!response.ok) {
-    const detail = await response.json().catch(() => ({}))
-    throw new Error(detail.error || `请求失败 (${response.status})`)
-  }
-  return response.json()
+  }), pathname)
 }
 
 async function logOperation(payload) {
@@ -162,7 +172,8 @@ async function openItem(itemId, fallbackDocumentName = '') {
     return true
   } catch (error) {
     await logOperation({ event: 'file.open.default', message: '使用系统默认程序打开文件', documentName, result: 'failure', error: error instanceof Error ? error.message : String(error), durationMs: performance.now() - started })
-    dialog.showErrorBox('打开文件失败', error instanceof Error ? error.message : String(error))
+    if (notificationFromError(error).level === 'fatal') return false
+    mainWindow?.webContents.send('business-error', { ...userError(error), title: '打开文件失败', msg: '无法使用系统默认程序打开文件，请检查文件关联和文件是否可读取', errorType: 'open_failed' })
     return false
   }
 }
@@ -177,7 +188,8 @@ async function showItemLocation(itemId, fallbackDocumentName = '') {
     await logOperation({ event: 'file.show_underlying', message: '在文件管理器中显示底层文件', documentName, result: 'success', durationMs: performance.now() - started })
   } catch (error) {
     await logOperation({ event: 'file.show_underlying', message: '在文件管理器中显示底层文件', documentName, result: 'failure', error: error instanceof Error ? error.message : String(error), durationMs: performance.now() - started })
-    dialog.showErrorBox('打开底层位置失败', error instanceof Error ? error.message : String(error))
+    if (notificationFromError(error).level === 'fatal') return false
+    mainWindow?.webContents.send('business-error', { ...userError(error), title: '打开底层位置失败', msg: '无法打开文件所在位置，请检查文件是否存在及访问权限', errorType: 'location_failed' })
   }
 }
 
@@ -310,6 +322,7 @@ if (primaryInstance) app.whenReady().then(async () => {
     createWindow()
   } catch (error) {
     console.error(error)
+    reportFatal('startup', '程序启动失败', '无法启动后端服务，请检查 Python 环境、数据目录权限和剩余磁盘空间后重试')
     app.quit()
   }
 })

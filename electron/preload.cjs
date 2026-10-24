@@ -15,5 +15,6 @@ contextBridge.exposeInMainWorld('bookManager', {
   selectFile: () => ipcRenderer.invoke('dialog:select-file'),
   selectFolder: (title) => ipcRenderer.invoke('dialog:select-folder', title),
   showContextMenu: (payload) => ipcRenderer.send('ui:context-menu', payload),
+  onBusinessError: (callback) => ipcRenderer.on('business-error', (_event, notice) => callback(notice)),
   onMenuAction: (callback) => ipcRenderer.on('menu-action', (_event, action) => callback(action))
 })
