@@ -167,12 +167,23 @@ def _extract_pdf(path: Path, fallback: StructuredFileName, max_pages: int) -> Me
     try:
         from pypdf import PdfReader  # type: ignore
 
+    except ModuleNotFoundError as exc:
+        if exc.name != "pypdf":
+            record_exception('metadata.pdf_dependency_failed')
+            return MetadataResult(fallback, False, "PDF 提取依赖加载失败，请修复启动程序所用 Python 环境的依赖；已使用文件名识别，可手动填写。")
+        record_event('metadata.pdf_dependency_unavailable', module='pypdf')
+        return MetadataResult(fallback, False, "当前 Python 环境未安装 pypdf，无法提取 PDF 内容。请在启动程序所用 Python 环境安装 requirements.txt 中的依赖并重启；已使用文件名识别，可手动填写。")
+    except ImportError:
+        record_exception('metadata.pdf_dependency_failed')
+        return MetadataResult(fallback, False, "PDF 提取依赖加载失败，请修复启动程序所用 Python 环境的依赖；已使用文件名识别，可手动填写。")
+
+    try:
         reader = PdfReader(str(path))
         text = "\n".join((page.extract_text() or "") for page in reader.pages[:max_pages])
         backend = "pypdf"
     except Exception:
         record_exception('metadata.recovered')
-        return MetadataResult(fallback, False, "未安装 pypdf，或 PDF 没有可提取文本；请手动输入。")
+        return MetadataResult(fallback, False, "PDF 内容解析失败，文件可能损坏、加密或不受支持；已使用文件名识别，可手动填写。")
 
     parts = _parts_from_metadata_text(fallback=fallback, text=text)
     if not text.strip():

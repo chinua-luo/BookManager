@@ -5,6 +5,7 @@ const POST_PATHS = new Set([
   '/api/import/folder',
   '/api/name-candidate',
   '/api/name-parse',
+  '/api/name-validate',
   '/api/name-metadata',
   '/api/search',
   '/api/crawl',

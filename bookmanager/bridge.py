@@ -16,7 +16,7 @@ from typing import Any
 
 from .crawler import crawl_into_library
 from .metadata import extract_metadata
-from .naming import StructuredFileName, build_structured_file_name, infer_structured_file_name
+from .naming import NamingValidationError, StructuredFileName, build_structured_file_name, infer_structured_file_name
 from .operation_log import OperationLogger
 from .diagnostics import diagnostic_scope, record_event, record_exception
 from .responses import response_envelope
@@ -420,6 +420,9 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         if request_path == "/api/name-parse":
             self._name_parse(payload)
             return
+        if request_path == "/api/name-validate":
+            self._name_validate(payload)
+            return
         if request_path == "/api/name-metadata":
             self._name_metadata(payload)
             return
@@ -560,6 +563,15 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         if not text:
             raise ValueError("请先输入要识别的名称")
         self._send_json(HTTPStatus.OK, {"nameParts": name_parts_payload(infer_structured_file_name(text))})
+
+    def _name_validate(self, payload: dict[str, Any]) -> None:
+        parts = name_parts_from_payload(dict(payload.get("nameParts") or {}))
+        try:
+            name = build_structured_file_name(parts)
+        except NamingValidationError as exc:
+            self._send_json(HTTPStatus.OK, {"valid": False, "field": exc.field, "message": str(exc)})
+        else:
+            self._send_json(HTTPStatus.OK, {"valid": True, "name": name})
 
     def _name_metadata(self, payload: dict[str, Any]) -> None:
         source = Path(str(payload.get("path", ""))).expanduser()

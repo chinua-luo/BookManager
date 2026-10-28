@@ -33,6 +33,12 @@ def check_dependencies() -> dict[str, bool]:
     try:
         importlib.import_module('pypdf')
         optional['pdfMetadata'] = True
+    except ModuleNotFoundError as exc:
+        optional['pdfMetadata'] = False
+        if exc.name == 'pypdf':
+            record_event('startup.optional_pdf_metadata_unavailable', module='pypdf')
+        else:
+            record_exception('startup.optional_pdf_metadata', exc)
     except Exception as exc:
         optional['pdfMetadata'] = False
         record_exception('startup.optional_pdf_metadata', exc)

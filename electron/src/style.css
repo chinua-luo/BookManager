@@ -94,3 +94,6 @@ h2 { font-size: 13px; }
 .modal-warning > header { border-left: 4px solid #a67519; }
 .modal-success > header { border-left: 4px solid #36794c; }
 .dialog-button:disabled { opacity: 0.55; cursor: wait; }
+
+.name-field-error { color: #c33b35; display: block; margin-top: 4px; }
+.form-grid input[aria-invalid="true"] { border-color: #c33b35; }

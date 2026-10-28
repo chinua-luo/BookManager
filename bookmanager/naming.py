@@ -47,6 +47,21 @@ TITLE_CASE_SMALL_WORDS = frozenset(
 )
 
 
+class NamingValidationError(ValueError):
+    """A curated naming rule violation, safe for display without raw input."""
+
+    def __init__(self, message: str, field: str = "mainTitle") -> None:
+        self.field = field
+        super().__init__(message)
+
+
+NAME_FIELD_KEYS = {
+    "系列缩写": "seriesAbbr", "编号": "number", "主标题名": "mainTitle",
+    "副标题名": "subtitle", "作者信息": "authors", "扩展名": "extension",
+    "版本信息": "edition",
+}
+
+
 @dataclass(frozen=True)
 class StructuredFileName:
     series_abbr: str
@@ -105,7 +120,7 @@ def build_structured_file_name(parts: StructuredFileName) -> str:
     segments = [leading, normalized.subtitle, edition_label]
     prefix = " - ".join(segment for segment in segments if segment)
     if not prefix and not normalized.authors:
-        raise ValueError("文件名整体不能为空")
+        raise NamingValidationError("文件名整体不能为空")
     if edition_label:
         _validate_optional_field("版本信息", edition_label)
     if normalized.authors:
@@ -211,7 +226,7 @@ def infer_structured_file_name(file_name: str) -> StructuredFileName:
 def validate_structured_file_name(file_name: str) -> None:
     parsed = parse_structured_file_name(file_name)
     if parsed is None:
-        raise ValueError("文件名整体不能为空")
+        raise NamingValidationError("文件名整体不能为空")
     build_structured_file_name(parsed)
 
 
@@ -284,10 +299,10 @@ def format_edition(value: str, language: str = "英文") -> str:
     if not text:
         return ""
     if not text.isdecimal():
-        raise ValueError("版本信息必须填写阿拉伯数字")
+        raise NamingValidationError("版本信息必须填写阿拉伯数字", "edition")
     number = int(text)
     if number < 1:
-        raise ValueError("版本信息必须大于等于 1")
+        raise NamingValidationError("版本信息必须大于等于 1", "edition")
     if number == 1:
         return ""
     if normalize_edition_language(language) == "中文":
@@ -362,15 +377,15 @@ def chinese_number_to_int(value: str) -> int | None:
 def _validate_field(label: str, value: str, allow_dot: bool = False) -> None:
     text = value.strip()
     if not text:
-        raise ValueError(f"{label}不能为空")
+        raise NamingValidationError(f"{label}不能为空", NAME_FIELD_KEYS[label])
     forbidden = WINDOWS_FORBIDDEN_CHARS - ({"."} if allow_dot else set())
     bad_chars = sorted(ch for ch in forbidden if ch in text)
     if bad_chars:
-        raise ValueError(f"{label}包含 Windows 文件名不允许的字符：{' '.join(bad_chars)}")
+        raise NamingValidationError(f"{label}包含 Windows 文件名不允许的字符：{' '.join(bad_chars)}", NAME_FIELD_KEYS[label])
     if not allow_dot:
         for delimiter in FIELD_DELIMITERS:
             if delimiter in text:
-                raise ValueError(f"{label}不能包含分隔符 {delimiter!r}")
+                raise NamingValidationError(f"{label}不能包含分隔符 {delimiter!r}，请删除两侧空格或改用其他标点。", NAME_FIELD_KEYS[label])
 
 
 def _validate_optional_field(label: str, value: str, allow_dot: bool = False) -> None:

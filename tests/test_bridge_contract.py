@@ -77,6 +77,46 @@ class BridgeContractTests(unittest.TestCase):
         self.assertEqual(sum(record['event'] == 'bridge.request_failed' for record in records), 2)
         self.assertTrue(all('Traceback' in record['traceback'] for record in records if record['event'] == 'bridge.request_failed'))
 
+    def test_name_validation_reports_field_and_preserves_existing_rules(self):
+        cases = [
+            ({'mainTitle': 'Book', 'subtitle': 'One - Two'}, 'subtitle', "' - '"),
+            ({'mainTitle': 'Book', 'authors': 'A _ B'}, 'authors', "' _ '"),
+            ({'mainTitle': 'Book', 'seriesAbbr': 'A - B'}, 'seriesAbbr', "' - '"),
+            ({'mainTitle': 'Book', 'number': '1 _ 2'}, 'number', "' _ '"),
+            ({'mainTitle': 'Book', 'extension': 'pd/f'}, 'extension', '不允许的字符'),
+            ({'mainTitle': 'Bad/Title'}, 'mainTitle', '不允许的字符'),
+            ({'mainTitle': 'Book', 'edition': 'second'}, 'edition', '阿拉伯数字'),
+            ({'mainTitle': 'Book', 'edition': '0'}, 'edition', '大于等于 1'),
+            ({}, 'mainTitle', '整体不能为空'),
+        ]
+        for parts, field, message in cases:
+            with self.subTest(parts=parts):
+                status, result = self.request('/api/name-validate', {'nameParts': parts})
+                self.assertEqual(status, 200)
+                self.assertEnvelope(result)
+                self.assertFalse(result['data']['valid'])
+                self.assertEqual(result['data']['field'], field)
+                self.assertIn(message, result['data']['message'])
+        status, result = self.request('/api/name-validate', {'nameParts': {'mainTitle': 'Book', 'subtitle': 'One-Two', 'extension': 'pdf'}})
+        self.assertTrue(result['data']['valid'])
+        self.assertTrue(result['data']['name'].endswith('.pdf'))
+        self.assertEqual(self.diagnostics(), [])
+
+    def test_invalid_import_name_crosses_error_boundary_with_specific_message(self):
+        source = self.root / 'Book.txt'
+        source.write_text('book')
+        status, result = self.request('/api/import/file', {'path': str(source), 'folderId': 1, 'nameParts': {'mainTitle': 'Book', 'subtitle': 'One - Two'}})
+        self.assertEqual(status, 400)
+        self.assertEqual(result['error_type'], 'invalid_name')
+        self.assertIn('副标题名', result['msg'])
+        self.assertIn("' - '", result['msg'])
+        self.assertIn('请删除', result['msg'])
+        self.assertNotIn('One', result['msg'])
+        self.assertNotIn('Traceback', result['msg'])
+        status, result = self.request('/api/import/file', {'path': str(source), 'folderId': 1, 'nameParts': {'mainTitle': 'Book', 'subtitle': 'One-Two'}})
+        self.assertEqual(status, 201)
+        self.assertTrue(result['ok'])
+
     def test_security_block_has_stable_error_type_and_business_message(self):
         with mock.patch('bookmanager.bridge.crawl_into_library', side_effect=UnsafeUrlError('private 127.0.0.1 secret')):
             status, result = self.request('/api/crawl', {'source': 'http://localhost', 'folderId': 1})

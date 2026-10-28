@@ -4,6 +4,8 @@ from __future__ import annotations
 import errno
 from typing import Any
 
+from .naming import NamingValidationError
+
 
 def failure_details(error: BaseException | str, path: str = '', status: int = 400) -> dict[str, str]:
     # Inspect types and known validations, never expose arbitrary exception text.
@@ -25,6 +27,8 @@ def failure_details(error: BaseException | str, path: str = '', status: int = 40
         kind, msg = 'unsupported_format', '该文件格式不支持，无法导入书库'
     elif isinstance(error, FileNotFoundError) or text in {'无法读取文件', '无法读取文件夹'}:
         kind, msg = 'file_unavailable', '文件或文件夹不存在或无法读取，请检查后重试'
+    elif isinstance(error, NamingValidationError) and status < 500:
+        kind, msg = 'invalid_name', str(error)
     elif '/import' in path:
         kind, msg = 'import_failed', '文件导入失败，请检查文件是否可读取且内容完整'
     elif '/search' in path:
