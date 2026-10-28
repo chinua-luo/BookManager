@@ -88,6 +88,12 @@ test('production name dialog stays open with inputs intact and accepts a correct
   const result = nameDialog('重命名文件', { nameParts: { mainTitle: 'Book', subtitle: 'One - Two' }, note: 'keep note', tags: ['tag'] })
   const inputs = form.children.filter(node => node.tag === 'label' && node.children[0]?.tag === 'input').map(node => node.children[0])
   const subtitle = inputs[3]
+  const languageField = form.children.find(node => node.textContent === '版本语言')
+  const language = languageField.children[0]
+  assert.equal(language.tag, 'select')
+  assert.ok(form.className.split(' ').includes('name-form'))
+  language.value = '中文'
+  language.listeners.get('change')()
   const submit = options.buttons.find(button => button.primary).action
   const close = () => { closed++; options.onDismiss() }
   await submit(close)
@@ -95,6 +101,7 @@ test('production name dialog stays open with inputs intact and accepts a correct
   assert.equal(focused, subtitle)
   assert.equal(subtitle.value, 'One - Two')
   assert.equal(inputs[7].value, 'keep note')
+  assert.equal(language.value, '中文')
   assert.equal(subtitle.attributes.get('aria-invalid'), 'true')
   subtitle.value = 'One-Two'
   subtitle.listeners.get('input')()
@@ -103,6 +110,7 @@ test('production name dialog stays open with inputs intact and accepts a correct
   const accepted = await result
   assert.equal(closed, 1)
   assert.equal(accepted.nameParts.subtitle, 'One-Two')
+  assert.equal(accepted.nameParts.editionLanguage, '中文')
   assert.equal(accepted.note, 'keep note')
   assert.deepEqual(accepted.tags, ['tag'])
   assert.deepEqual(calls.map(call => call.path), ['/api/name-validate', '/api/name-validate'])

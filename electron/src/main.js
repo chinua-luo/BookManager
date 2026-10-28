@@ -310,7 +310,7 @@ function titleCase(value) { return value.replace(/\b([A-Za-z])([A-Za-z']*)\b/g, 
 async function nameDialog(title, item = null, sourcePath = null, options = {}) {
   const candidate = options.initial?.nameParts || (sourcePath ? (await window.bookManager.post('/api/name-candidate', { path: sourcePath })).nameParts : (item?.nameParts || {}))
   return new Promise(resolve => {
-    const form = document.createElement('form'); form.className = 'form-grid'; const controls = {}; const fieldErrors = {}; const keys = [['系列缩写', 'seriesAbbr'], ['编号', 'number'], ['主标题名', 'mainTitle'], ['副标题名', 'subtitle'], ['版本号', 'edition'], ['作者信息', 'authors'], ['扩展名', 'extension']]
+    const form = document.createElement('form'); form.className = 'form-grid name-form'; const controls = {}; const fieldErrors = {}; const keys = [['系列缩写', 'seriesAbbr'], ['编号', 'number'], ['主标题名', 'mainTitle'], ['副标题名', 'subtitle'], ['版本号', 'edition'], ['作者信息', 'authors'], ['扩展名', 'extension']]
     const importMode = options.importMode === true
     let targetIds = options.initial?.folderIds || (importMode && selectedFolderId ? [selectedFolderId] : [])
     let dialog = null; let allowDismiss = false; let importSubmitting = false

@@ -78,6 +78,9 @@ h2 { font-size: 13px; }
 .modal-body { min-height: 0; overflow: auto; padding: 14px; }.modal-footer { display: flex; justify-content: flex-end; gap: 8px; padding: 10px 14px; border-top: 1px solid #dde3e6; }
 .dialog-button { min-height: 30px; padding: 4px 12px; border: 1px solid #b9c4c9; border-radius: 3px; background: #fff; color: #26353e; cursor: pointer; font: inherit; font-size: 13px; }.dialog-button.primary { border-color: #357391; color: #fff; background: #357391; }.dialog-button.danger { border-color: #a9453d; color: #fff; background: #a9453d; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }.form-grid label, .form-stack label { display: grid; gap: 5px; font-size: 13px; color: #47545c; }.form-grid input, .form-stack input, .form-stack textarea, .dialog-select { width: 100%; min-height: 31px; padding: 5px 7px; border: 1px solid #b9c4c9; border-radius: 3px; color: #1e2932; background: #fff; font: inherit; -webkit-user-select: text; user-select: text; }.form-stack { display: grid; gap: 10px; }.form-grid .span-2 { grid-column: span 2; }
+.name-form > label { align-content: start; align-items: start; line-height: 18px; }
+.name-form > label > input, .name-form > label > .dialog-select, .name-form .tag-input-row > input { height: 32px; min-height: 32px; line-height: 20px; }
+.name-form .name-field-error:empty { display: none; }
 .form-grid label.cache-exit-toggle { display: flex; align-items: center; min-height: 31px; gap: 8px; }.form-grid label.cache-exit-toggle input[type="checkbox"] { width: 16px; min-width: 16px; height: 16px; min-height: 16px; margin: 0; padding: 0; }
 .form-stack label.crawl-recursive-option { display: flex; align-items: center; gap: 8px; min-height: 28px; color: #37464f; }
 .form-stack label.crawl-recursive-option input[type="checkbox"] { width: 16px; min-width: 16px; height: 16px; min-height: 16px; margin: 0; padding: 0; }
