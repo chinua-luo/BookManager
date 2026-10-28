@@ -117,7 +117,7 @@ tmp/             导入和渲染过程中的临时文件
 
 PDF 提取会分别说明依赖未安装、依赖加载失败、文件解析失败和无可提取文本。缺少 `pypdf` 时仍可使用文件名识别和手动填写。安装依赖时须使用**实际启动 BookManager 的 Python**，例如 `"/实际环境/bin/python" -m pip install -r requirements.txt`，完成后重启；桌面快捷方式的 Python 路径在其 `Contents/Resources/app/bookmanager-config.json` 中的 `pythonExecutable`。在其他 Python 环境安装依赖不会修复当前启动环境。
 
-元数据子进程设置资源限制时会遵守继承的软、硬上限，并在日志中记录无法设置的具体资源项；macOS 跳过不兼容的地址空间上限，继续保留 CPU、文件描述符限制及 40 秒解析超时保护。
+元数据子进程设置资源限制时会遵守继承的软、硬上限，并在日志中记录无法设置的具体资源项；macOS 跳过不兼容的地址空间上限，继续保留 CPU、文件描述符限制及 40 秒解析超时保护。按平台能力或 macOS 兼容性策略主动跳过的项目记录为 INFO 级别的 `metadata_worker.limit_skipped`，附带跳过原因和中文说明，属于正常状态；实际设置失败仍以 ERROR 级别的 `metadata_worker.limit_unavailable` 记录异常堆栈。
 
 诊断日志与原有操作日志分开保存：
 

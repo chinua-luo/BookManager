@@ -97,7 +97,7 @@ class ResourceLimitTests(unittest.TestCase):
     def test_resource_module_absence_is_a_capability_event(self):
         with mock.patch.dict(sys.modules, {'resource': None}), mock.patch('bookmanager.metadata_worker.record_event') as event:
             _limit_resources()
-        event.assert_called_once_with('metadata_worker.limit_unavailable', resource='resource', reason='platform_unsupported')
+        event.assert_called_once_with('metadata_worker.limit_skipped', resource='resource', reason='resource_module_not_supported', message='当前平台未提供资源限制模块，按平台能力跳过设置；解析超时保护继续生效。')
 
     def test_inherited_limits_are_never_raised_and_infinity_is_supported(self):
         resource = self.fake_resource({0: (3, 10), 1: (12, 16), 2: (-1, -1)})
@@ -110,7 +110,27 @@ class ResourceLimitTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, {'resource': resource}), mock.patch('bookmanager.metadata_worker.sys.platform', 'darwin'), mock.patch('bookmanager.metadata_worker.record_event') as event:
             _limit_resources()
         self.assertEqual(resource.setrlimit.call_args_list, [mock.call(0, (25, 25)), mock.call(1, (64, 64))])
-        event.assert_called_once_with('metadata_worker.limit_unavailable', resource='RLIMIT_AS', reason='platform_unsupported')
+        event.assert_called_once_with('metadata_worker.limit_skipped', resource='RLIMIT_AS', reason='macos_compatibility_policy', message='按 macOS 兼容性策略跳过地址空间限制；CPU、文件描述符限制和解析超时保护继续生效。')
+
+    def test_unsupported_limit_is_skipped_without_hiding_actual_failures(self):
+        resource = self.fake_resource({0: (-1, -1), 2: (-1, -1)})
+        del resource.RLIMIT_NOFILE
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.dict(sys.modules, {'resource': resource}), mock.patch('bookmanager.metadata_worker.sys.platform', 'linux'), mock.patch.dict('os.environ', {'BOOKMANAGER_DIAGNOSTIC_HOME': temporary}):
+                resource.setrlimit.side_effect = [ValueError('system ceiling'), None]
+                _limit_resources()
+            records = [json.loads(line) for log in Path(temporary).glob('logs/diagnostics-*.jsonl') for line in log.read_text().splitlines()]
+        skipped = next(record for record in records if record['event'] == 'metadata_worker.limit_skipped')
+        self.assertEqual(skipped['level'], 'INFO')
+        self.assertEqual(skipped['details']['resource'], 'RLIMIT_NOFILE')
+        self.assertEqual(skipped['details']['reason'], 'resource_not_supported')
+        self.assertIn('按平台能力跳过', skipped['details']['message'])
+        self.assertNotIn('error_type', skipped)
+        failed = next(record for record in records if record['event'] == 'metadata_worker.limit_unavailable')
+        self.assertEqual(failed['level'], 'ERROR')
+        self.assertEqual(failed['details']['resource'], 'RLIMIT_CPU')
+        self.assertEqual(failed['error_type'], 'ValueError')
+        self.assertIn('system ceiling', failed['traceback'])
 
     def test_failure_records_resource_and_continues_with_other_limits(self):
         resource = self.fake_resource({0: (-1, -1), 1: (-1, -1), 2: (-1, -1)})
