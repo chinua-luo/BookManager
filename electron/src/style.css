@@ -100,13 +100,17 @@ h2 { font-size: 13px; }
 
 .import-targets { min-width: 0; }
 .import-target-header, .import-target-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.import-target-list, .import-folder-choices { max-height: 220px; overflow: auto; }
+.import-target-list { max-height: 220px; overflow: auto; }
 .import-target-row span { overflow-wrap: anywhere; }
 .import-target-row button { flex-shrink: 0; }
 .missing-target { color: #c33b35; }
-.import-folder-choice { display: flex; align-items: center; gap: 8px; padding: 6px; overflow-wrap: anywhere; }
-.import-folder-choice input { width: auto; }
-.import-folder-children { padding-left: 18px; }
-.import-folder-choices summary { cursor: pointer; }
+.import-folder-choices { display: flex; flex-direction: column; gap: 0; max-height: min(360px, 45vh); border-radius: 4px; overflow-y: auto; }
+.form-stack .import-folder-choice { display: flex; flex: 0 0 auto; align-items: center; gap: 10px; min-width: 0; min-height: 38px; margin: 0; padding: 8px 12px; border-bottom: 1px solid #edf0f2; background: #fff; font-size: 13px; line-height: 20px; color: #34434c; cursor: pointer; }
+.form-stack .import-folder-choice:last-child { border-bottom: 0; }
+.form-stack .import-folder-choice:hover { background: #f3f7f9; }
+.form-stack .import-folder-choice:has(input:checked) { background: #e8f1f5; }
+.form-stack .import-folder-choice:focus-within { outline: 2px solid #357391; outline-offset: -2px; }
+.form-stack .import-folder-choice input[type="checkbox"] { flex: 0 0 16px; width: 16px; min-width: 16px; height: 16px; min-height: 16px; margin: 0; padding: 0; accent-color: #357391; cursor: pointer; }
+.form-stack .import-folder-choice span { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .import-status:empty { display: none; }

@@ -59,6 +59,24 @@ function harness({ fail = null } = {}) {
   return { ...functions, controller, dialogs, sent, saved, focused: () => focused, askCount: () => askCount, setTree: value => { currentTree = value } }
 }
 
+test('folder chooser presents one labelled checkbox and complete path per flat row', async () => {
+  const h = harness()
+  const chosen = h.chooseImportFolders([2])
+  const selector = h.dialogs[0]
+  assert.equal(selector.content.querySelectorAll('details,summary').length, 0)
+  const rows = selector.content.querySelectorAll('label')
+  assert.equal(rows.length, 3)
+  assert.deepEqual(rows.map(row => row.children.map(node => node.tag)), [['input', 'span'], ['input', 'span'], ['input', 'span']])
+  const paths = ['Library', 'Library / Math', 'Library / Math / Calculus']
+  assert.deepEqual(rows.map(row => row.children[1].textContent), paths)
+  assert.deepEqual(rows.map(row => row.title), paths)
+  assert.deepEqual(rows.map(row => row.children[0].attributes.get('aria-label')), paths)
+  await rows[2].children[0].change(true)
+  assert.equal(rows[0].children[0].checked, false)
+  await selector.submit()
+  assert.deepEqual(await chosen, [2, 3])
+})
+
 test('production import form defaults to current folder, multi-selects child and preserves fields', async () => {
   const h = harness()
   const pending = h.nameDialog('导入文件', null, '/Book.txt', { importMode: true, controller: h.controller })

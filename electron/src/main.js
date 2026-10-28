@@ -286,27 +286,18 @@ function chooseImportFolders(initialIds) {
     const count = element('p', 'dialog-hint')
     const list = element('div', 'choice-list import-folder-choices')
     count.textContent = `已选 ${selected.size} 个文件夹（最多 ${MAX_IMPORT_TARGETS} 个）；父文件夹仅代表自身。`
-    function render(nodes, parent) {
-      for (const folder of nodes) {
-        const row = element('label', 'import-folder-choice')
-        const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.checked = selected.has(folder.id)
-        const path = folderTargets(tree, [folder.id])[0].path
-        checkbox.setAttribute('aria-label', path)
-        checkbox.addEventListener('click', event => event.stopPropagation())
-        checkbox.addEventListener('change', () => {
-          if (checkbox.checked && selected.size >= MAX_IMPORT_TARGETS) { checkbox.checked = false; notice({ title: '目标数量过多', msg: `一次最多选择 ${MAX_IMPORT_TARGETS} 个文件夹。`, errorType: 'invalid_targets' }); return }
-          if (checkbox.checked) selected.add(folder.id); else selected.delete(folder.id)
-          count.textContent = `已选 ${selected.size} 个文件夹（最多 ${MAX_IMPORT_TARGETS} 个）；父文件夹仅代表自身。`
-        })
-        row.append(checkbox, element('span', '', path))
-        if (folder.children?.length) {
-          const branch = document.createElement('details'); branch.open = true
-          const summary = document.createElement('summary'); summary.textContent = folder.name; branch.append(summary, row)
-          const children = element('div', 'import-folder-children'); render(folder.children, children); branch.append(children); parent.append(branch)
-        } else parent.append(row)
-      }
+    for (const target of folderTargets(tree)) {
+      const row = element('label', 'import-folder-choice'); row.title = target.path
+      const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.checked = selected.has(target.id)
+      checkbox.setAttribute('aria-label', target.path)
+      checkbox.addEventListener('change', () => {
+        if (checkbox.checked && selected.size >= MAX_IMPORT_TARGETS) { checkbox.checked = false; notice({ title: '目标数量过多', msg: `一次最多选择 ${MAX_IMPORT_TARGETS} 个文件夹。`, errorType: 'invalid_targets' }); return }
+        if (checkbox.checked) selected.add(target.id); else selected.delete(target.id)
+        count.textContent = `已选 ${selected.size} 个文件夹（最多 ${MAX_IMPORT_TARGETS} 个）；父文件夹仅代表自身。`
+      })
+      row.append(checkbox, element('span', '', target.path)); list.append(row)
     }
-    render(tree, list); content.append(count, list)
+    content.append(count, list)
     modal('选择存放文件夹', content, { nested: true, wide: true, onDismiss: () => resolve(null), buttons: [
       { label: '取消', action: close => { resolve(null); close() } },
       { label: '确认选择', primary: true, action: close => { if (!selected.size) { notice({ title: '请选择存放文件夹', msg: '请至少选择一个存放文件夹。', errorType: 'invalid_targets' }); return }; resolve([...selected]); close() } }
