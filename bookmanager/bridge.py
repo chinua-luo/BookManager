@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .crawler import crawl_into_library
+from .importing import ImportProblem, import_file, import_status, target_ids, validate_request_id
 from .metadata import extract_metadata
 from .naming import NamingValidationError, StructuredFileName, build_structured_file_name, infer_structured_file_name
 from .operation_log import OperationLogger
@@ -58,6 +59,7 @@ CONTENT_SECURITY_POLICY = "; ".join(
 
 
 DOCUMENT_PATH_PATTERN = re.compile(r"^/api/documents/(?P<document_id>\d+)/content$")
+IMPORT_STATUS_PATTERN = re.compile(r"^/api/import/requests/(?P<request_id>[A-Za-z0-9_-]{1,80})$")
 FOLDER_PATH_PATTERN = re.compile(r"^/api/folders/(?P<folder_id>\d+)/contents$")
 ITEM_OPEN_PATH_PATTERN = re.compile(r"^/api/items/(?P<item_id>\d+)/open$")
 ITEM_LOCATION_PATH_PATTERN = re.compile(r"^/api/items/(?P<item_id>\d+)/location$")
@@ -225,20 +227,27 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         details: dict[str, Any] = {}
         try:
             payload = self._read_json_body()
-            document_name, details = self._operation_context(parsed.path, payload)
+            if parsed.path == '/api/import/file':
+                details.update(request_id=payload.get('requestId'), target_folder_ids=payload.get('folderIds', [payload.get('folderId')]))
+            document_name, context_details = self._operation_context(parsed.path, payload)
+            details.update(context_details)
             self._operation_document_name = document_name
             self._operation_details = details
             self._handle_post(parsed.path, payload)
             document_name = self._operation_document_name
         except (OSError, ValueError) as exc:
-            self._log_request_operation(operation, started, "failure", document_name, details, exc)
-            self._send_failure(exc, HTTPStatus.BAD_REQUEST)
+            if not details.get("replayed"):
+                self._log_request_operation(operation, started, "failure", document_name, details, exc)
+            status = HTTPStatus.CONFLICT if getattr(exc, 'import_error_type', '') in {'request_conflict', 'import_pending'} else HTTPStatus.BAD_REQUEST
+            self._send_failure(exc, status)
         except Exception as exc:  # Keep full diagnostics on disk; only curated messages cross IPC.
-            self._log_request_operation(operation, started, "failure", document_name, details, exc)
+            if not details.get("replayed"):
+                self._log_request_operation(operation, started, "failure", document_name, details, exc)
             self._send_failure(exc, HTTPStatus.INTERNAL_SERVER_ERROR)
         else:
             failure = getattr(self, '_business_failure', '')
-            self._log_request_operation(operation, started, 'failure' if failure else 'success', document_name, details, ValueError(failure) if failure else None)
+            if not details.get('replayed'):
+                self._log_request_operation(operation, started, 'failure' if failure else 'success', document_name, details, ValueError(failure) if failure else None)
 
     def _operation_for_path(self, request_path: str) -> tuple[str, str] | None:
         if request_path == "/api/logs/events":
@@ -355,6 +364,14 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         if not self._authorized(parsed):
             self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "Unauthorized"})
             return
+        import_match = IMPORT_STATUS_PATTERN.match(parsed.path)
+        if import_match:
+            store = self.server.open_store()
+            try:
+                self._send_json(HTTPStatus.OK, import_status(store, import_match.group('request_id')))
+            finally:
+                store.close()
+            return
         if parsed.path == "/api/health":
             self._send_json(HTTPStatus.OK, {"ok": True})
             return
@@ -373,7 +390,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/tree":
             store = self.server.open_store()
             try:
-                self._send_json(HTTPStatus.OK, {"folders": self._folder_tree(store, None)})
+                self._send_json(HTTPStatus.OK, {"folders": self._folder_tree(store, None), "libraryId": store.conn.execute("SELECT library_id FROM library_identity WHERE id=1").fetchone()["library_id"]})
             finally:
                 store.close()
             return
@@ -581,23 +598,31 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.OK, {"nameParts": name_parts_payload(result.parts), "extracted": result.extracted, "message": result.message})
 
     def _import_file(self, payload: dict[str, Any]) -> None:
+        folder_ids = target_ids(payload)
+        request_id = validate_request_id(payload['requestId']) if 'requestId' in payload else None
         source = Path(str(payload.get("path", ""))).expanduser()
-        if not source.is_file():
-            raise ValueError("无法读取文件")
         store = self.server.open_store()
         try:
+            identity = store.conn.execute('SELECT library_id FROM library_identity WHERE id=1').fetchone()['library_id']
+            if 'libraryId' in payload and payload['libraryId'] != identity:
+                raise ImportProblem('library_changed', '当前书库已变化，请切回原书库确认上次导入结果。')
             parts = name_parts_from_payload(dict(payload.get("nameParts") or {}), source.name)
-            item_id = store.add_local_file(
-                source,
-                int(payload["folderId"]),
-                parts,
-                str(payload.get("note", "")),
-                normalize_tag_names(payload.get("tags", ())),
-            )
-            item = store.get_item(item_id)
-            self._operation_document_name = item.display_name
-            self._operation_details["imported_file_count"] = 1
-            self._send_json(HTTPStatus.CREATED, {"item": item_payload(item)})
+            result = import_file(store, source, folder_ids, parts, str(payload.get("note", "")),
+                                 normalize_tag_names(payload.get("tags", ())), request_id,
+                                 details=self._operation_details)
+            # Receipt results are snapshots; replay remains valid even if a user
+            # subsequently moved or deleted one of the returned items.
+            items = []
+            for entry in result['entries']:
+                try:
+                    items.append(item_payload(store.get_item(entry['itemId'])))
+                except ValueError:
+                    continue
+            self._operation_document_name = build_structured_file_name(parts)
+            try:
+                self._send_json(HTTPStatus.CREATED, {**result, "items": items, "item": items[0] if items else None})
+            except (BrokenPipeError, ConnectionResetError):
+                record_exception('import.response_delivery_failed', request_id=result['requestId'])
         finally:
             store.close()
 
@@ -973,7 +998,10 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         super().end_headers()
 
     def _send_failure(self, error: BaseException, status: HTTPStatus) -> None:
-        record_exception('bridge.request_failed', error, data_home=self.server.library_home, request_path=urllib.parse.urlparse(self.path).path)
+        if isinstance(error, NamingValidationError) or getattr(error, 'import_error_type', '') in {'invalid_targets', 'target_missing', 'invalid_request_id', 'request_conflict', 'import_pending'}:
+            record_event('bridge.validation_rejected', data_home=self.server.library_home, request_path=urllib.parse.urlparse(self.path).path, reason=str(error))
+        else:
+            record_exception('bridge.request_failed', error, data_home=self.server.library_home, request_path=urllib.parse.urlparse(self.path).path)
         if not getattr(self, '_response_started', False):
             self._send_json(status, {}, error=error)
 

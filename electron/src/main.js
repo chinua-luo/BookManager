@@ -11,8 +11,10 @@ import { bindFileActivation } from './file-activation.js'
 import { createPreviewCoordinator } from './preview-coordinator.js'
 import { crawlRequestPayload, recursiveEnabled } from './recursive-crawl.mjs'
 import { createModalManager } from './modal-manager.js'
-import { notificationFromError, importSummary, crawlSummary } from '../user-errors.mjs'
+import { businessError, notificationFromError, importSummary, crawlSummary } from '../user-errors.mjs'
 import { submitNameForm } from './name-validation.js'
+import { createImportController, importSummaryText } from './import-controller.js'
+import { folderTargets, MAX_IMPORT_TARGETS } from './folder-targets.js'
 import './style.css'
 
 const $ = selector => document.querySelector(selector)
@@ -22,6 +24,7 @@ const previewTitle = $('#preview-title'); const preview = $('#preview'); const s
 const appMenu = $('#app-menu'); const contextElement = $('#context-menu'); const modalRoot = $('#modal-root')
 const workspace = $('.workspace'); const workspaceSplitter = $('#workspace-splitter')
 const textExtensions = new Set(['.txt', '.md', '.py', '.json', '.xml', '.html', '.htm', '.css', '.js', '.csv', '.log'])
+let libraryId = null; let importController = null
 let tree = []; let selectedFolderId = null; let selectedItem = null; let contextTarget = null; let shortcuts = {}; let doubleClickDelayMs = 600
 const sortModes = new Map()
 
@@ -151,7 +154,7 @@ function modal(title, content, options = {}) {
   const body = document.createElement('div'); body.className = 'modal-body'; body.append(content)
   const footer = document.createElement('footer'); footer.className = 'modal-footer'
   let release = () => {}
-  const close = () => release()
+  const close = () => { if (!options.canDismiss || options.canDismiss()) release() }
   panel.setAttribute('role', options.level === 'error' || options.level === 'warning' ? 'alertdialog' : 'dialog')
   panel.setAttribute('aria-modal', 'true'); panel.setAttribute('aria-label', title)
   let busy = false
@@ -270,24 +273,149 @@ async function chooseFolder(title, excludedId = null) {
   })
 }
 
+async function readImportTree(expectedLibrary = libraryId) {
+  const data = await window.bookManager.tree()
+  if (data.libraryId !== expectedLibrary) throw businessError({ error_type: 'library_changed', msg: '当前书库已变化，请切回原书库确认导入结果。', level: 'error' })
+  tree = data.folders
+}
+
+function chooseImportFolders(initialIds) {
+  return new Promise(resolve => {
+    const selected = new Set(initialIds)
+    const content = element('div', 'form-stack')
+    const count = element('p', 'dialog-hint')
+    const list = element('div', 'choice-list import-folder-choices')
+    count.textContent = `已选 ${selected.size} 个文件夹（最多 ${MAX_IMPORT_TARGETS} 个）；父文件夹仅代表自身。`
+    function render(nodes, parent) {
+      for (const folder of nodes) {
+        const row = element('label', 'import-folder-choice')
+        const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.checked = selected.has(folder.id)
+        const path = folderTargets(tree, [folder.id])[0].path
+        checkbox.setAttribute('aria-label', path)
+        checkbox.addEventListener('click', event => event.stopPropagation())
+        checkbox.addEventListener('change', () => {
+          if (checkbox.checked && selected.size >= MAX_IMPORT_TARGETS) { checkbox.checked = false; notice({ title: '目标数量过多', msg: `一次最多选择 ${MAX_IMPORT_TARGETS} 个文件夹。`, errorType: 'invalid_targets' }); return }
+          if (checkbox.checked) selected.add(folder.id); else selected.delete(folder.id)
+          count.textContent = `已选 ${selected.size} 个文件夹（最多 ${MAX_IMPORT_TARGETS} 个）；父文件夹仅代表自身。`
+        })
+        row.append(checkbox, element('span', '', path))
+        if (folder.children?.length) {
+          const branch = document.createElement('details'); branch.open = true
+          const summary = document.createElement('summary'); summary.textContent = folder.name; branch.append(summary, row)
+          const children = element('div', 'import-folder-children'); render(folder.children, children); branch.append(children); parent.append(branch)
+        } else parent.append(row)
+      }
+    }
+    render(tree, list); content.append(count, list)
+    modal('选择存放文件夹', content, { nested: true, wide: true, onDismiss: () => resolve(null), buttons: [
+      { label: '取消', action: close => { resolve(null); close() } },
+      { label: '确认选择', primary: true, action: close => { if (!selected.size) { notice({ title: '请选择存放文件夹', msg: '请至少选择一个存放文件夹。', errorType: 'invalid_targets' }); return }; resolve([...selected]); close() } }
+    ] })
+  })
+}
+
 function nameDisplay(parts) { const series = `${parts.seriesAbbr || ''}${parts.number || ''}`; const first = [series, parts.mainTitle].filter(Boolean).join(' '); const edition = !/^1$/.test(parts.edition || '1') ? (parts.editionLanguage === '中文' ? `第${parts.edition}版` : `${parts.edition}${[11, 12, 13].includes(Number(parts.edition) % 100) ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[Number(parts.edition) % 10] || 'th')} Edition`) : ''; const prefix = [first, parts.subtitle, edition].filter(Boolean).join(' - '); return `${prefix}${parts.authors ? `${prefix ? ' _ ' : ''}${parts.authors}` : ''}${parts.extension || ''}` }
 function titleCase(value) { return value.replace(/\b([A-Za-z])([A-Za-z']*)\b/g, (_whole, first, rest) => `${first.toUpperCase()}${rest.toLowerCase()}`) }
-async function nameDialog(title, item = null, sourcePath = null) {
-  const candidate = sourcePath ? (await window.bookManager.post('/api/name-candidate', { path: sourcePath })).nameParts : (item?.nameParts || {})
+async function nameDialog(title, item = null, sourcePath = null, options = {}) {
+  const candidate = options.initial?.nameParts || (sourcePath ? (await window.bookManager.post('/api/name-candidate', { path: sourcePath })).nameParts : (item?.nameParts || {}))
   return new Promise(resolve => {
     const form = document.createElement('form'); form.className = 'form-grid'; const controls = {}; const fieldErrors = {}; const keys = [['系列缩写', 'seriesAbbr'], ['编号', 'number'], ['主标题名', 'mainTitle'], ['副标题名', 'subtitle'], ['版本号', 'edition'], ['作者信息', 'authors'], ['扩展名', 'extension']]
+    const importMode = options.importMode === true
+    let targetIds = options.initial?.folderIds || (importMode && selectedFolderId ? [selectedFolderId] : [])
+    let dialog = null; let allowDismiss = false; let importSubmitting = false
+    const importIssue = element('p', 'import-status dialog-hint span-2'); importIssue.setAttribute('role', 'alert')
+    const targets = element('section', 'import-targets span-2')
+    const targetList = element('div', 'import-target-list')
+    const targetHeading = element('strong')
+    const choose = element('button', 'dialog-button', '选择文件夹'); choose.type = 'button'
+    function renderTargets() {
+      targetHeading.textContent = `存放文件夹 · 已选 ${targetIds.length} 个`
+      targetList.replaceChildren()
+      for (const target of folderTargets(tree, targetIds)) {
+        const row = element('div', `import-target-row${target.missing ? ' missing-target' : ''}`)
+        const remove = element('button', 'dialog-button', '移除'); remove.type = 'button'; remove.disabled = importSubmitting || !!options.controller?.pending
+        remove.addEventListener('click', () => { targetIds = targetIds.filter(id => id !== target.id); renderTargets() })
+        row.append(element('span', '', target.path), remove); targetList.append(row)
+      }
+      if (!targetIds.length) targetList.append(element('p', 'name-field-error', '请至少选择一个存放文件夹。'))
+      updateImportButton()
+    }
+    function updateImportButton() {
+      if (!importMode || !dialog) return
+      dialog.panel.querySelector('.primary').textContent = options.controller.pending ? '确认结果 / 重试原请求' : `导入到 ${targetIds.length} 个文件夹`
+    }
+    function lockImport(locked) {
+      if (!importMode) return
+      form.querySelectorAll('input,textarea,select,button').forEach(input => { input.disabled = locked })
+      updateImportButton()
+    }
+    choose.addEventListener('click', async () => {
+      try { await readImportTree(); const chosen = await chooseImportFolders(targetIds); if (chosen !== null) targetIds = chosen; renderTargets() }
+      catch (issue) { importIssue.classList.add('name-field-error'); importIssue.textContent = notificationFromError(issue).msg }
+    })
+    if (importMode) {
+      const header = element('div', 'import-target-header'); header.append(targetHeading, choose)
+      targets.append(header, targetList, element('p', 'dialog-hint', '已有镜像保留原信息；本次填写内容仅用于新建镜像。'))
+      form.append(targets, importIssue); renderTargets()
+    }
     if (sourcePath) { const paste = document.createElement('label'); paste.className = 'span-2'; paste.textContent = '复制文本识别名称字符段'; const textarea = document.createElement('textarea'); textarea.rows = 2; const apply = document.createElement('button'); apply.type = 'button'; apply.className = 'dialog-button'; apply.textContent = '应用文本'; apply.addEventListener('click', async () => { const value = textarea.value.trim(); if (!value) { notice({ title: '请检查输入', msg: '请先粘贴名称文本。', errorType: 'name_text_required' }); return } try { const result = await window.bookManager.post('/api/name-parse', { text: value }); const includesExtension = /\.[A-Za-z0-9]{1,10}\s*$/.test(value); keys.forEach(([, key]) => { if (key !== 'extension' || includesExtension) controls[key].value = result.nameParts[key] || '' }); languageSelect.value = result.nameParts.editionLanguage || languageSelect.value; refreshPreview() } catch (issue) { error(issue) } }); paste.append(textarea, apply); form.append(paste) }
     for (const [label, key] of keys) { const field = document.createElement('label'); field.textContent = label; const input = document.createElement('input'); input.value = candidate[key] || (key === 'edition' ? '1' : ''); input.addEventListener('input', () => { input.removeAttribute('aria-invalid'); fieldErrors[key].textContent = ''; refreshPreview() }); const hint = element('small', 'name-field-error', ''); hint.id = `name-error-${key}`; hint.setAttribute('role', 'alert'); input.setAttribute('aria-describedby', hint.id); fieldErrors[key] = hint; field.append(input, hint); form.append(field); controls[key] = input }
     const language = document.createElement('label'); language.textContent = '版本语言'; const languageSelect = document.createElement('select'); languageSelect.className = 'dialog-select'; languageSelect.append(new Option('英文'), new Option('中文')); languageSelect.value = candidate.editionLanguage || '英文'; languageSelect.addEventListener('change', refreshPreview); language.append(languageSelect); form.append(language)
     const caseOption = document.createElement('label'); caseOption.textContent = '主、副标题格式'; const caseSelect = document.createElement('select'); caseSelect.className = 'dialog-select'; caseSelect.append(new Option('原样'), new Option('驼峰化')); caseOption.append(caseSelect); form.append(caseOption)
-    const note = document.createElement('label'); note.className = 'span-2'; note.textContent = '备注（不加入文件名）'; const noteInput = document.createElement('input'); noteInput.value = item?.note || ''; note.append(noteInput); form.append(note)
-    const tags = document.createElement('label'); tags.className = 'span-2'; tags.textContent = '标签（以逗号分隔，不加入文件名）'; const tagRow = document.createElement('div'); tagRow.className = 'tag-input-row'; const tagsInput = document.createElement('input'); tagsInput.value = item?.tags?.join(', ') || ''; const selectTags = document.createElement('button'); selectTags.type = 'button'; selectTags.className = 'dialog-button'; selectTags.textContent = '选择标签'; selectTags.addEventListener('click', () => openTagPicker(tagsInput).catch(error)); tagRow.append(tagsInput, selectTags); tags.append(tagRow); form.append(tags)
+    const note = document.createElement('label'); note.className = 'span-2'; note.textContent = '备注（不加入文件名）'; const noteInput = document.createElement('input'); noteInput.value = options.initial?.note ?? item?.note ?? ''; note.append(noteInput); form.append(note)
+    const tags = document.createElement('label'); tags.className = 'span-2'; tags.textContent = '标签（以逗号分隔，不加入文件名）'; const tagRow = document.createElement('div'); tagRow.className = 'tag-input-row'; const tagsInput = document.createElement('input'); tagsInput.value = (options.initial?.tags || item?.tags || []).join(', '); const selectTags = document.createElement('button'); selectTags.type = 'button'; selectTags.className = 'dialog-button'; selectTags.textContent = '选择标签'; selectTags.addEventListener('click', () => openTagPicker(tagsInput).catch(error)); tagRow.append(tagsInput, selectTags); tags.append(tagRow); form.append(tags)
     const previewName = document.createElement('div'); previewName.className = 'name-preview span-2'; const metadata = document.createElement('p'); metadata.className = 'dialog-hint span-2'; form.append(previewName, metadata)
     function data() { const values = {}; keys.forEach(([, key]) => { values[key] = controls[key].value.trim() }); if (caseSelect.value === '驼峰化') { values.mainTitle = titleCase(values.mainTitle); values.subtitle = titleCase(values.subtitle) }; values.editionLanguage = languageSelect.value; return values }
     function refreshPreview() { previewName.textContent = nameDisplay(data()) || '待补全：文件名整体不能为空' }
     refreshPreview()
-    if (sourcePath) { metadata.textContent = '正在后台分析文件元数据…'; window.bookManager.post('/api/name-metadata', { path: sourcePath }).then(result => { metadata.textContent = result.message || (result.extracted ? '已提取文件元数据，可检查并修改。' : '未提取到可用元数据，请手动填写名称信息。'); if (result.extracted) keys.forEach(([, key]) => { if (!controls[key].value.trim() && result.nameParts[key]) controls[key].value = result.nameParts[key] }); refreshPreview() }).catch(value => { console.error(value); metadata.textContent = '未能分析文件内容，可手动填写名称信息。' }) }
-    const dialog = modal(title, form, { wide: true, onDismiss: () => resolve(null), buttons: [{ label: '取消', action: close => { close(); resolve(null) } }, { label: '确定', primary: true, action: async close => { await submitNameForm({ read: () => ({ nameParts: data(), note: noteInput.value.trim(), tags: tagsInput.value.split(',').map(value => value.trim()).filter(Boolean) }), validate: nameParts => window.bookManager.post('/api/name-validate', { nameParts }), controls, errors: fieldErrors, accept: values => { resolve(values); close() } }) } }] }); form.addEventListener('submit', event => { event.preventDefault(); dialog.panel.querySelector('.primary').click() })
+    if (sourcePath && !options.initial) { metadata.textContent = '正在后台分析文件元数据…'; window.bookManager.post('/api/name-metadata', { path: sourcePath }).then(result => { metadata.textContent = result.message || (result.extracted ? '已提取文件元数据，可检查并修改。' : '未提取到可用元数据，请手动填写名称信息。'); if (result.extracted && !importSubmitting && !options.controller?.pending) keys.forEach(([, key]) => { if (!controls[key].value.trim() && result.nameParts[key]) controls[key].value = result.nameParts[key] }); refreshPreview() }).catch(value => { console.error(value); metadata.textContent = '未能分析文件内容，可手动填写名称信息。' }) }
+    function readValues() {
+      const values = { nameParts: data(), note: noteInput.value.trim(), tags: tagsInput.value.split(',').map(value => value.trim()).filter(Boolean) }
+      if (importMode) { values.path = sourcePath; values.folderIds = [...targetIds] }
+      return values
+    }
+    async function acceptImport(values, close) {
+      await readImportTree(options.controller.libraryId)
+      const result = await options.controller.run(values)
+      resolve({ importResult: result }); close()
+    }
+    async function submit(close) {
+      if (!importMode) return submitNameForm({ read: readValues, validate: nameParts => window.bookManager.post('/api/name-validate', { nameParts }), controls, errors: fieldErrors, accept: values => { resolve(values); close() } })
+      importIssue.classList.remove('name-field-error')
+      importIssue.textContent = options.controller.pending ? '正在确认上次导入结果…' : '正在导入，请稍候…'
+      let focusTargets = false
+      importSubmitting = true
+      lockImport(true)
+      try {
+        if (options.controller.pending) { await acceptImport(options.controller.pending.payload, close); return }
+        await readImportTree(); renderTargets()
+        const targets = folderTargets(tree, targetIds)
+        if (!targetIds.length || targetIds.length > MAX_IMPORT_TARGETS || targets.some(target => target.missing)) {
+          importIssue.classList.add('name-field-error')
+          importIssue.textContent = targets.some(target => target.missing) ? '目标文件夹已失效，请移除或重新选择。' : `请选择 1 至 ${MAX_IMPORT_TARGETS} 个存放文件夹。`
+          focusTargets = true; return
+        }
+        await submitNameForm({ read: readValues, validate: nameParts => window.bookManager.post('/api/name-validate', { nameParts }), controls, errors: fieldErrors, accept: values => acceptImport(values, close) })
+        if (form.isConnected) importIssue.textContent = ''
+      } catch (issue) {
+        console.error(issue)
+        importIssue.classList.add('name-field-error')
+        const info = notificationFromError(issue); importIssue.textContent = info.msg + (info.errorType === 'import_failed' && options.controller.lastRequestId ? ` 请求标识：${options.controller.lastRequestId}` : '')
+        if (info.errorType === 'target_missing') { try { await readImportTree(); renderTargets() } catch { /* Keep the original reason. */ } }
+      } finally {
+        importSubmitting = false; lockImport(!!options.controller.pending)
+        if (!options.controller.pending) {
+          const invalid = Object.values(controls).find(input => input.getAttribute('aria-invalid') === 'true')
+          if (invalid) invalid.focus(); else if (focusTargets) choose.focus()
+        }
+      }
+    }
+    dialog = modal(title, form, { wide: true, canDismiss: () => !importMode || !options.controller.pending || allowDismiss, onDismiss: () => resolve(null), buttons: [
+      { label: '取消', action: async close => { if (importMode && options.controller.pending) { if (!(await ask('关闭导入窗口', '导入结果尚未确认，关闭窗口不会取消后台导入。下次点击“导入文件”可继续确认。'))) return; allowDismiss = true }; resolve(null); close() } },
+      { label: importMode ? `导入到 ${targetIds.length} 个文件夹` : '确定', primary: true, action: submit }
+    ] })
+    if (importMode) lockImport(!!options.controller.pending)
+    form.addEventListener('submit', event => { event.preventDefault(); dialog.panel.querySelector('.primary').click() })
   })
 }
 
@@ -318,14 +446,27 @@ async function selectFolder(id) {
   sortedItems(payload.items, id).forEach(item => contentList.append(fileRow(item))); folderSummary(payload)
 }
 function renderTree(nodes) { const list = document.createElement('ul'); nodes.forEach((folder, index) => { const item = document.createElement('li'); const details = document.createElement('details'); details.open = index === 0; const summary = document.createElement('summary'); summary.addEventListener('click', event => { if (event.target === summary) selectFolder(folder.id).catch(error) }); const button = document.createElement('button'); button.type = 'button'; button.dataset.folderId = String(folder.id); button.textContent = folder.name; button.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); selectFolder(folder.id).catch(error) }); button.addEventListener('contextmenu', event => openContext(event, { kind: 'folder', folder })); summary.append(button); details.append(summary); if (folder.children.length) details.append(renderTree(folder.children)); item.append(details); list.append(item) }); return list }
-async function refresh(select = selectedFolderId) { const data = await window.bookManager.tree(); tree = data.folders; folderTree.replaceChildren(renderTree(tree)); const id = findFolder(select) ? select : tree[0]?.id; if (id) await selectFolder(id) }
+async function refresh(select = selectedFolderId) { const data = await window.bookManager.tree(); if (libraryId !== data.libraryId) { libraryId = data.libraryId; importController = createImportController({ api: window.bookManager, storage: localStorage, libraryId }) }; tree = data.folders; folderTree.replaceChildren(renderTree(tree)); const id = findFolder(select) ? select : tree[0]?.id; if (id) await selectFolder(id) }
 
 async function openDefault(item = selectedItem) { if (!item) throw new Error('请先选择文件'); if (await window.bookManager.openDocument(item.id, item.displayName)) message(`已用系统默认方式打开：${item.displayName}`) }
 async function createFolder(parent = selectedFolderId) { const name = await promptValue('新建文件夹', '文件夹名称'); if (!name) return; const result = await window.bookManager.post('/api/folders', { parentId: parent, name }); await refresh(result.folder.id); message('已新建文件夹。') }
 async function renameFolder(folder) { const name = await promptValue('重命名文件夹', '新的文件夹名称', folder.name); if (!name) return; await window.bookManager.post(`/api/folders/${folder.id}/rename`, { name }); await refresh(folder.id); message('文件夹已重命名。') }
 async function moveFolder(folder) { const target = await chooseFolder('选择移动目标文件夹', folder.id); if (!target) return; await window.bookManager.post(`/api/folders/${folder.id}/move`, { targetFolderId: target }); await refresh(folder.id); message('文件夹已移动。') }
 async function deleteFolder(folder) { if (!(await ask('删除文件夹', `删除“${folder.name}”及其子文件夹、镜像文件？底层 Hash 文件不会删除。`, true))) return; await window.bookManager.post(`/api/folders/${folder.id}/delete`, {}); await refresh(folder.parentId || tree[0]?.id); message('文件夹及镜像文件已删除。') }
-async function importFile() { const path = await window.bookManager.selectFile(); if (!path) return; const details = await nameDialog('导入文件', null, path); if (!details) return; await window.bookManager.post('/api/import/file', { path, folderId: selectedFolderId, ...details }); await refresh(selectedFolderId); message('已导入文件并创建镜像。') }
+async function importFile() {
+  if (!importController) { notice({ title: '书库尚未连接', msg: '请等待书库加载完成后重试。', errorType: 'library_loading' }); return }
+  if (importController.restoreIssue) { error(importController.restoreIssue); return }
+  const initial = importController.pending?.payload
+  const path = initial?.path || await window.bookManager.selectFile()
+  if (!path) return
+  const originalFolder = selectedFolderId
+  const completed = await nameDialog('导入文件', null, path, { importMode: true, initial, controller: importController })
+  if (!completed?.importResult) return
+  const result = completed.importResult
+  const target = result.entries.some(entry => entry.folderId === originalFolder) ? originalFolder : result.entries[0].folderId
+  try { await refresh(target); message(importSummaryText(result)) }
+  catch (issue) { console.error(issue); notice({ title: '文件已导入', msg: `${importSummaryText(result)} 列表刷新失败，请刷新书库或重新打开程序。`, errorType: 'import_refresh_failed', level: 'warning' }) }
+}
 async function importFolder() { const path = await window.bookManager.selectFolder('选择要添加的文件夹'); if (!path) return; const text = await promptValue('为文件夹内书籍添加标签', '标签（以逗号分隔，可留空）', '', true); if (text === null) return; const result = await window.bookManager.post('/api/import/folder', { path, folderId: selectedFolderId, tags: text ? text.split(',') : [] }); await refresh(result.folderId); message(`已添加文件夹，导入 ${result.fileCount} 个文件。`); const warning = importSummary(result); if (warning) notice(warning) }
 async function renameItem(item = selectedItem) { if (!item) throw new Error('请先选择文件'); const details = await nameDialog('按规则重命名', item); if (!details) return; await window.bookManager.post(`/api/items/${item.id}/rename`, details); await refresh(selectedFolderId); message('已重命名；底层文件未复制或改名。') }
 async function moveItem(item) { const target = await chooseFolder('选择移动目标文件夹'); if (!target) return; await window.bookManager.post(`/api/items/${item.id}/move`, { targetFolderId: target }); await refresh(selectedFolderId); message('镜像文件已移动。') }
@@ -492,6 +633,6 @@ folderTree.addEventListener('keydown', event => moveListSelection(event, folderT
 appMenu.querySelectorAll('summary').forEach(summary => summary.addEventListener('click', () => { for (const menu of appMenu.querySelectorAll('details')) if (menu !== summary.parentElement) menu.open = false }))
 appMenu.addEventListener('click', event => { const button = event.target.closest('button[data-action]'); if (button) action(button.dataset.action).catch(error) }); $('#search-button').addEventListener('click', () => action('search').catch(error)); contextElement.addEventListener('click', event => { const button = event.target.closest('button[data-action]'); if (button) contextAction(button.dataset.action).catch(error) }); document.addEventListener('pointerdown', event => { if (!appMenu.contains(event.target)) closeMenus(); if (!contextElement.hidden && !contextElement.contains(event.target)) closeContext() }, true); window.addEventListener('resize', () => { closeMenus(); closeContext() })
 window.addEventListener('keydown', event => { if ([...modalRoot.children].some(child => !child.hidden) || event.target.matches('input,textarea,select')) return; const key = `${event.metaKey || event.ctrlKey ? 'CommandOrControl+' : ''}${event.altKey ? 'Alt+' : ''}${event.shiftKey ? 'Shift+' : ''}${event.key.length === 1 ? event.key.toUpperCase() : event.key}`; const name = Object.entries(shortcuts).find(([, accelerator]) => accelerator === key)?.[0]; if (name) { event.preventDefault(); action(name).catch(error) } })
-async function bootstrap() { doubleClickDelayMs = await window.bookManager.doubleClickDelay(); await refresh(); shortcuts = (await window.bookManager.get('/api/shortcuts')).shortcuts || {}; message('资料库已连接') }
+async function bootstrap() { doubleClickDelayMs = await window.bookManager.doubleClickDelay(); await refresh(); shortcuts = (await window.bookManager.get('/api/shortcuts')).shortcuts || {}; message(importController.restoreIssue ? '待确认导入记录无法读取，导入功能已暂停，请检查本地应用存储。' : importController.pending ? '上次导入结果待确认，请点击“导入文件”继续确认。' : '资料库已连接') }
 window.bookManager.onBusinessError(notice)
 bootstrap().catch(error); window.bookManager.onMenuAction(payload => { if (payload?.name) action(payload.name).catch(error) })

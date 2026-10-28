@@ -97,3 +97,16 @@ h2 { font-size: 13px; }
 
 .name-field-error { color: #c33b35; display: block; margin-top: 4px; }
 .form-grid input[aria-invalid="true"] { border-color: #c33b35; }
+
+.import-targets { min-width: 0; }
+.import-target-header, .import-target-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.import-target-list, .import-folder-choices { max-height: 220px; overflow: auto; }
+.import-target-row span { overflow-wrap: anywhere; }
+.import-target-row button { flex-shrink: 0; }
+.missing-target { color: #c33b35; }
+.import-folder-choice { display: flex; align-items: center; gap: 8px; padding: 6px; overflow-wrap: anywhere; }
+.import-folder-choice input { width: auto; }
+.import-folder-children { padding-left: 18px; }
+.import-folder-choices summary { cursor: pointer; }
+
+.import-status:empty { display: none; }

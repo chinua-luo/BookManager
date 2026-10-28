@@ -10,6 +10,8 @@ import sqlite3
 import tempfile
 import threading
 import time
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -725,43 +727,44 @@ class LibraryStore:
 
     def cleanup_unreferenced_blobs(self) -> int:
         """Remove Blob records and files that no current document references."""
-        rows = self.conn.execute(
-            """
-            SELECT b.sha256, b.size, b.stored_path
-            FROM blobs AS b
-            LEFT JOIN documents AS d ON d.current_hash = b.sha256
-            WHERE d.id IS NULL
-            """
-        ).fetchall()
+        with self.transaction():
+            rows = self.conn.execute(
+                """
+                SELECT b.sha256, b.size, b.stored_path
+                FROM blobs AS b
+                LEFT JOIN documents AS d ON d.current_hash = b.sha256
+                WHERE d.id IS NULL
+                """
+            ).fetchall()
 
-        reclaimed_bytes = 0
-        for row in rows:
-            blob_hash = str(row["sha256"])
-            stored_path = Path(str(row["stored_path"]))
-            try:
-                stored_path.unlink()
-            except FileNotFoundError:
-                record_exception('store.recovered', data_home=self.home)
-                pass
-            except OSError:
-                # Keep the database entry if its file cannot be removed.
-                record_exception('store.recovered', data_home=self.home)
-                continue
+            reclaimed_bytes = 0
+            for row in rows:
+                blob_hash = str(row["sha256"])
+                stored_path = Path(str(row["stored_path"]))
+                try:
+                    stored_path.unlink()
+                except FileNotFoundError:
+                    record_exception('store.recovered', data_home=self.home)
+                    pass
+                except OSError:
+                    # Keep the database entry if its file cannot be removed.
+                    record_exception('store.recovered', data_home=self.home)
+                    continue
 
-            with self.conn:
-                deleted = self.conn.execute(
-                    """
-                    DELETE FROM blobs
-                    WHERE sha256 = ?
-                      AND NOT EXISTS (
-                          SELECT 1 FROM documents WHERE current_hash = ?
-                      )
-                    """,
-                    (blob_hash, blob_hash),
-                ).rowcount
-            if deleted:
-                reclaimed_bytes += int(row["size"])
-        return reclaimed_bytes
+                with self.transaction():
+                    deleted = self.conn.execute(
+                        """
+                        DELETE FROM blobs
+                        WHERE sha256 = ?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM documents WHERE current_hash = ?
+                          )
+                        """,
+                        (blob_hash, blob_hash),
+                    ).rowcount
+                if deleted:
+                    reclaimed_bytes += int(row["size"])
+            return reclaimed_bytes
 
     def _all_cache_entries(self) -> list[tuple[Path, float, int]]:
         return self._cache_entries("open_cache") + self._cache_entries("render_cache")
@@ -814,6 +817,28 @@ class LibraryStore:
             return 0
         return size
 
+    @contextmanager
+    def transaction(self):
+        """Nested writes use savepoints; only the outermost writer commits."""
+        if self.conn.in_transaction:
+            marker = f"nested_{time.monotonic_ns()}"
+            self.conn.execute(f"SAVEPOINT {marker}")
+            try:
+                yield
+                self.conn.execute(f"RELEASE SAVEPOINT {marker}")
+            except BaseException:
+                self.conn.execute(f"ROLLBACK TO SAVEPOINT {marker}")
+                self.conn.execute(f"RELEASE SAVEPOINT {marker}")
+                raise
+        else:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+                self.conn.commit()
+            except BaseException:
+                self.conn.rollback()
+                raise
+
     def _init_schema(self) -> None:
         self.conn.executescript(
             """
@@ -856,6 +881,21 @@ class LibraryStore:
 
             CREATE INDEX IF NOT EXISTS idx_items_document ON items(document_id);
 
+            CREATE TABLE IF NOT EXISTS library_identity (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                library_id TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS import_requests (
+                request_id TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                content_hash TEXT NOT NULL DEFAULT '',
+                owner_pid INTEGER NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('pending', 'success', 'failed')),
+                result_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS shortcuts (
                 action_id TEXT PRIMARY KEY,
                 accelerator TEXT NOT NULL
@@ -886,6 +926,8 @@ class LibraryStore:
             CREATE INDEX IF NOT EXISTS idx_item_tags_tag ON item_tags(tag_id);
             """
         )
+        self.conn.execute('INSERT OR IGNORE INTO library_identity(id,library_id) VALUES(1,?)', (uuid.uuid4().hex,))
+        self.conn.commit()
         self._migrate_items_allow_duplicate_display_names()
         self._migrate_item_name_data()
         self.conn.execute(
@@ -1046,7 +1088,7 @@ class LibraryStore:
     def create_folder(self, parent_id: int, name: str) -> int:
         name = safe_name(name, "New Folder")
         now = utc_now()
-        with self.conn:
+        with self.transaction():
             cursor = self.conn.execute(
                 "INSERT INTO folders(parent_id, name, created_at) VALUES(?, ?, ?)",
                 (parent_id, self._unique_folder_name(parent_id, name), now),
@@ -1186,18 +1228,20 @@ class LibraryStore:
         name_parts: StructuredFileName | str | None = None,
         note: str = "",
         tags: Iterable[str] | str = (),
+        *,
+        _prepared: tuple[str, int] | None = None,
     ) -> int:
         source_path = Path(source_path)
         if source_path.is_symlink() or not source_path.is_file():
             raise ValueError("文件路径无效或为软链接")
         validate_supported_document(source_path)
-        blob_hash, size = sha256_file(source_path)
+        blob_hash, size = _prepared if _prepared is not None else sha256_file(source_path)
         mime = mimetypes.guess_type(str(source_path))[0] or "application/octet-stream"
         extension = source_path.suffix.lower()
-        stored_path = self._ensure_blob(source_path, blob_hash, size, mime, extension)
+        stored_path = self._ensure_blob(source_path, blob_hash, size, mime, extension, allow_rename=_prepared is None)
         now = utc_now()
 
-        with self.conn:
+        with self.transaction():
             document_id = self._find_document_by_hash(blob_hash)
             if document_id is None:
                 cursor = self.conn.execute(
@@ -1222,7 +1266,11 @@ class LibraryStore:
         self._ensure_article_mirror(item_id)
         return item_id
 
-    def _ensure_blob(self, source_path: Path, blob_hash: str, size: int, mime: str, extension: str) -> Path:
+    def _ensure_blob(self, source_path: Path, blob_hash: str, size: int, mime: str, extension: str, *, allow_rename: bool = True) -> Path:
+        with self.transaction():
+            return self._ensure_blob_in_transaction(source_path, blob_hash, size, mime, extension, allow_rename=allow_rename)
+
+    def _ensure_blob_in_transaction(self, source_path: Path, blob_hash: str, size: int, mime: str, extension: str, *, allow_rename: bool = True) -> Path:
         existing = self.conn.execute(
             "SELECT stored_path FROM blobs WHERE sha256 = ?",
             (blob_hash,),
@@ -1231,12 +1279,12 @@ class LibraryStore:
             stored_path = Path(existing["stored_path"])
             if stored_path.is_symlink():
                 raise ValueError("底层文件不能是软链接")
-            if extension and stored_path.exists() and not stored_path.suffix:
+            if allow_rename and extension and stored_path.exists() and not stored_path.suffix:
                 renamed_path = stored_path.with_name(f"{stored_path.name}{extension}")
                 if not renamed_path.exists():
                     stored_path.rename(renamed_path)
                     stored_path = renamed_path
-                    with self.conn:
+                    with self.transaction():
                         self.conn.execute(
                             "UPDATE blobs SET stored_path = ?, extension = ?, mime = ? WHERE sha256 = ?",
                             (str(stored_path), extension, mime, blob_hash),
@@ -1249,7 +1297,7 @@ class LibraryStore:
         subdir.mkdir(parents=True, exist_ok=True)
         stored_path = subdir / f"{blob_hash}{extension}"
         _atomic_copy_verified(source_path, stored_path, blob_hash)
-        with self.conn:
+        with self.transaction():
             self.conn.execute(
                 """
                 INSERT OR IGNORE INTO blobs(sha256, size, mime, extension, stored_path, created_at)
@@ -1276,7 +1324,7 @@ class LibraryStore:
         item = self.get_item(item_id)
         parts = self._coerce_name_parts(name_parts, item.display_name) if name_parts is not None else item.name_parts
         now = utc_now()
-        with self.conn:
+        with self.transaction():
             name, parts = self._unique_item_name_parts(target_folder_id, parts)
             cursor = self.conn.execute(
                 """
@@ -1316,7 +1364,7 @@ class LibraryStore:
             article_item_id = int(row["id"])
             article_item = self.get_item(article_item_id)
             if not any(tag.casefold() == "article" for tag in article_item.tags):
-                with self.conn:
+                with self.transaction():
                     self._replace_item_tags(article_item_id, (*article_item.tags, "article"))
             return article_item_id
         return self.mirror_item(item.id, articles_folder_id)

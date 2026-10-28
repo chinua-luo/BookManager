@@ -15,6 +15,6 @@ export async function submitNameForm({ read, validate, controls, errors, accept 
     controls[key].focus()
     return false
   }
-  accept(values)
+  await accept(values)
   return true
 }

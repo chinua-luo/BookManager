@@ -117,6 +117,37 @@ class BridgeContractTests(unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertTrue(result['ok'])
 
+    def test_multi_target_import_receipt_compatibility_and_safe_validation(self):
+        store = self.server.open_store()
+        folder_id = store.create_folder(1, 'Destination')
+        store.close()
+        source = self.root / 'Book.txt'
+        source.write_text('book')
+        payload = {'path': str(source), 'folderIds': [1, folder_id, 1], 'nameParts': {'mainTitle': 'Book', 'extension': '.txt'}, 'requestId': 'multi-request'}
+        status, result = self.request('/api/import/file', payload)
+        self.assertEqual(status, 201)
+        self.assertEqual(result['stats']['created'], 2)
+        self.assertEqual(len(result['data']['items']), 2)
+        self.assertEqual(result['data']['item']['folderId'], 1)
+        status, receipt = self.request('/api/import/requests/multi-request')
+        self.assertEqual(status, 200)
+        self.assertEqual(receipt['data']['state'], 'success')
+        self.assertEqual(receipt['data']['result']['documentId'], result['data']['documentId'])
+        self.assertEqual(self.request('/api/import/file', payload)[1]['data']['entries'], result['data']['entries'])
+        status, conflict = self.request('/api/import/file', {**payload, 'folderIds': [1]})
+        self.assertEqual(status, 409)
+        self.assertEqual(conflict['error_type'], 'request_conflict')
+        self.assertEqual(self.request('/api/import/requests/unknown-request')[1]['data']['state'], 'not_found')
+        self.assertEqual(self.request('/api/import/requests/multi-request', authorized=False)[0], 401)
+        for index, changes in enumerate(({'folderIds': []}, {'folderIds': [True]}, {'folderIds': [9999]}, {'folderIds': [1], 'folderId': 1}, {'requestId': '../invalid'})):
+            with self.subTest(changes=changes):
+                status, failure = self.request('/api/import/file', {**payload, 'requestId': f'invalid-{index}', **changes})
+                self.assertEqual(status, 400)
+                self.assertNotIn('Traceback', failure['msg'])
+        identity = self.request('/api/tree')[1]['data']['libraryId']
+        self.assertTrue(identity)
+        self.assertEqual(self.request('/api/tree')[1]['data']['libraryId'], identity)
+
     def test_security_block_has_stable_error_type_and_business_message(self):
         with mock.patch('bookmanager.bridge.crawl_into_library', side_effect=UnsafeUrlError('private 127.0.0.1 secret')):
             status, result = self.request('/api/crawl', {'source': 'http://localhost', 'folderId': 1})

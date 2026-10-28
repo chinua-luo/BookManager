@@ -29,6 +29,8 @@ def failure_details(error: BaseException | str, path: str = '', status: int = 40
         kind, msg = 'file_unavailable', '文件或文件夹不存在或无法读取，请检查后重试'
     elif isinstance(error, NamingValidationError) and status < 500:
         kind, msg = 'invalid_name', str(error)
+    elif hasattr(error, 'import_error_type'):
+        kind, msg = error.import_error_type, str(error)
     elif '/import' in path:
         kind, msg = 'import_failed', '文件导入失败，请检查文件是否可读取且内容完整'
     elif '/search' in path:

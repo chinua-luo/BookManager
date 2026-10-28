@@ -16,7 +16,7 @@ const POST_PATHS = new Set([
   '/api/settings/shortcuts',
   '/api/logs/events'
 ])
-const GET_PATTERNS = [/^\/api\/folders\/\d+\/contents$/]
+const GET_PATTERNS = [/^\/api\/import\/requests\/[A-Za-z0-9_-]{1,80}$/, /^\/api\/folders\/\d+\/contents$/]
 const POST_PATTERNS = [
   /^\/api\/folders\/\d+\/(?:rename|move|delete)$/,
   /^\/api\/items\/\d+\/(?:rename|move|mirror|delete|delete-underlying)$/,

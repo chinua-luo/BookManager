@@ -252,3 +252,17 @@ test('production response boundary unwraps success and preserves structured busi
   await assert.rejects(responseJson(new Response(JSON.stringify(failure), { status: 400 }), '/api/tree'), error => notificationFromError(error).msg === failure.msg)
   for (const value of [null, [], 'bad envelope']) await assert.rejects(responseJson(new Response(JSON.stringify(value)), '/api/tree'), /BM_NOTICE/)
 })
+
+
+test('production modal refuses dismissal until the guarded import outcome is resolved', () => {
+  const h = domHarness()
+  let resolved = false; let dismissed = 0
+  const dialog = h.modal('导入文件', h.document.createElement('div'), { canDismiss: () => resolved, onDismiss: () => { dismissed++ } })
+  dialog.close()
+  assert.equal(dismissed, 0)
+  assert.equal(h.root.children.length, 1)
+  resolved = true
+  dialog.close()
+  assert.equal(dismissed, 1)
+  assert.equal(h.root.children.length, 0)
+})
