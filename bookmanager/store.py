@@ -335,6 +335,15 @@ class FolderStats:
 
 
 @dataclass(frozen=True)
+class PreparedBlob:
+    """A copy-hashed source file staged outside any write transaction."""
+
+    sha256: str
+    size: int
+    temp_path: Path
+
+
+@dataclass(frozen=True)
 class CacheSettings:
     policy: str
     open_days: int
@@ -1442,45 +1451,156 @@ class LibraryStore:
         note: str = "",
         tags: Iterable[str] | str = (),
         *,
-        _prepared: tuple[str, int] | None = None,
+        _prepared: PreparedBlob | None = None,
     ) -> int:
         source_path = Path(source_path)
         if source_path.is_symlink() or not source_path.is_file():
             raise ValueError("文件路径无效或为软链接")
         validate_supported_document(source_path)
-        blob_hash, size = _prepared if _prepared is not None else sha256_file(source_path)
         mime = mimetypes.guess_type(str(source_path))[0] or "application/octet-stream"
         extension = source_path.suffix.lower()
-        stored_path = self._ensure_blob(source_path, blob_hash, size, mime, extension, allow_rename=_prepared is None)
+        if _prepared is None:
+            prepared = self.prepare_blob(source_path)
+            self.install_prepared_blob(prepared, mime, extension)
+        else:
+            # The caller already staged and registered this blob.
+            prepared = _prepared
+        blob_hash = prepared.sha256
         now = utc_now()
 
-        with self.transaction():
-            document_id = self._find_document_by_hash(blob_hash)
-            if document_id is None:
+        try:
+            with self.transaction():
+                document_id = self._find_document_by_hash(blob_hash)
+                if document_id is None:
+                    cursor = self.conn.execute(
+                        """
+                        INSERT INTO documents(current_hash, original_name, created_at, updated_at)
+                        VALUES(?, ?, ?, ?)
+                        """,
+                        (blob_hash, source_path.name, now, now),
+                    )
+                    document_id = int(cursor.lastrowid)
+                parts = self._coerce_name_parts(name_parts, source_path.name)
+                name, parts = self._item_name_parts(parts)
                 cursor = self.conn.execute(
                     """
-                    INSERT INTO documents(current_hash, original_name, created_at, updated_at)
-                    VALUES(?, ?, ?, ?)
+                    INSERT INTO items(
+                        folder_id, document_id, display_name, name_data, created_at, updated_at,
+                        main_title_norm, subtitle_norm, authors_norm
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (blob_hash, source_path.name, now, now),
+                    (folder_id, document_id, name, _name_parts_to_json(parts, note), now, now, *_name_norms(parts)),
                 )
-                document_id = int(cursor.lastrowid)
-            parts = self._coerce_name_parts(name_parts, source_path.name)
-            name, parts = self._item_name_parts(parts)
-            cursor = self.conn.execute(
-                """
-                INSERT INTO items(
-                    folder_id, document_id, display_name, name_data, created_at, updated_at,
-                    main_title_norm, subtitle_norm, authors_norm
-                )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (folder_id, document_id, name, _name_parts_to_json(parts, note), now, now, *_name_norms(parts)),
-            )
-            self._replace_item_tags(int(cursor.lastrowid), tags)
+                self._replace_item_tags(int(cursor.lastrowid), tags)
+        except BaseException:
+            self.release_unreferenced_blob(blob_hash)
+            raise
         item_id = int(cursor.lastrowid)
         self._ensure_article_mirror(item_id)
         return item_id
+
+    def prepare_blob(self, source_path: Path) -> PreparedBlob:
+        """Copy the source into the temp dir while hashing it, in a single read pass."""
+        source_path = Path(source_path)
+        temp_root = self.home / "tmp"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256()
+        size = 0
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=".bookmanager-import-",
+                dir=temp_root,
+                delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                with source_path.open("rb") as source:
+                    while True:
+                        chunk = source.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        size += len(chunk)
+                        temporary.write(chunk)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            try:
+                temporary_path.chmod(0o600)
+            except OSError:
+                record_exception('store.permission_apply_failed', data_home=self.home)
+            return PreparedBlob(digest.hexdigest(), size, temporary_path)
+        except BaseException:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            raise
+
+    def install_prepared_blob(self, prepared: PreparedBlob, mime: str, extension: str) -> Path:
+        """Register a staged blob with short write transactions only.
+
+        The long copy already happened in prepare_blob, so writers are blocked for
+        milliseconds instead of the whole file copy.
+        """
+        existing = self.conn.execute(
+            "SELECT stored_path FROM blobs WHERE sha256 = ?",
+            (prepared.sha256,),
+        ).fetchone()
+        if existing is not None:
+            stored_path = Path(existing["stored_path"])
+            if stored_path.is_symlink():
+                raise ValueError("底层文件不能是软链接")
+            if stored_path.exists():
+                prepared.temp_path.unlink(missing_ok=True)
+                return stored_path
+            stored_path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(prepared.temp_path, stored_path)
+            with self.transaction():
+                self.conn.execute(
+                    "UPDATE blobs SET mime = ?, extension = ? WHERE sha256 = ?",
+                    (mime, extension, prepared.sha256),
+                )
+            return stored_path
+
+        subdir = self.blob_dir / prepared.sha256[:2]
+        subdir.mkdir(parents=True, exist_ok=True)
+        stored_path = subdir / f"{prepared.sha256}{extension}"
+        os.replace(prepared.temp_path, stored_path)
+        try:
+            with self.transaction():
+                self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO blobs(sha256, size, mime, extension, stored_path, created_at)
+                    VALUES(?, ?, ?, ?, ?, ?)
+                    """,
+                    (prepared.sha256, prepared.size, mime, extension, str(stored_path), utc_now()),
+                )
+        except BaseException:
+            stored_path.unlink(missing_ok=True)
+            raise
+        return stored_path
+
+    def release_unreferenced_blob(self, blob_hash: str) -> None:
+        """Drop a staged blob when its import failed and nothing references it yet."""
+        try:
+            with self.transaction():
+                referenced = self.conn.execute(
+                    "SELECT 1 FROM documents WHERE current_hash = ? LIMIT 1", (blob_hash,)
+                ).fetchone()
+                if referenced is not None:
+                    return
+                row = self.conn.execute("SELECT stored_path FROM blobs WHERE sha256 = ?", (blob_hash,)).fetchone()
+                if row is None:
+                    return
+                self.conn.execute("DELETE FROM blobs WHERE sha256 = ?", (blob_hash,))
+                stored_path = Path(row["stored_path"])
+            try:
+                if not stored_path.is_symlink():
+                    stored_path.unlink(missing_ok=True)
+            except OSError:
+                record_exception('store.blob_unlink_failed', data_home=self.home)
+        except (OSError, sqlite3.Error):
+            record_exception('store.blob_release_failed', data_home=self.home)
 
     def _ensure_blob(self, source_path: Path, blob_hash: str, size: int, mime: str, extension: str, *, allow_rename: bool = True) -> Path:
         with self.transaction():
@@ -1714,10 +1834,15 @@ class LibraryStore:
         if source_path.is_symlink() or not source_path.is_file():
             raise ValueError("文件路径无效或为软链接")
         validate_supported_document(source_path)
-        blob_hash, size = sha256_file(source_path)
         mime = mimetypes.guess_type(str(source_path))[0] or "application/octet-stream"
         extension = source_path.suffix.lower()
-        self._ensure_blob(source_path, blob_hash, size, mime, extension)
+        prepared = self.prepare_blob(source_path)
+        try:
+            self.install_prepared_blob(prepared, mime, extension)
+        except BaseException:
+            prepared.temp_path.unlink(missing_ok=True)
+            raise
+        blob_hash = prepared.sha256
         existing_document_id = self._find_document_by_hash(blob_hash)
         now = utc_now()
 

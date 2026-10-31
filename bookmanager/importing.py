@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import mimetypes
 import os
 import re
 import sqlite3
@@ -115,7 +116,7 @@ def import_file(store: LibraryStore, source: Path, folder_ids: list[int], parts:
             details['replayed'] = True
             raise ImportProblem('import_pending', '此导入请求正在处理中，请确认结果后再操作。')
         _active.add(key)
-    owned_blob: Path | None = None
+    prepared = None
     registered = False
     try:
         row = store.conn.execute('SELECT * FROM import_requests WHERE request_id=?', (request_id,)).fetchone()
@@ -143,22 +144,24 @@ def import_file(store: LibraryStore, source: Path, folder_ids: list[int], parts:
         validate_supported_document(source)
         details['stage'] = 'hash'
         before = source.stat()
-        blob_hash, size = sha256_file(source)
         snapshot = (before.st_size, before.st_mtime_ns, before.st_ino)
+        prepared = store.prepare_blob(source)
+        blob_hash, size = prepared.sha256, prepared.size
         def unchanged():
             stat = source.stat()
             if snapshot != (stat.st_size, stat.st_mtime_ns, stat.st_ino):
                 raise ImportProblem('source_changed', '源文件在导入期间发生变化，本次未新增镜像，请重新选择。')
         unchanged()
         details['stage'] = 'write'
+        # The long read/copy already happened in prepare_blob; only short write
+        # transactions remain, so concurrent writers are not blocked for seconds.
+        store.install_prepared_blob(
+            prepared,
+            mimetypes.guess_type(str(source))[0] or 'application/octet-stream',
+            source.suffix.lower(),
+        )
         with store.transaction():
             _check_targets(store, folder_ids)
-            blob = store.conn.execute('SELECT stored_path,mime,extension FROM blobs WHERE sha256=?', (blob_hash,)).fetchone()
-            path = Path(blob['stored_path']) if blob else store.blob_dir / blob_hash[:2] / f'{blob_hash}{source.suffix.lower()}'
-            if blob is None and not path.exists():
-                owned_blob = path
-            if blob is not None:
-                store._ensure_blob(source, blob_hash, size, blob['mime'], blob['extension'], allow_rename=False)
             document_id = store._find_document_by_hash(blob_hash)
             original_ids = {int(row['id']) for row in store.conn.execute('SELECT id FROM items WHERE document_id=?', (document_id,))} if document_id else set()
             created = []; existing = []
@@ -171,7 +174,7 @@ def import_file(store: LibraryStore, source: Path, folder_ids: list[int], parts:
                 # The first item also applies the existing article-tag rule, within
                 # this same transaction; later targets reuse any auto-created item.
                 if document_id is None or not created:
-                    item_id = store.add_local_file(source, folder_id, parts, note, tags, _prepared=(blob_hash, size))
+                    item_id = store.add_local_file(source, folder_id, parts, note, tags, _prepared=prepared)
                     document_id = store.get_item(item_id).document_id
                 else:
                     item_id = store.mirror_item(created[0], folder_id, parts, note, tags)
@@ -213,13 +216,12 @@ def import_file(store: LibraryStore, source: Path, folder_ids: list[int], parts:
         row = store.conn.execute('SELECT state,result_json FROM import_requests WHERE request_id=?', (request_id,)).fetchone()
         if registered and row is not None and row['state'] == 'success':
             return json.loads(row['result_json'])['result']
-        if owned_blob is not None:
+        if prepared is not None:
             try:
-                with store.transaction():
-                    if not store.conn.execute('SELECT 1 FROM blobs WHERE stored_path=?', (str(owned_blob),)).fetchone():
-                        owned_blob.unlink(missing_ok=True)
-            except Exception:
+                prepared.temp_path.unlink(missing_ok=True)
+            except OSError:
                 record_exception('import.cleanup_failed', data_home=store.home, request_id=request_id)
+            store.release_unreferenced_blob(prepared.sha256)
         if registered:
             try:
                 with store.transaction():

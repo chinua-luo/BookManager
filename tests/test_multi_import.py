@@ -48,10 +48,13 @@ class MultiImportTests(unittest.TestCase):
                 target_ids(payload)
 
     def test_parent_child_and_root_share_one_document_hash_and_copy(self):
-        with mock.patch('bookmanager.importing.sha256_file', wraps=sha256_file) as hash_file, mock.patch('bookmanager.store._atomic_copy_verified', wraps=__import__('bookmanager.store', fromlist=['_atomic_copy_verified'])._atomic_copy_verified) as copy:
+        with (
+            mock.patch.object(LibraryStore, 'prepare_blob', autospec=True, wraps=LibraryStore.prepare_blob) as prepare,
+            mock.patch.object(LibraryStore, 'install_prepared_blob', autospec=True, wraps=LibraryStore.install_prepared_blob) as install,
+        ):
             result = self.run_import([1, self.a, self.b, self.a])
-        self.assertEqual(hash_file.call_count, 1)
-        self.assertEqual(copy.call_count, 1)
+        self.assertEqual(prepare.call_count, 1)
+        self.assertEqual(install.call_count, 1)
         self.assertEqual(result['stats'], {'targetCount': 3, 'created': 3, 'existing': 0, 'automatic': 0})
         self.assertEqual(self.counts(), [3, 1, 1])
         items = [self.store.get_item(entry['itemId']) for entry in result['entries']]
@@ -158,26 +161,27 @@ class MultiImportTests(unittest.TestCase):
         with self.assertRaises(ImportProblem):
             self.run_import([9999])
         self.assertEqual(self.counts(), [0, 0, 0])
-        with mock.patch('bookmanager.importing.sha256_file', side_effect=PermissionError('cannot read')):
+        with mock.patch.object(LibraryStore, 'prepare_blob', autospec=True, side_effect=PermissionError('cannot read')):
             with self.assertRaises(PermissionError):
                 self.run_import(request='unreadable')
-        original_hash = sha256_file
-        def changed(path):
-            result = original_hash(path)
+        original_prepare = LibraryStore.prepare_blob
+        def changed(store, path):
+            result = original_prepare(store, path)
             path.write_text('changed during hash')
             return result
-        with mock.patch('bookmanager.importing.sha256_file', side_effect=changed):
+        with mock.patch.object(LibraryStore, 'prepare_blob', autospec=True, side_effect=changed):
             with self.assertRaisesRegex(ImportProblem, '变化'):
                 self.run_import(request='changed')
         self.assertEqual(self.counts(), [0, 0, 0])
 
     def test_target_deleted_between_precheck_and_write_is_rejected(self):
-        original_hash = sha256_file
-        def deleted(path):
+        original_prepare = LibraryStore.prepare_blob
+        def deleted(store, path):
+            result = original_prepare(store, path)
             with self.store.transaction():
                 self.store.conn.execute('DELETE FROM folders WHERE id=?', (self.b,))
-            return original_hash(path)
-        with mock.patch('bookmanager.importing.sha256_file', side_effect=deleted), self.assertRaisesRegex(ImportProblem, '已不存在'):
+            return result
+        with mock.patch.object(LibraryStore, 'prepare_blob', autospec=True, side_effect=deleted), self.assertRaisesRegex(ImportProblem, '已不存在'):
             self.run_import()
         self.assertEqual(self.counts(), [0, 0, 0])
 
@@ -206,7 +210,8 @@ class MultiImportTests(unittest.TestCase):
                 return getattr(connection, name)
             def commit(self):
                 self.commits += 1
-                if self.commits == 2:
+                # 1: pending receipt, 2: staged blob registration, 3: mirror write.
+                if self.commits == 3:
                     if self.fail_after_commit:
                         connection.commit()
                     raise RuntimeError('commit acknowledgement failed')
@@ -249,10 +254,10 @@ class MultiImportTests(unittest.TestCase):
 
     def test_concurrent_same_request_does_not_duplicate_and_reports_pending(self):
         entered = threading.Event(); release = threading.Event(); results = []; errors = []
-        original_hash = sha256_file
-        def paused(path):
+        original_prepare = LibraryStore.prepare_blob
+        def paused(store, path):
             entered.set(); release.wait(4)
-            return original_hash(path)
+            return original_prepare(store, path)
         def worker():
             store = LibraryStore(self.root / 'data')
             try:
@@ -261,7 +266,7 @@ class MultiImportTests(unittest.TestCase):
                 errors.append(error)
             finally:
                 store.close()
-        with mock.patch('bookmanager.importing.sha256_file', side_effect=paused):
+        with mock.patch.object(LibraryStore, 'prepare_blob', autospec=True, side_effect=paused):
             thread = threading.Thread(target=worker); thread.start()
             try:
                 self.assertTrue(entered.wait(3))
@@ -288,11 +293,11 @@ class MultiImportTests(unittest.TestCase):
         self.assertEqual(self.counts(), [0, 0, 0])
 
     def test_cleanup_failure_keeps_original_error_and_records_diagnostic(self):
-        with mock.patch.object(self.store, 'mirror_item', side_effect=RuntimeError('original failure')), mock.patch('pathlib.Path.unlink', side_effect=PermissionError('cleanup denied')), mock.patch('bookmanager.importing.record_exception') as log:
+        with mock.patch.object(self.store, 'mirror_item', side_effect=RuntimeError('original failure')), mock.patch('pathlib.Path.unlink', side_effect=PermissionError('cleanup denied')), mock.patch('bookmanager.store.record_exception') as log:
             with self.assertRaisesRegex(RuntimeError, 'original failure'):
                 self.run_import()
         self.assertEqual(self.counts(), [0, 0, 0])
-        log.assert_any_call('import.cleanup_failed', data_home=self.store.home, request_id='request-1')
+        self.assertTrue(any(call.args and call.args[0] == 'store.blob_unlink_failed' for call in log.call_args_list), log.call_args_list)
 
 
     def test_delete_underlying_file_rolls_back_blob_when_database_fails(self):

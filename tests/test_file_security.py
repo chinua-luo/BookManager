@@ -72,7 +72,7 @@ class FileSecurityTests(unittest.TestCase):
         stale = next((data / "blobs").iterdir()) / ".bookmanager-tmp-stale"
         stale.write_text("partial", encoding="utf-8")
         stale_tmp = data / "tmp" / "abandoned.tmp"
-        stale_tmp.parent.mkdir()
+        stale_tmp.parent.mkdir(exist_ok=True)
         stale_tmp.write_text("partial", encoding="utf-8")
         old = time.time() - 25 * 60 * 60
         os.utime(stale, (old, old))
