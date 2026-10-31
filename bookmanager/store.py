@@ -84,7 +84,7 @@ CACHE_POLICY_NAMES = tuple(CACHE_POLICIES)
 OPEN_CACHE_MANIFEST = ".bookmanager-open.json"
 # Bump when the base schema or a data migration changes; existing libraries are
 # upgraded once instead of re-scanning every item on each request.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MIGRATION_STAGING_PREFIX = ".bookmanager-migration-"
 MIGRATION_COMPLETE_MARKER = ".bookmanager-migration-complete"
 _BLOB_WRITE_LOCK = threading.RLock()
@@ -422,6 +422,29 @@ def _note_from_json(value: str) -> str:
     return _normalize_note(data.get("note", ""))
 
 
+def _parse_name_data(value: str) -> tuple[StructuredFileName, str]:
+    """Parse name_data once for the hot item-listing path."""
+    try:
+        data = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        record_event('store.name_data_invalid')
+        data = {}
+    if not isinstance(data, dict):
+        record_event('store.name_data_invalid')
+        data = {}
+    parts = StructuredFileName(
+        series_abbr=str(data.get("series_abbr", "")),
+        number=str(data.get("number", "")),
+        main_title=str(data.get("main_title", "")),
+        subtitle=str(data.get("subtitle", "")),
+        edition=str(data.get("edition", "1")) or "1",
+        authors=str(data.get("authors", "")),
+        extension=str(data.get("extension", "")),
+        edition_language=str(data.get("edition_language", "英文")),
+    )
+    return parts, _normalize_note(data.get("note", ""))
+
+
 _LEGACY_NAME_FORBIDDEN_CHARS = set('<>:"/\\|?*')
 
 
@@ -538,6 +561,13 @@ class LibraryStore:
         if int(self.conn.execute("PRAGMA user_version").fetchone()[0]) != SCHEMA_VERSION:
             self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self.conn.commit()
+
+    def _apply_schema_v2(self) -> None:
+        # Folder listings and their name ordering are by far the hottest query.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_items_folder_name ON items(folder_id, display_name)"
+        )
+        self.conn.commit()
 
     @silent_background('cache.stale_temporary_cleanup_failed')
     def _cleanup_stale_temporary_files(self) -> None:
@@ -1145,15 +1175,28 @@ class LibraryStore:
             raise ValueError(f"Folder {folder_id} does not exist")
         return Folder(row["id"], row["parent_id"], row["name"])
 
+    def _folder_path_lookup(self):
+        """Return a memoized id -> "A / B / C" resolver backed by one query."""
+        rows = self.conn.execute("SELECT id, parent_id, name FROM folders").fetchall()
+        nodes = {int(row["id"]): (row["parent_id"], str(row["name"])) for row in rows}
+        paths: dict[int, str] = {}
+
+        def resolve(folder_id: int) -> str:
+            cached = paths.get(folder_id)
+            if cached is not None:
+                return cached
+            node = nodes.get(int(folder_id))
+            if node is None:
+                return ""
+            parent_id, name = node
+            resolved = name if parent_id is None else f"{resolve(int(parent_id))} / {name}"
+            paths[int(folder_id)] = resolved
+            return resolved
+
+        return resolve
+
     def folder_path(self, folder_id: int) -> str:
-        names: list[str] = []
-        current = self.get_folder(folder_id)
-        while current:
-            names.append(current.name)
-            if current.parent_id is None:
-                break
-            current = self.get_folder(current.parent_id)
-        return " / ".join(reversed(names))
+        return self._folder_path_lookup()(folder_id)
 
     def folder_stats(self, folder_id: int) -> FolderStats:
         folder_ids = self._descendant_folder_ids(folder_id)
@@ -1181,10 +1224,19 @@ class LibraryStore:
         )
 
     def _descendant_folder_ids(self, folder_id: int) -> list[int]:
-        ids = [folder_id]
-        for child in self.folders(folder_id):
-            ids.extend(self._descendant_folder_ids(child.id))
-        return ids
+        rows = self.conn.execute(
+            """
+            WITH RECURSIVE descendants(id) AS (
+                SELECT id FROM folders WHERE id = ?
+                UNION
+                SELECT folders.id FROM folders
+                JOIN descendants ON folders.parent_id = descendants.id
+            )
+            SELECT id FROM descendants
+            """,
+            (folder_id,),
+        ).fetchall()
+        return [int(row["id"]) for row in rows]
 
     def create_folder(self, parent_id: int, name: str) -> int:
         name = safe_name(name, "New Folder")
@@ -1261,6 +1313,30 @@ class LibraryStore:
         parts = normalize_structured_file_name(parts)
         return build_structured_file_name(parts), parts
 
+    def _tags_for_item_ids(self, item_ids: Iterable[int]) -> dict[int, tuple[str, ...]]:
+        unique_ids = list(dict.fromkeys(int(item_id) for item_id in item_ids))
+        if not unique_ids:
+            return {}
+        collected: dict[int, list[str]] = {item_id: [] for item_id in unique_ids}
+        for start in range(0, len(unique_ids), 500):
+            chunk = unique_ids[start:start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.conn.execute(
+                f"""
+                SELECT it.item_id, t.name
+                FROM item_tags it
+                JOIN tags t ON t.id = it.tag_id
+                WHERE it.item_id IN ({placeholders})
+                """,
+                tuple(chunk),
+            ).fetchall()
+            for row in rows:
+                collected[int(row["item_id"])].append(str(row["name"]))
+        return {
+            item_id: tuple(sorted(names, key=lambda name: (name.casefold(), name)))
+            for item_id, names in collected.items()
+        }
+
     def list_items(self, folder_id: int) -> list[Item]:
         rows = self.conn.execute(
             """
@@ -1274,7 +1350,8 @@ class LibraryStore:
             """,
             (folder_id,),
         ).fetchall()
-        return [self._item_from_row(row) for row in rows]
+        tags = self._tags_for_item_ids(int(row["id"]) for row in rows)
+        return [self._item_from_row(row, tags.get(int(row["id"]), ())) for row in rows]
 
     def get_item(self, item_id: int) -> Item:
         row = self.conn.execute(
@@ -1292,15 +1369,16 @@ class LibraryStore:
             raise ValueError(f"Item {item_id} does not exist")
         return self._item_from_row(row)
 
-    def _item_from_row(self, row: sqlite3.Row) -> Item:
+    def _item_from_row(self, row: sqlite3.Row, tags: tuple[str, ...] | None = None) -> Item:
+        name_parts, note = _parse_name_data(row["name_data"])
         return Item(
             id=row["id"],
             folder_id=row["folder_id"],
             document_id=row["document_id"],
             display_name=row["display_name"],
-            name_parts=_name_parts_from_json(row["name_data"]),
-            note=_note_from_json(row["name_data"]),
-            tags=self.tag_names_for_item(int(row["id"])),
+            name_parts=name_parts,
+            note=note,
+            tags=self.tag_names_for_item(int(row["id"])) if tags is None else tags,
             sha256=row["sha256"],
             size=row["size"],
             mime=row["mime"],
