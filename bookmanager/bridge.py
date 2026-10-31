@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .crawler import crawl_into_library, new_crawl_stats
+from .file_copy import clone_or_copy
 from .file_security import ensure_safe_system_open
 from .importing import ImportProblem, import_file, import_status, target_ids, validate_request_id
 from .metadata import extract_metadata
@@ -883,7 +884,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 file_name += item.stored_path.suffix
             file_name = truncate_open_cache_file_name(file_name)
             open_path = cache_dir / file_name
-            shutil.copy2(item.stored_path, open_path)
+            clone_or_copy(item.stored_path, open_path)
             store.register_open_cache_copy(
                 cache_dir, item.document_id, item.sha256, open_path.name
             )

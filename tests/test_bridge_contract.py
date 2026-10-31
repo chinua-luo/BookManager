@@ -260,6 +260,25 @@ class BridgeContractTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertIs(result['data']['truncated'], False)
 
+
+    def test_open_copy_materializes_an_independent_cache_file(self):
+        source = self.root / 'opened.txt'
+        source.write_text('opened content', encoding='utf-8')
+        status, result = self.request('/api/import/file', {
+            'path': str(source),
+            'folderIds': [1],
+            'nameParts': {'mainTitle': 'Opened', 'edition': '1', 'extension': '.txt'},
+            'requestId': 'opened',
+        })
+        self.assertEqual(status, 201)
+        item_id = result['data']['items'][0]['id']
+        status, opened = self.request(f'/api/items/{item_id}/open')
+        self.assertEqual(status, 200)
+        cached = Path(opened['data']['path'])
+        self.assertTrue(cached.is_file())
+        self.assertEqual(cached.read_text(encoding='utf-8'), 'opened content')
+        self.assertIn('open_cache', str(cached))
+
     def test_startup_applies_the_cache_policy_immediately(self):
         with mock.patch.object(LibraryStore, 'cleanup_caches', return_value=0) as cleanup:
             server = BridgeServer(('127.0.0.1', 0), self.root / 'cleanup-data', self.token, self.root)
