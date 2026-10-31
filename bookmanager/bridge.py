@@ -48,6 +48,7 @@ FOLDER_IMPORT_BATCH_SIZE = 100
 MAX_FOLDER_IMPORT_JOBS = 20
 MAX_OPEN_CACHE_FILE_NAME_BYTES = 200
 REQUEST_SOCKET_TIMEOUT_SECONDS = 30
+MAX_CONCURRENT_REQUESTS = 16
 CONTENT_SECURITY_POLICY = "; ".join(
     (
         "default-src 'self'",
@@ -174,7 +175,12 @@ def truncate_open_cache_file_name(file_name: str, max_bytes: int = MAX_OPEN_CACH
 
 
 class BridgeServer(ThreadingHTTPServer):
+    # A handful of renderer windows plus startup probes never need dozens of
+    # sockets; a larger listen backlog absorbs short bursts instead.
+    request_queue_size = 64
+
     def __init__(self, address: tuple[str, int], library_home: Path | None, token: str, static_dir: Path) -> None:
+        self._request_slots = threading.BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
         super().__init__(address, BridgeRequestHandler)
         self.library_home = library_home
         self.token = token
@@ -200,6 +206,22 @@ class BridgeServer(ThreadingHTTPServer):
             daemon=True,
         )
         self._startup_cleanup_thread.start()
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        # Backpressure: each accepted connection holds a slot until its handler
+        # thread finishes, bounding memory and SQLite connections under bursts.
+        self._request_slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
 
     def _apply_startup_cache_policy(self) -> None:
         try:
