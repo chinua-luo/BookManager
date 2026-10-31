@@ -172,7 +172,7 @@ class BridgeServer(ThreadingHTTPServer):
         self.token = token
         self.static_dir = static_dir.resolve()
         try:
-            initial_store = self.open_store()
+            initial_store = self.open_store(run_maintenance=True)
             try:
                 self.library_home = initial_store.home
                 # Apply retention days and size limits as soon as the library is known.
@@ -185,8 +185,8 @@ class BridgeServer(ThreadingHTTPServer):
         self.operation_logger = OperationLogger(self.library_home)
         self.capabilities: dict[str, bool] = {}
 
-    def open_store(self) -> LibraryStore:
-        return LibraryStore(self.library_home)
+    def open_store(self, *, run_maintenance: bool = False) -> LibraryStore:
+        return LibraryStore(self.library_home, run_maintenance=run_maintenance)
 
     def log_operation(self, **record: Any) -> None:
         try:

@@ -210,6 +210,12 @@ class BridgeContractTests(unittest.TestCase):
                 server.server_close()
         self.assertTrue((self.root / 'cleanup-data' / 'library.db').is_file())
 
+    def test_per_request_store_skips_the_startup_maintenance_scan(self):
+        with mock.patch('bookmanager.bridge.LibraryStore') as store_class:
+            store_class.return_value.home = self.server.library_home
+            self.server.open_store()
+        store_class.assert_called_once_with(self.server.library_home, run_maintenance=False)
+
     def test_data_migration_copies_then_writes_config_then_deletes_source(self):
         import bookmanager.store as store_module
 

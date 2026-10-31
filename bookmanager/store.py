@@ -82,6 +82,9 @@ CACHE_POLICIES = {
 }
 CACHE_POLICY_NAMES = tuple(CACHE_POLICIES)
 OPEN_CACHE_MANIFEST = ".bookmanager-open.json"
+# Bump when the base schema or a data migration changes; existing libraries are
+# upgraded once instead of re-scanning every item on each request.
+SCHEMA_VERSION = 1
 MIGRATION_STAGING_PREFIX = ".bookmanager-migration-"
 MIGRATION_COMPLETE_MARKER = ".bookmanager-migration-complete"
 _BLOB_WRITE_LOCK = threading.RLock()
@@ -460,7 +463,7 @@ def _legacy_name_parts(display_name: str) -> StructuredFileName:
 class LibraryStore:
     """SQLite-backed virtual folder tree over content-addressed local files."""
 
-    def __init__(self, home: Optional[Path] = None) -> None:
+    def __init__(self, home: Optional[Path] = None, *, run_maintenance: bool = True) -> None:
         if home is None:
             default_home, self.migrated_legacy_library = resolve_default_library_home()
             self.home = default_home.expanduser()
@@ -472,15 +475,18 @@ class LibraryStore:
         self.home.mkdir(parents=True, exist_ok=True)
         self.blob_dir.mkdir(parents=True, exist_ok=True)
         self._secure_library_permissions()
-        self._cleanup_stale_temporary_files()
         self.conn = sqlite3.connect(str(self.db_path))
         try:
             self.conn.row_factory = sqlite3.Row
             self.conn.execute("PRAGMA foreign_keys = ON")
-            self._init_schema()
+            self._ensure_schema()
             self._secure_library_permissions()
             if self.migrated_legacy_library:
                 self._rewrite_legacy_blob_paths()
+            if run_maintenance:
+                # Only the long-lived startup store pays for the full-tree scan;
+                # per-request stores created by the bridge skip it.
+                self._cleanup_stale_temporary_files()
         except Exception:
             self.conn.close()
             raise
@@ -502,6 +508,36 @@ class LibraryStore:
                 except OSError:
                     record_exception('store.permission_apply_failed', data_home=self.home)
                     pass
+
+    REQUIRED_TABLES = (
+        "folders", "blobs", "documents", "items", "library_identity", "import_requests",
+        "shortcuts", "cache_settings", "tags", "item_tags",
+    )
+
+    def _schema_complete(self) -> bool:
+        placeholders = ",".join("?" for _ in self.REQUIRED_TABLES)
+        row = self.conn.execute(
+            f"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ({placeholders})",
+            self.REQUIRED_TABLES,
+        ).fetchone()
+        return int(row[0]) == len(self.REQUIRED_TABLES)
+
+    def _ensure_schema(self) -> None:
+        """Run the base migration once per library, then only newer schema steps."""
+        version = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
+        if version == 0 or not self._schema_complete():
+            self._init_schema()
+            version = 1
+        if version > SCHEMA_VERSION:
+            return
+        while version < SCHEMA_VERSION:
+            version += 1
+            migration = getattr(self, f"_apply_schema_v{version}", None)
+            if migration is not None:
+                migration()
+        if int(self.conn.execute("PRAGMA user_version").fetchone()[0]) != SCHEMA_VERSION:
+            self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            self.conn.commit()
 
     @silent_background('cache.stale_temporary_cleanup_failed')
     def _cleanup_stale_temporary_files(self) -> None:

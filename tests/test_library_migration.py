@@ -164,6 +164,8 @@ class LibraryMigrationTests(unittest.TestCase):
                     'UPDATE items SET display_name = ?, name_data = ? WHERE id = ?',
                     (dirty_name, 'not-json{', item_id),
                 )
+                # Simulate a library written by a pre-versioning release.
+                store.conn.execute('PRAGMA user_version = 0')
         finally:
             store.close()
 
@@ -195,6 +197,7 @@ class LibraryMigrationTests(unittest.TestCase):
                     'UPDATE items SET display_name = ?, name_data = ? WHERE id = ?',
                     ('Bad\x02/Title<>.txt', '[]', item_id),
                 )
+                store.conn.execute('PRAGMA user_version = 0')
         finally:
             store.close()
 
