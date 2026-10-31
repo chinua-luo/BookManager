@@ -95,7 +95,7 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(event['event'], 'startup-error')
         self.assertEqual(event['error_type'], 'frontend_missing')
         self.assertNotIn('Traceback', result.stdout)
-        self.assertIn('Traceback', Path(event['log_path']).read_text())
+        self.assertIn('Traceback', Path(event['log_path']).read_text(encoding='utf-8'))
 
     def test_real_bootstrap_passes_preflight_then_serves_enveloped_health(self):
         import queue

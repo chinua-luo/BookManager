@@ -25,7 +25,7 @@ class DiagnosticsTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def records(self, home):
-        return [json.loads(line) for path in (home / 'logs').glob('diagnostics-*.jsonl') for line in path.read_text().splitlines()]
+        return [json.loads(line) for path in (home / 'logs').glob('diagnostics-*.jsonl') for line in path.read_text(encoding='utf-8').splitlines()]
 
     def test_full_chained_traceback_is_logged_but_secrets_are_redacted(self):
         with diagnostic_scope(self.root / 'data'):
@@ -109,8 +109,8 @@ class DiagnosticsTests(unittest.TestCase):
                 with mock.patch.object(store, 'cache_settings', return_value=policy):
                     self.assertEqual(store.cleanup_caches('startup'), 0)
                     self.assertTrue(cached.exists())
-            self.assertEqual(cached.read_text(), 'changed')
-            self.assertEqual(item.stored_path.read_text(), 'original')
+            self.assertEqual(cached.read_text(encoding='utf-8'), 'changed')
+            self.assertEqual(item.stored_path.read_text(encoding='utf-8'), 'original')
         finally:
             store.close()
 

@@ -51,7 +51,7 @@ class BridgeContractTests(unittest.TestCase):
         self.assertIsInstance(value['stats'], dict)
 
     def diagnostics(self):
-        return [json.loads(line) for path in (self.server.library_home / 'logs').glob('diagnostics-*.jsonl') for line in path.read_text().splitlines()]
+        return [json.loads(line) for path in (self.server.library_home / 'logs').glob('diagnostics-*.jsonl') for line in path.read_text(encoding='utf-8').splitlines()]
 
     def test_success_get_post_and_rejections_share_one_contract(self):
         for path, payload, authorized in [('/api/health', None, True), ('/api/tree', None, True), ('/api/folders', {'parentId': 1, 'name': 'new'}, True), ('/api/missing', None, True), ('/api/health', None, False)]:

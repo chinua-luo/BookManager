@@ -123,7 +123,7 @@ class MetadataSecurityTests(unittest.TestCase):
         self.assertNotIn('Traceback', result.message)
         paths = list((self.path.parent / 'diagnostics' / 'logs').glob('diagnostics-*.jsonl'))
         self.assertTrue(paths)
-        self.assertIn('private-parser-detail', paths[0].read_text())
+        self.assertIn('private-parser-detail', paths[0].read_text(encoding='utf-8'))
 
 
 if __name__ == "__main__":

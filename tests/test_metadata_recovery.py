@@ -74,7 +74,7 @@ class MetadataRecoveryTests(unittest.TestCase):
                 result = extract_metadata(path)
             self.assertTrue(result.extracted, result.message)
             self.assertEqual(result.parts.main_title, 'Useful Book Title')
-            records = [json.loads(line) for log in Path(temporary).glob('logs/diagnostics-*.jsonl') for line in log.read_text().splitlines()]
+            records = [json.loads(line) for log in Path(temporary).glob('logs/diagnostics-*.jsonl') for line in log.read_text(encoding='utf-8').splitlines()]
             self.assertFalse(any(record['level'] == 'ERROR' for record in records), records)
 
     def test_missing_optional_pdf_dependency_is_a_capability_event(self):
@@ -119,7 +119,7 @@ class ResourceLimitTests(unittest.TestCase):
             with mock.patch.dict(sys.modules, {'resource': resource}), mock.patch('bookmanager.metadata_worker.sys.platform', 'linux'), mock.patch.dict('os.environ', {'BOOKMANAGER_DIAGNOSTIC_HOME': temporary}):
                 resource.setrlimit.side_effect = [ValueError('system ceiling'), None]
                 _limit_resources()
-            records = [json.loads(line) for log in Path(temporary).glob('logs/diagnostics-*.jsonl') for line in log.read_text().splitlines()]
+            records = [json.loads(line) for log in Path(temporary).glob('logs/diagnostics-*.jsonl') for line in log.read_text(encoding='utf-8').splitlines()]
         skipped = next(record for record in records if record['event'] == 'metadata_worker.limit_skipped')
         self.assertEqual(skipped['level'], 'INFO')
         self.assertEqual(skipped['details']['resource'], 'RLIMIT_NOFILE')
