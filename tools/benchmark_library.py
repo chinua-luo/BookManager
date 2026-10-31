@@ -26,7 +26,10 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR))
 
+from bookmanager.bridge import BridgeRequestHandler  # noqa: E402
+from bookmanager.file_copy import clone_or_copy  # noqa: E402
 from bookmanager.naming import infer_structured_file_name  # noqa: E402
+from bookmanager.startup import check_storage  # noqa: E402
 from bookmanager.store import LibraryStore  # noqa: E402
 
 
@@ -221,6 +224,124 @@ def api_benchmarks(home: Path, repeats: int) -> dict[str, dict[str, float]]:
             process.kill()
 
 
+def p1_benchmarks(root: Path) -> dict[str, object]:
+    """Scenarios targeted by the P1 work: imports, copies, cache and startup."""
+    import threading
+
+    report: dict[str, object] = {}
+
+    import_home = root / "p1-import"
+    big = root / "p1-big.bin"
+    big.write_bytes(b"\0" * (128 * 1024 * 1024))
+    timings: dict[str, float] = {}
+    started = threading.Event()
+
+    def import_worker() -> None:
+        store = LibraryStore(import_home)
+        started.set()
+        try:
+            began = time.perf_counter()
+            store.add_local_file(big, 1)
+            timings["import_s"] = time.perf_counter() - began
+        finally:
+            store.close()
+
+    thread = threading.Thread(target=import_worker)
+    thread.start()
+    started.wait()
+    writer = None
+    latencies = []
+    while thread.is_alive():
+        writer = LibraryStore(import_home)
+        began = time.perf_counter()
+        writer.create_folder(1, f"during-{len(latencies)}")
+        latencies.append((time.perf_counter() - began) * 1000)
+        writer.close()
+        time.sleep(0.005)
+    thread.join()
+    report["import_128mb"] = {
+        "seconds": round(timings.get("import_s", 0.0), 3),
+        "max_concurrent_write_ms": round(max(latencies) if latencies else 0.0, 1),
+    }
+
+    copy_source = root / "p1-copy.bin"
+    copy_source.write_bytes(b"\0" * (256 * 1024 * 1024))
+    plain = root / "p1-plain.bin"
+    began = time.perf_counter()
+    shutil.copy2(copy_source, plain)
+    report["copy_256mb_plain_ms"] = round((time.perf_counter() - began) * 1000, 1)
+    clone = root / "p1-clone.bin"
+    began = time.perf_counter()
+    clone_or_copy(copy_source, clone)
+    report["copy_256mb_clone_ms"] = round((time.perf_counter() - began) * 1000, 1)
+    plain.unlink(missing_ok=True)
+    clone.unlink(missing_ok=True)
+
+    folder = root / "p1-folder"
+    folder.mkdir()
+    for index in range(400):
+        (folder / f"book-{index}.txt").write_text(f"content {index}", encoding="utf-8")
+    folder_home = root / "p1-folder-home"
+    folder_store = LibraryStore(folder_home)
+    handler = object.__new__(BridgeRequestHandler)
+    began = time.perf_counter()
+    result = BridgeRequestHandler._import_folder_tree(handler, folder_store, folder, 1, ())
+    report["folder_import_400_s"] = round(time.perf_counter() - began, 2)
+    folder_store.close()
+
+    cache_home = root / "p1-cache"
+    cache_store = LibraryStore(cache_home)
+    for index in range(200):
+        directory = cache_store.prepare_cache_directory("open_cache", f"entry-{index}")
+        (directory / "file.txt").write_bytes(b"x" * (1024 * 1024))
+        cache_store.register_open_cache_copy(directory, 1, "deadbeef", "file.txt")
+    began = time.perf_counter()
+    cache_store.cache_usage()
+    report["cache_usage_200_ms"] = round((time.perf_counter() - began) * 1000, 1)
+    began = time.perf_counter()
+    cache_store.sync_open_cache_changes()
+    report["sync_open_cache_200_ms"] = round((time.perf_counter() - began) * 1000, 1)
+    cache_store.close()
+
+    startup_home = root / "p1-startup"
+    startup_store = LibraryStore(startup_home)
+    for index in range(200):
+        directory = startup_store.prepare_cache_directory("open_cache", f"entry-{index}")
+        (directory / "file.txt").write_bytes(b"x" * (1024 * 1024))
+        old = time.time() - 30 * 24 * 3600
+        os.utime(directory, (old, old))
+        os.utime(directory / "file.txt", (old, old))
+    startup_store.close()
+    static_dir = PROJECT_DIR / "electron" / "dist"
+    if (static_dir / "index.html").is_file():
+        from bookmanager.bridge import BridgeServer
+
+        began = time.perf_counter()
+        server = BridgeServer(("127.0.0.1", 0), startup_home, "b" * 64, static_dir)
+        report["startup_ready_ms"] = round((time.perf_counter() - began) * 1000, 1)
+        began = time.perf_counter()
+        server.wait_for_startup_cleanup(60)
+        report["startup_cleanup_ms"] = round((time.perf_counter() - began) * 1000, 1)
+        server.server_close()
+
+    check_home = root / "p1-check"
+    check_store = LibraryStore(check_home)
+    check_store.conn.executemany(
+        "INSERT INTO folders(parent_id,name,created_at) VALUES(1,?,?)",
+        [(f"F{index}", "2026-01-01T00:00:00Z") for index in range(20000)],
+    )
+    check_store.conn.commit()
+    check_store.mark_clean_shutdown()
+    check_store.close()
+    began = time.perf_counter()
+    check_storage(check_home)
+    report["check_storage_20000_clean_ms"] = round((time.perf_counter() - began) * 1000, 1)
+    began = time.perf_counter()
+    check_storage(check_home)
+    report["check_storage_20000_full_ms"] = round((time.perf_counter() - began) * 1000, 1)
+    return report
+
+
 def payload_size(home: Path) -> dict[str, int]:
     # A cheap approximation of the JSON body users have to download per folder click.
     store = LibraryStore(home)
@@ -242,6 +363,7 @@ def main() -> int:
     parser.add_argument("--items", type=int, default=5000, help="synthetic mirror count")
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--no-api", action="store_true", help="skip bridge HTTP benchmarks")
+    parser.add_argument("--p1", action="store_true", help="also run P1 import/copy/cache/startup scenarios")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     args = parser.parse_args()
 
@@ -256,6 +378,8 @@ def main() -> int:
         }
         if not args.no_api:
             report["api"] = api_benchmarks(home, args.repeats)
+        if args.p1:
+            report["p1"] = p1_benchmarks(Path(tempfile.mkdtemp(prefix="bm-benchmark-p1-")))
         if args.json:
             print(json.dumps(report, ensure_ascii=False, indent=2))
         else:
@@ -268,6 +392,8 @@ def main() -> int:
                     print(f"  {name:<22} p50 {values['p50_ms']:>8.1f} ms   p95 {values['p95_ms']:>8.1f} ms")
             for name, size in report.get("api", {}).get("_bytes", {}).items():
                 print(f"  {name:<22} {size / 1024:>8.1f} KiB")
+            for name, value in report.get("p1", {}).items():
+                print(f"  {name:<28} {value}")
         return 0
     finally:
         shutil.rmtree(home, ignore_errors=True)

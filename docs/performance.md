@@ -8,6 +8,7 @@
 
 ```bash
 python3 tools/benchmark_library.py --items 5000 --repeats 5
+python3 tools/benchmark_library.py --items 5000 --repeats 3 --p1   # 额外测导入/复制/缓存/启动
 python3 tools/benchmark_library.py --items 5000 --repeats 5 --no-api   # 仅数据层
 python3 tools/benchmark_library.py --items 5000 --repeats 5 --json     # 机器可读
 ```
@@ -96,6 +97,74 @@ python3 tools/benchmark_library.py --items 5000 --repeats 5 --json     # 机器�
   `truncated: true`，前端状态栏提示“结果过多，请细化搜索条件”。
 - 移除了原先 5 万行后的静默漏结果问题。
 
+
+## P1 优化与实测
+
+P1 阶段解决的是“单个大文件、整目录导入、启动与缓存、前端首屏”这类非请求级问题。
+以下场景由 `--p1` 基准复跑，环境同上（重复 3–5 次取代表值）。
+
+| 场景 | 优化前 | 优化后 | 变化 |
+|---|---:|---:|---:|
+| 导入 128 MiB 文件总耗时 | 0.225 s | **0.109 s** | 约 2.1× |
+| 导入期间另一个写请求最大延迟 | 146.3 ms | **1.5 ms** | 约 97× |
+| 打开 256 MiB 文件的缓存复制 | 61.4 ms（`shutil.copy2`） | **9.5 ms（APFS clone）** | 约 6.5× |
+| 整目录导入 400 个文件 | 0.81 s | **0.26 s** | 约 3.1× |
+| `sync_open_cache_changes`（200 个未修改副本 / 200 MiB） | 186.3 ms | **23.3 ms** | 约 8× |
+| `cache_usage`（200 个副本） | 16.4 ms | 13.1 ms | 约 1.25× |
+| 启动 BridgeServer（含 200 MiB 过期缓存） | 127.9 ms | **5.2 ms 即可用** | 约 24× |
+| 启动缓存清理（后台完成） | 阻塞启动 | 111.2 ms（后台，不阻塞窗口） | 窗口更早可用 |
+| `check_storage`（20000 个文件夹） | 4.2 ms 全量检查 | **1.1 ms（正常退出后跳过）** | 约 3.8× |
+
+> `check_storage` 的差距随数据库页数增长而放大；这里用 20000 个文件夹模拟较大库。
+
+### P1-1 导入：一遍读取 + 事务外复制
+
+- 原实现先 `sha256_file` 读一遍源文件，再在 `BEGIN IMMEDIATE` 写事务里复制一遍并复核哈希，
+  大文件导入期间其他写请求会被长时间阻塞（实测最大 146 ms）。
+- 现改为 `prepare_blob`：在临时目录“边复制边计算哈希”（一次读取），随后用短事务登记；
+  `add_local_file` / `replace_document_content` / `import_file` 全部走这条路径。
+  失败时由 `release_unreferenced_blob` 清理未被引用的 staged blob。
+- 结果：读放大减半，写锁持有时间从 146 ms 级降到 1–2 ms；导入总耗时也下降约一半。
+
+### P1-2 整目录导入：分批提交 + 进度/取消
+
+- 原实现每个文件单独提交、整请求无进度、无法取消。
+- 现在先扫描目录统计总数，再按 100 个文件一批事务提交；进度通过
+  `GET /api/import/folder/progress/{jobId}` 提供（250 ms 轮询），
+  `POST /api/import/folder/cancel/{jobId}` 可取消，取消会删除本次创建的根目录，
+  不保留部分导入。
+- 结果：400 个文件 0.81 s → 0.26 s（减少逐文件 fsync），前端显示实时进度并可取消。
+
+### P1-3 打开外部程序：写时复制克隆
+
+- 原先每次“用系统默认程序打开”都 `shutil.copy2` 整个 Blob。
+- 现在 macOS 使用 `cp -c -p`（APFS clone），Linux 使用 `cp --reflink=auto -p`，
+  失败回退 `shutil.copy2`；克隆后用户编辑产生独立副本，不会修改底层 Blob。
+- 结果：256 MiB 文件从约 61 ms 降到约 9.5 ms；文件越大收益越明显。
+
+### P1-4 启动与缓存：异步清理 + 干净关机标记 + 未修改副本跳过哈希
+
+- 启动缓存清理改为后台线程，窗口不再等缓存删除完成；新增
+  `wait_for_startup_cleanup()` 供测试/关闭流程等待。
+- 正常退出时写入 `.bookmanager-clean-shutdown` 标记，下次启动跳过整库
+  `PRAGMA quick_check`；异常退出（无标记）仍会完整检查。
+- 打开缓存 manifest 记录 copy 时的 size/mtime；未修改且文档哈希未变的副本
+  直接跳过 SHA-256，只有真正编辑过的副本才重新哈希并写回；
+  写回后刷新 manifest（含合并后的 document_id）。
+- `cache_usage` 改为一次目录遍历，而不是每个缓存条目分别 rglob。
+- 结果：启动可用时间约 24× 提升；200 MiB 未修改缓存的同步从 186 ms 降到 23 ms。
+
+### P1-5 前端：导入进度、树事件委托、渲染器懒加载
+
+- 文件夹导入显示实时进度对话框（role=status），支持取消；轮询在请求结束时清理，
+  切换页面不会残留定时器。
+- 文件夹树由“每个节点绑定 click/contextmenu/toggle”改为容器级事件委托，
+  减少大量节点的事件监听器；展开状态/当前目录/键盘导航行为保持不变。
+- 预览库与 7 个渲染器改为首次打开非文本预览时动态 `import()`；
+  启动与文本/DJVU 预览不再加载这些资源。
+- 本环境无法执行 `pnpm build`，因此前端首屏包体积/真实 Electron 端到端收益未在此测量；
+  代码通过 147 个 `node:test` 与语法检查，正式效果需在可构建环境复测（详见 README）。
+
 ## 仍然保留的已知上限
 
 - 未实现虚拟列表：前端已加载的页面会保留在 DOM 中，超大文件夹滚动到底后仍会
@@ -104,8 +173,7 @@ python3 tools/benchmark_library.py --items 5000 --repeats 5 --json     # 机器�
   应改为服务端全局排序 + 游标分页。
 - 标签搜索仍会对 tags 表做 `LIKE`（表很小，14 ms 级）；书库到数万级且标签搜索
   成为瓶颈时可评估 FTS5 trigram。
-- 大文件导入仍是单遍读取前的“先哈希再复制”两次读取、复制位于写事务内（P1 项，
-  本次未改）；打开缓存仍整文件复制（可改用 APFS clonefile / reflink）。
+- 前端只做了事件委托与渲染器懒加载，未做虚拟列表；首屏资源的真实收益需在可构建环境测量。
 - 本机无法构建 Electron 产物（原生绑定签名限制），本轮前端分页只经过
   node:test 与语法检查；正式使用前需在可构建环境执行 `pnpm build` 后做一次
   手工验证。
