@@ -23,12 +23,22 @@ from .store import LibraryStore, safe_name
 USER_AGENT = "BookManager/0.1 (+local desktop crawler)"
 SPRINGER_SERIES_URL = "https://link.springer.com/bookseries/{series_id}"
 DOWNLOAD_EXTENSIONS = {".pdf", ".epub", ".zip", ".csv", ".xlsx", ".txt", ".xml"}
+# Files with any other suffix are still written, but get an inert ".download"
+# suffix so the OS never treats crawled content as directly executable.
+ALLOWED_DOWNLOAD_EXTENSIONS = {
+    ".pdf", ".epub", ".djvu", ".djv", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".txt", ".md", ".csv", ".json", ".xml", ".html", ".htm", ".png", ".jpg", ".jpeg",
+    ".gif", ".bmp", ".webp", ".tif", ".tiff", ".heic", ".mobi", ".azw", ".azw3",
+    ".odt", ".rtf", ".ods", ".odp", ".zip",
+}
+UNSAFE_DOWNLOAD_SUFFIX = ".download"
 REQUEST_TIMEOUT = 15
 MAX_REDIRECTS = 2
 MAX_REQUEST_COUNT = 100
 MAX_DOWNLOADS = 40
 MAX_HTML_BYTES = 10 * 1024 * 1024
 MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
+MAX_CRAWL_TOTAL_BYTES = 512 * 1024 * 1024
 SANDBOX_MAX_DEPTH = 1
 SANDBOX_MAX_REQUEST_COUNT = 20
 SANDBOX_MAX_DOWNLOADS = 8
@@ -339,18 +349,35 @@ def _read_limited(response, max_bytes: int) -> bytes:  # noqa: ANN001
         chunks.append(chunk)
 
 
-def _write_limited(response, target: Path, max_bytes: int) -> None:  # noqa: ANN001
+def _write_limited(response, target: Path, max_bytes: int) -> int:  # noqa: ANN001
+    """Stream to disk and return the number of bytes actually written."""
     _ensure_size_allowed(response.headers, max_bytes)
     size = 0
     with target.open("xb") as output:
         while True:
             chunk = response.read(1024 * 1024)
             if not chunk:
-                return
+                return size
             size += len(chunk)
             if size > max_bytes:
                 raise DownloadTooLargeError(f"文件超过 {max_bytes // (1024 * 1024)} MB 上限")
             output.write(chunk)
+
+
+def sanitize_download_filename(url: str, headers, fallback: str, content_type: str = "") -> str:  # noqa: ANN001
+    """Derive a basename from the response and keep only inert file types.
+
+    The readable stem is preserved, but anything that is not a known document,
+    image or archive suffix gets an extra ".download" suffix so a crawled
+    "setup.command"/"run.exe" can never be launched by the system default app.
+    """
+    derived = filename_from_response(url, headers) or fallback
+    name = safe_name(derived, "download")
+    if not Path(name).suffix and content_type == "application/pdf":
+        name += ".pdf"
+    if Path(name).suffix.lower() not in ALLOWED_DOWNLOAD_EXTENSIONS:
+        name += UNSAFE_DOWNLOAD_SUFFIX
+    return name
 
 
 def _crawl_temporary_root(store: LibraryStore) -> Path:
@@ -402,19 +429,25 @@ def crawl_into_library(
     stats.update(new_crawl_stats())
     request_limit = SANDBOX_MAX_REQUEST_COUNT if recursive_enabled else MAX_REQUEST_COUNT
     download_limit = SANDBOX_MAX_DOWNLOADS if recursive_enabled else min(max_downloads, MAX_DOWNLOADS)
-    client = SafeHttpClient(max_requests=request_limit, pin_dns=recursive_enabled)
+    client = SafeHttpClient(max_requests=request_limit, pin_dns=True)
     temporary_root = _crawl_temporary_root(store)
 
     response, final_url = client.open(url)
     try:
         content_type = response.headers.get_content_type()
         if content_type != "text/html":
-            folder_name = safe_name(filename_from_response(final_url, response.headers) or "Downloaded Files")
+            filename = sanitize_download_filename(
+                final_url,
+                response.headers,
+                "Downloaded Files",
+                content_type=content_type,
+            )
+            folder_name = safe_name(filename, "Downloaded Files")
             folder_id = store.create_folder(parent_folder_id, folder_name)
             with tempfile.TemporaryDirectory(prefix="crawl-", dir=temporary_root) as temp_dir:
-                temp_path = Path(temp_dir) / folder_name
-                _write_limited(response, temp_path, MAX_DOWNLOAD_BYTES)
-                store.add_local_file(temp_path, folder_id, folder_name)
+                temp_path = Path(temp_dir) / filename
+                _write_limited(response, temp_path, min(MAX_DOWNLOAD_BYTES, MAX_CRAWL_TOTAL_BYTES))
+                store.add_local_file(temp_path, folder_id, filename)
             stats["success"] = 1
             return CrawlResult(folder_id, folder_name, 1, messages, stats)
 
@@ -440,6 +473,7 @@ def crawl_into_library(
         page_links = []
 
     downloaded = 0
+    total_bytes = 0
     seen_downloads: set[str] = set()
     with tempfile.TemporaryDirectory(prefix="crawl-", dir=temporary_root) as temp_dir:
         temp_root = Path(temp_dir)
@@ -477,7 +511,8 @@ def crawl_into_library(
                     _bump(stats, "failed")
                     messages.append(f"跳过一级链接 {page_url}: {exc}")
 
-        for link_url, label in downloads:
+        candidates = list(downloads)
+        for position, (link_url, label) in enumerate(candidates):
             if link_url in seen_downloads:
                 _bump(stats, "skipped_duplicate")
                 continue
@@ -485,27 +520,42 @@ def crawl_into_library(
                 _bump(stats, "skipped_quota")
                 continue
             seen_downloads.add(link_url)
+            remaining_budget = MAX_CRAWL_TOTAL_BYTES - total_bytes
+            if remaining_budget <= 0:
+                _bump(stats, "skipped_quota", len(candidates) - position)
+                messages.append("本次抓取总大小已达上限，其余链接已跳过。")
+                break
+            per_file_budget = min(MAX_DOWNLOAD_BYTES, remaining_budget)
             try:
                 _preflight_download(client, link_url, origin if recursive_enabled else None)
                 file_response, final_file_url = client.open(
                     link_url, allowed_origin=origin if recursive_enabled else None
                 )
                 try:
-                    filename = safe_name(
-                        filename_from_response(final_file_url, file_response.headers)
-                        or label
-                        or Path(urllib.parse.urlparse(final_file_url).path).name,
-                        f"download-{downloaded + 1}",
+                    filename = sanitize_download_filename(
+                        final_file_url,
+                        file_response.headers,
+                        label
+                        or Path(urllib.parse.urlparse(final_file_url).path).name
+                        or f"download-{downloaded + 1}",
+                        content_type=file_response.headers.get_content_type(),
                     )
-                    if "." not in filename and file_response.headers.get_content_type() == "application/pdf":
-                        filename += ".pdf"
                     temp_path = temp_root / filename
-                    _write_limited(file_response, temp_path, MAX_DOWNLOAD_BYTES)
+                    written = _write_limited(file_response, temp_path, per_file_budget)
                 finally:
                     file_response.close()
+                total_bytes += written
                 store.add_local_file(temp_path, folder_id, filename)
                 downloaded += 1
                 _bump(stats, "success")
+            except DownloadTooLargeError as exc:
+                if per_file_budget < MAX_DOWNLOAD_BYTES:
+                    _bump(stats, "skipped_quota", len(candidates) - position)
+                    messages.append("本次抓取总大小已达上限，其余链接已跳过。")
+                    break
+                record_exception('crawler.recovered')
+                _bump(stats, "failed")
+                messages.append(f"跳过 {link_url}: {exc}")
             except UnsafeUrlError as exc:
                 record_exception('crawler.recovered')
                 _bump(stats, "skipped_safe_block")

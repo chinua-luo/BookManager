@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import zipfile
 from dataclasses import dataclass
 from html import unescape
@@ -17,10 +18,14 @@ from xml.etree import ElementTree
 
 from .epub import epub_member_index, epub_package_dir, resolve_epub_member
 from .file_security import validate_supported_document
-from .naming import StructuredFileName, infer_structured_file_name, parse_edition_number, split_series_number
+from .naming import StructuredFileName, infer_structured_file_name, split_series_number
 
 
 SUPPORTED_EXTENSIONS = {".pdf", ".epub", ".djvu", ".djv"}
+# Parsing a document can cost hundreds of MB, so cap concurrent worker
+# processes instead of letting every queued import start one at once.
+MAX_PARALLEL_METADATA_WORKERS = 2
+_WORKER_SLOTS = threading.BoundedSemaphore(MAX_PARALLEL_METADATA_WORKERS)
 
 
 @dataclass(frozen=True)
@@ -30,6 +35,19 @@ class MetadataResult:
     message: str
 
 
+def _worker_environment() -> dict[str, str]:
+    """Least-privilege environment for the parser subprocess.
+
+    The bridge token is only needed by the local HTTP bridge; a parser child
+    process must never inherit it (and with it the ability to drive the app).
+    """
+    environment = {
+        key: value for key, value in os.environ.items() if key != "BOOKMANAGER_BRIDGE_TOKEN"
+    }
+    environment["BOOKMANAGER_DIAGNOSTIC_HOME"] = str(current_home())
+    return environment
+
+
 def extract_metadata(path: Path, max_pages: int = 5) -> MetadataResult:
     path = Path(path)
     fallback = infer_structured_file_name(path.name)
@@ -37,14 +55,15 @@ def extract_metadata(path: Path, max_pages: int = 5) -> MetadataResult:
         return MetadataResult(fallback, False, "当前格式暂不支持内容提取，已使用文件名识别。")
     try:
         validate_supported_document(path)
-        completed = subprocess.run(
-            [sys.executable, "-m", "bookmanager.metadata_worker", str(path.resolve()), str(max_pages)],
-            capture_output=True,
-            text=True,
-            timeout=40,
-            check=False,
-            env={**os.environ, 'BOOKMANAGER_DIAGNOSTIC_HOME': str(current_home())},
-        )
+        with _WORKER_SLOTS:
+            completed = subprocess.run(
+                [sys.executable, "-m", "bookmanager.metadata_worker", str(path.resolve()), str(max_pages)],
+                capture_output=True,
+                text=True,
+                timeout=40,
+                check=False,
+                env=_worker_environment(),
+            )
         if completed.returncode != 0:
             record_event('metadata.worker_failed', stderr=completed.stderr, returncode=completed.returncode)
             raise ValueError('解析进程异常退出')
