@@ -52,6 +52,25 @@ class DownloadTooLargeError(ValueError):
     pass
 
 
+def new_crawl_stats() -> dict[str, int]:
+    """Give every reason a candidate link or download can be dropped its own counter."""
+    return {
+        "total_links": 0,
+        "success": 0,
+        "failed": 0,
+        "skipped_cross_origin": 0,
+        "skipped_safe_block": 0,
+        "skipped_duplicate": 0,
+        "skipped_quota": 0,
+    }
+
+
+def _bump(stats: dict[str, int] | None, key: str, amount: int = 1) -> None:
+    if stats is None:
+        return
+    stats[key] = int(stats.get(key, 0)) + amount
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
         return None
@@ -371,6 +390,7 @@ def crawl_into_library(
     max_downloads: int = MAX_DOWNLOADS,
     follow_links: bool = False,
     sandboxed_recursive_mode: bool = False,
+    crawl_stats: dict[str, int] | None = None,
 ) -> CrawlResult:
     recursive_enabled = follow_links and sandboxed_recursive_mode
     url = validated_url(normalize_source(source))
@@ -378,7 +398,8 @@ def crawl_into_library(
     parsed_source = urllib.parse.urlsplit(url)
     display_source = urllib.parse.urlunsplit((parsed_source.scheme, parsed_source.netloc, parsed_source.path, "", ""))
     messages: list[str] = [f"Source: {display_source}"]
-    stats = {"total_links": 0, "success": 0, "skipped_cross_origin": 0, "skipped_safe_block": 0}
+    stats = crawl_stats if crawl_stats is not None else new_crawl_stats()
+    stats.update(new_crawl_stats())
     request_limit = SANDBOX_MAX_REQUEST_COUNT if recursive_enabled else MAX_REQUEST_COUNT
     download_limit = SANDBOX_MAX_DOWNLOADS if recursive_enabled else min(max_downloads, MAX_DOWNLOADS)
     client = SafeHttpClient(max_requests=request_limit, pin_dns=recursive_enabled)
@@ -415,7 +436,7 @@ def crawl_into_library(
     elif recursive_enabled:
         downloads, page_links = recursive_link_candidates(final_url, collector.links, origin, stats)
     else:
-        downloads = list(download_candidates(final_url, collector.links, validated_url))
+        downloads = list(download_candidates(final_url, collector.links, validated_url, stats=stats))
         page_links = []
 
     downloaded = 0
@@ -423,13 +444,18 @@ def crawl_into_library(
     with tempfile.TemporaryDirectory(prefix="crawl-", dir=temporary_root) as temp_dir:
         temp_root = Path(temp_dir)
         if recursive_enabled and SANDBOX_MAX_DEPTH >= 1:
-            for page_url in page_links[:SANDBOX_MAX_PAGE_REQUESTS]:
+            capped_pages = page_links[:SANDBOX_MAX_PAGE_REQUESTS]
+            _bump(stats, "skipped_quota", len(page_links) - len(capped_pages))
+            for index, page_url in enumerate(capped_pages):
                 if client.request_count >= request_limit:
+                    _bump(stats, "skipped_quota", len(capped_pages) - index)
+                    messages.append("请求配额已用完，剩余一级页面未访问。")
                     break
                 try:
                     child_response, child_final_url = client.open(page_url, allowed_origin=origin)
                     try:
                         if child_response.headers.get_content_type() != "text/html":
+                            _bump(stats, "failed")
                             continue
                         child_page = _read_limited(child_response, MAX_HTML_BYTES).decode(
                             child_response.headers.get_content_charset() or "utf-8", errors="replace"
@@ -444,14 +470,19 @@ def crawl_into_library(
                     downloads.extend(child_downloads)
                 except UnsafeUrlError as exc:
                     record_exception('crawler.recovered')
-                    stats["skipped_safe_block"] += 1
+                    _bump(stats, "skipped_safe_block")
                     messages.append(f"安全拦截一级链接：{exc}")
                 except (OSError, ValueError, urllib.error.URLError) as exc:
                     record_exception('crawler.recovered')
+                    _bump(stats, "failed")
                     messages.append(f"跳过一级链接 {page_url}: {exc}")
 
         for link_url, label in downloads:
-            if downloaded >= download_limit or link_url in seen_downloads:
+            if link_url in seen_downloads:
+                _bump(stats, "skipped_duplicate")
+                continue
+            if downloaded >= download_limit:
+                _bump(stats, "skipped_quota")
                 continue
             seen_downloads.add(link_url)
             try:
@@ -474,13 +505,14 @@ def crawl_into_library(
                     file_response.close()
                 store.add_local_file(temp_path, folder_id, filename)
                 downloaded += 1
-                stats["success"] += 1
+                _bump(stats, "success")
             except UnsafeUrlError as exc:
                 record_exception('crawler.recovered')
-                stats["skipped_safe_block"] += 1
+                _bump(stats, "skipped_safe_block")
                 messages.append(f"安全拦截下载链接：{exc}")
             except (OSError, ValueError, urllib.error.URLError) as exc:
                 record_exception('crawler.recovered')
+                _bump(stats, "failed")
                 messages.append(f"跳过 {link_url}: {exc}")
 
     if downloaded == 0:
@@ -495,8 +527,9 @@ def crawl_into_library(
     if recursive_enabled:
         messages.append(
             "受控递归统计："
-            f"链接 {stats['total_links']}，导入 {stats['success']}，"
-            f"跨源丢弃 {stats['skipped_cross_origin']}，安全拦截 {stats['skipped_safe_block']}。"
+            f"链接 {stats['total_links']}，导入 {stats['success']}，失败 {stats['failed']}，"
+            f"跨源丢弃 {stats['skipped_cross_origin']}，安全拦截 {stats['skipped_safe_block']}，"
+            f"重复跳过 {stats['skipped_duplicate']}，配额跳过 {stats['skipped_quota']}。"
         )
     return CrawlResult(folder_id, folder_name, downloaded, messages, stats)
 
@@ -511,17 +544,18 @@ def recursive_link_candidates(
     pages: list[str] = []
     seen: set[str] = set()
     for href, label in links:
-        stats["total_links"] += 1
+        _bump(stats, "total_links")
         try:
             absolute = normalize_url(urllib.parse.urljoin(base_url, href))
         except (OSError, ValueError):
             record_exception('crawler.recovered')
-            stats["skipped_safe_block"] += 1
+            _bump(stats, "skipped_safe_block")
             continue
         if url_origin(absolute) != origin:
-            stats["skipped_cross_origin"] += 1
+            _bump(stats, "skipped_cross_origin")
             continue
         if absolute in seen:
+            _bump(stats, "skipped_duplicate")
             continue
         seen.add(absolute)
         parsed = urllib.parse.urlsplit(absolute)
@@ -538,21 +572,27 @@ def download_candidates(
     base_url: str,
     links: list[tuple[str, str]],
     validator: Callable[[str], str] | None = None,
+    stats: dict[str, int] | None = None,
 ) -> Iterable[tuple[str, str]]:
     seen: set[str] = set()
     for href, label in links:
+        _bump(stats, "total_links")
         try:
             absolute = normalize_url(urllib.parse.urljoin(base_url, href))
             if validator is not None:
                 absolute = validator(absolute)
         except (OSError, ValueError):
             record_exception('crawler.recovered')
+            _bump(stats, "skipped_safe_block")
             continue
         parsed = urllib.parse.urlparse(absolute)
         suffix = Path(parsed.path).suffix.lower()
         is_springer_pdf = "/content/pdf/" in parsed.path or parsed.path.endswith(".pdf")
         is_download = suffix in DOWNLOAD_EXTENSIONS or "download" in parsed.path.lower() or is_springer_pdf
-        if not is_download or absolute in seen:
+        if not is_download:
+            continue
+        if absolute in seen:
+            _bump(stats, "skipped_duplicate")
             continue
         seen.add(absolute)
         yield absolute, label

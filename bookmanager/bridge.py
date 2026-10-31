@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from .crawler import crawl_into_library
+from .crawler import crawl_into_library, new_crawl_stats
 from .importing import ImportProblem, import_file, import_status, target_ids, validate_request_id
 from .metadata import extract_metadata
 from .naming import NamingValidationError, StructuredFileName, build_structured_file_name, infer_structured_file_name
@@ -699,6 +699,8 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
 
     def _crawl(self, payload: dict[str, Any]) -> None:
         recursive_enabled = payload.get("enable_recursive") is True
+        crawl_stats = new_crawl_stats()
+        self._operation_details.update({"recursive_enabled": recursive_enabled, **crawl_stats})
         store = self.server.open_store()
         try:
             result = crawl_into_library(
@@ -707,6 +709,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 int(payload["folderId"]),
                 follow_links=recursive_enabled,
                 sandboxed_recursive_mode=recursive_enabled,
+                crawl_stats=crawl_stats,
             )
             self._operation_details.update(
                 {
@@ -735,6 +738,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 },
             )
         finally:
+            self._operation_details.update(crawl_stats)
             store.close()
 
     def _send_settings(self) -> None:

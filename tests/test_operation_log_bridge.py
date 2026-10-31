@@ -135,6 +135,38 @@ class OperationLogBridgeTests(unittest.TestCase):
                 self.assertEqual(crawl.call_args.kwargs["follow_links"], expected)
                 self.assertEqual(crawl.call_args.kwargs["sandboxed_recursive_mode"], expected)
 
+    def test_failed_recursive_crawl_logs_partial_statistics(self) -> None:
+        def fail_after_partial_progress(_store, _source, _folder_id, **kwargs):  # noqa: ANN001
+            kwargs["crawl_stats"].update(
+                {"total_links": 9, "success": 2, "failed": 1, "skipped_cross_origin": 3, "skipped_safe_block": 1}
+            )
+            raise ValueError("模拟递归抓取失败")
+
+        with mock.patch("bookmanager.bridge.crawl_into_library", side_effect=fail_after_partial_progress):
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                self.request(
+                    "/api/crawl",
+                    {"source": "https://example.com", "folderId": 1, "enable_recursive": True},
+                )
+
+        self.assertEqual(raised.exception.code, 400)
+        record = self.records()[0]
+        self.assertEqual(record["event"], "series.crawl")
+        self.assertEqual(record["result"], "failure")
+        self.assertEqual(
+            record["details"],
+            {
+                "recursive_enabled": True,
+                "total_links": 9,
+                "success": 2,
+                "failed": 1,
+                "skipped_cross_origin": 3,
+                "skipped_safe_block": 1,
+                "skipped_duplicate": 0,
+                "skipped_quota": 0,
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

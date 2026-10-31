@@ -48,12 +48,13 @@ export function crawlSummary(result) {
   const stats = result.stats || {}
   const messages = (result.messages || []).map(String)
   const skipped = (stats.skipped_cross_origin || 0) + (stats.skipped_safe_block || 0)
+    + (stats.skipped_duplicate || 0) + (stats.skipped_quota || 0) + (stats.failed || 0)
   const fallback = messages.some(msg => msg.includes('所有下载链接均失败'))
-  const warnings = messages.some(msg => /^(跳过|安全拦截|起始网址发生重定向)/.test(msg))
+  const warnings = messages.some(msg => /^(跳过|安全拦截|起始网址发生重定向|请求配额)/.test(msg))
   if (!skipped && !fallback && !warnings) return null
   return { title: fallback ? '未能下载文档' : '爬取结果提醒', level: 'warning', errorType: 'crawl_partial',
     msg: fallback ? '文档下载失败，已保存源页面供后续查看。请检查站点访问限制或更换网址。'
-      : `已导入 ${result.downloaded} 个文件；部分链接因访问失败、安全限制或跨源限制已跳过。${skipped ? `其中跨源或安全拦截 ${skipped} 个。` : ''}` }
+      : `已导入 ${result.downloaded} 个文件；${skipped} 个链接因访问失败、安全限制、重复或配额限制被跳过。` }
 }
 export function createFatalReporter(show, now = Date.now) {
   const recent = new Map()

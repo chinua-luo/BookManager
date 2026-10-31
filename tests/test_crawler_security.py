@@ -18,6 +18,7 @@ from bookmanager.crawler import (
     filename_from_response,
     normalize_source,
     normalize_url,
+    new_crawl_stats,
     recursive_link_candidates,
     url_origin,
     validated_url,
@@ -156,10 +157,15 @@ class CrawlerSecurityTests(unittest.TestCase):
             ("javascript:alert(1)", "script"),
         ]
         validator = lambda url: url if "127.0.0.1" not in url else (_ for _ in ()).throw(UnsafeUrlError())
+        stats = new_crawl_stats()
         self.assertEqual(
-            list(download_candidates("https://example.com/catalog", links, validator)),
+            list(download_candidates("https://example.com/catalog", links, validator, stats=stats)),
             [("https://example.com/book.pdf", "one")],
         )
+        self.assertEqual(stats["total_links"], 4)
+        self.assertEqual(stats["skipped_duplicate"], 1)
+        self.assertEqual(stats["skipped_safe_block"], 2)
+        self.assertEqual(stats["success"], 0)
 
     def test_response_size_is_enforced_with_and_without_content_length(self) -> None:
         headers = Message()
@@ -203,8 +209,25 @@ class CrawlerSecurityTests(unittest.TestCase):
         self.assertEqual(stats["total_links"], 3)
         self.assertEqual(stats["skipped_cross_origin"], 1)
 
+    def test_recursive_candidates_count_duplicates(self) -> None:
+        stats = new_crawl_stats()
+        origin = url_origin("https://example.com/catalog")
+
+        downloads, pages = recursive_link_candidates(
+            "https://example.com/catalog",
+            [("/book.pdf", "Book"), ("/book.pdf", "Again"), ("/series", "Series"), ("/series", "Series again")],
+            origin,
+            stats,
+        )
+
+        self.assertEqual(downloads, [("https://example.com/book.pdf", "Book")])
+        self.assertEqual(pages, ["https://example.com/series"])
+        self.assertEqual(stats["total_links"], 4)
+        self.assertEqual(stats["skipped_duplicate"], 2)
+
     def test_recursive_crawl_only_reads_first_level_same_origin_pages(self) -> None:
         store = self.new_store()
+        stats = new_crawl_stats()
         _RecursiveClient.redirect_start = False
         _RecursiveClient.root_download_count = None
         with mock.patch("bookmanager.crawler.SafeHttpClient", _RecursiveClient):
@@ -214,6 +237,7 @@ class CrawlerSecurityTests(unittest.TestCase):
                 1,
                 follow_links=True,
                 sandboxed_recursive_mode=True,
+                crawl_stats=stats,
             )
 
         client = _RecursiveClient.latest
@@ -225,6 +249,7 @@ class CrawlerSecurityTests(unittest.TestCase):
         self.assertEqual(result.downloaded, 2)
         self.assertEqual(result.stats["success"], 2)
         self.assertEqual(result.stats["skipped_cross_origin"], 1)
+        self.assertIs(result.stats, stats)
         self.assertTrue(all(str(path).startswith(str(store.home / "tmp")) for path in store.source_paths))
 
     def test_recursive_flag_downgrades_without_sandbox_confirmation(self) -> None:
@@ -243,7 +268,10 @@ class CrawlerSecurityTests(unittest.TestCase):
         client = _RecursiveClient.latest
         self.assertFalse(client.pin_dns)
         self.assertNotIn(("GET", "https://93.184.216.34/child"), client.calls)
-        self.assertEqual(result.stats["total_links"], 0)
+        # Non-recursive mode now records candidate links and successful downloads too.
+        self.assertEqual(result.stats["total_links"], 2)
+        self.assertEqual(result.stats["success"], 1)
+        self.assertEqual(result.downloaded, 1)
 
     def test_recursive_start_redirect_disables_link_extraction(self) -> None:
         store = self.new_store()
@@ -282,6 +310,7 @@ class CrawlerSecurityTests(unittest.TestCase):
 
         self.assertEqual(result.downloaded, 8)
         self.assertEqual(result.stats["success"], 8)
+        self.assertEqual(result.stats["skipped_quota"], 2)
         self.assertEqual(len(store.added), 8)
 
     def test_recursive_dns_results_are_cached_for_the_origin(self) -> None:

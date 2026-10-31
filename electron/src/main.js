@@ -557,7 +557,7 @@ function crawl() {
       await refresh(result.folderId)
       const stats = result.stats || {}
       const summary = enabled
-        ? `；链接 ${stats.total_links || 0}，跨源丢弃 ${stats.skipped_cross_origin || 0}，安全拦截 ${stats.skipped_safe_block || 0}`
+        ? `；链接 ${stats.total_links || 0}，导入 ${stats.success || 0}，失败 ${stats.failed || 0}，跨源丢弃 ${stats.skipped_cross_origin || 0}，安全拦截 ${stats.skipped_safe_block || 0}，重复 ${stats.skipped_duplicate || 0}，配额跳过 ${stats.skipped_quota || 0}`
         : ''
       message(`爬取完成：${result.folderName}，导入 ${result.downloaded} 个文件${summary}。`)
       const warning = crawlSummary(result)

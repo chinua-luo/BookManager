@@ -70,8 +70,15 @@ def response_envelope(status: int, payload: dict[str, Any], path: str = '', *, e
         messages = data.get('messages') or []
         if any('所有下载链接均失败' in str(message) for message in messages):
             result.update(level='warning', error_type='crawl_fallback', msg='文档下载失败，已保存源页面供后续查看。请检查站点访问限制或更换网址。')
-        elif stats.get('skipped_cross_origin', 0) or stats.get('skipped_safe_block', 0) or any(str(message).startswith(('跳过', '安全拦截', '起始网址发生重定向')) for message in messages):
-            result.update(level='warning', error_type='crawl_partial', msg='部分链接因访问失败、安全限制或跨源限制已跳过，请检查导入结果')
+        elif (
+            stats.get('skipped_cross_origin', 0)
+            or stats.get('skipped_safe_block', 0)
+            or stats.get('skipped_duplicate', 0)
+            or stats.get('skipped_quota', 0)
+            or stats.get('failed', 0)
+            or any(str(message).startswith(('跳过', '安全拦截', '起始网址发生重定向', '请求配额')) for message in messages)
+        ):
+            result.update(level='warning', error_type='crawl_partial', msg='部分链接因访问失败、安全限制、重复或配额限制已跳过，请检查导入结果')
     elif path == '/api/settings/data/migrate' and data.get('migrated'):
         result['msg'] = '书库数据已成功迁移到目标目录'
     return result
