@@ -3,6 +3,7 @@ const { contextBridge, ipcRenderer } = require('electron')
 contextBridge.exposeInMainWorld('bookManager', {
   tree: () => ipcRenderer.invoke('bridge:tree'),
   folder: (folderId) => ipcRenderer.invoke('bridge:folder', folderId),
+  folderPage: (folderId, offset, limit) => ipcRenderer.invoke('bridge:folder-page', folderId, offset, limit),
   documentUrl: (documentId) => ipcRenderer.invoke('bridge:document-url', documentId),
   doubleClickDelay: () => ipcRenderer.invoke('ui:double-click-delay'),
   openDocument: (itemId, documentName) => ipcRenderer.invoke('bridge:open-document', itemId, documentName),

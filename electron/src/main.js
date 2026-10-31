@@ -16,6 +16,7 @@ import { submitNameForm } from './name-validation.js'
 import { createImportController, importSummaryText } from './import-controller.js'
 import { folderTargets, MAX_IMPORT_TARGETS } from './folder-targets.js'
 import { createRequestSequence } from './request-sequence.js'
+import { createPaginationState, LOAD_MORE_THRESHOLD_PX, mergePage, nextPageOffset, PAGE_SIZE, paginationCountText, shouldLoadMore } from './pagination.js'
 import { isNavigationKey, nextRowIndex } from './selection.js'
 import { dialogKeyAction, focusTrapTarget, isContextMenuKey } from './dialog-keyboard.js'
 import { acceleratorFromKeyboardEvent } from './shortcut-capture.js'
@@ -35,9 +36,12 @@ let tree = []; let selectedFolderId = null; let selectedItem = null; let context
 const sortModes = new Map()
 const expandedFolderIds = new Set()
 const folderRequests = createRequestSequence()
+const pageRequests = createRequestSequence()
 const refreshRequests = createRequestSequence()
 const rowItems = new WeakMap()
 const rowFolders = new WeakMap()
+let pagination = createPaginationState()
+let scrollLoadFrame = 0
 let contextReturnFocus = null
 
 function setSidebarWidth(requestedWidth, persist = false) {
@@ -503,18 +507,67 @@ function fileIconClass(extension) {
   return 'file-icon-other'
 }
 function fileRow(item) { const button = element('button', 'content-row file-row'); button.type = 'button'; rowItems.set(button, item); button.append(element('span', `file-icon ${fileIconClass(item.extension)}`, item.extension.slice(1).toUpperCase() || 'FILE'), element('span', '', item.listName), element('small', '', size(item.size))); bindFileActivation(button, { select: () => markContentSelection(button), preview: () => showItem(item), open: () => openDefault(item), onError: error, delayMs: doubleClickDelayMs }); button.addEventListener('contextmenu', event => openContext(event, { kind: 'file', item })); return button }
+function updateContentCount() { contentCount.textContent = paginationCountText(pagination) }
+function appendPage(payload) {
+  const folderId = pagination.folderId
+  if (!folderId) return
+  const previous = pagination.loaded
+  pagination = mergePage(pagination, { items: sortedItems(payload.items || [], folderId), pagination: payload.pagination })
+  pagination.items.slice(previous).forEach(item => contentList.append(fileRow(item)))
+  updateContentCount()
+}
+async function loadMoreItems() {
+  const state = pagination
+  const offset = nextPageOffset(state)
+  if (offset === null) return false
+  const request = pageRequests.begin()
+  pagination = { ...state, loading: true }
+  let payload
+  try {
+    payload = await window.bookManager.folderPage(state.folderId, offset, PAGE_SIZE)
+  } catch (issue) {
+    // A superseded page load must not surface an error for a folder the user
+    // already left, and it must not clear the loading flag of the newer load.
+    if (!pageRequests.isCurrent(request) || pagination.folderId !== state.folderId) return false
+    pagination = { ...pagination, loading: false }
+    throw issue
+  }
+  // The folder request token and the page request token must both still be
+  // current, otherwise the appended rows would belong to another folder/page.
+  if (!pageRequests.isCurrent(request) || pagination.folderId !== state.folderId || !folderRequests.isCurrent(state.folderToken)) return false
+  appendPage(payload)
+  return true
+}
+function scheduleLoadMoreCheck() {
+  if (scrollLoadFrame) return
+  scrollLoadFrame = requestAnimationFrame(() => {
+    scrollLoadFrame = 0
+    const wantsMore = shouldLoadMore({
+      scrollTop: contentList.scrollTop,
+      clientHeight: contentList.clientHeight,
+      scrollHeight: contentList.scrollHeight,
+      hasMore: pagination.hasMore,
+      loading: pagination.loading,
+      threshold: LOAD_MORE_THRESHOLD_PX
+    })
+    if (wantsMore) loadMoreItems().catch(error)
+  })
+}
 async function selectFolder(id) {
   const request = folderRequests.begin()
+  pageRequests.invalidate()
+  pagination = { ...createPaginationState(id), folderToken: request }
   setSelectedItem(null); clearContentSelection(); previewCoordinator.invalidate(); expandAncestors(id)
-  const payload = await window.bookManager.folder(id)
+  const payload = await window.bookManager.folderPage(id, 0, PAGE_SIZE)
   if (!folderRequests.isCurrent(request)) return false
   selectedFolderId = id; markTreeSelection()
-  contentTitle.textContent = payload.folder.name; contentCount.textContent = `${payload.folders.length + payload.items.length} 项`; contentList.replaceChildren()
+  contentTitle.textContent = payload.folder.name; contentList.replaceChildren()
   ;[...payload.folders].sort((a, b) => a.name.localeCompare(b.name)).forEach(folder => {
     const button = element('button', 'content-row folder-row'); button.type = 'button'; rowFolders.set(button, folder); button.append(element('span', 'folder-icon', 'DIR'), element('span', '', folder.name))
     button.addEventListener('click', () => { markContentSelection(button); selectFolder(folder.id).then(rendered => { if (rendered) contentList.focus() }).catch(error) }); button.addEventListener('contextmenu', event => openContext(event, { kind: 'folder', folder })); contentList.append(button)
   })
-  sortedItems(payload.items, id).forEach(item => contentList.append(fileRow(item))); folderSummary(payload)
+  pagination = { ...pagination, folderToken: request }
+  appendPage(payload); folderSummary(payload)
   return true
 }
 function renderTree(nodes) { const list = document.createElement('ul'); nodes.forEach(folder => { const item = document.createElement('li'); const details = document.createElement('details'); details.open = expandedFolderIds.has(folder.id); details.addEventListener('toggle', () => { if (details.open) expandedFolderIds.add(folder.id); else expandedFolderIds.delete(folder.id) }); const summary = document.createElement('summary'); summary.addEventListener('click', event => { if (event.target === summary) selectFolder(folder.id).catch(error) }); const button = document.createElement('button'); button.type = 'button'; button.dataset.folderId = String(folder.id); button.textContent = folder.name; if (folder.id === selectedFolderId) { button.classList.add('current'); button.setAttribute('aria-current', 'true') }; button.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); selectFolder(folder.id).catch(error) }); button.addEventListener('contextmenu', event => openContext(event, { kind: 'folder', folder })); rowFolders.set(button, folder); summary.append(button); details.append(summary); if (folder.children.length) details.append(renderTree(folder.children)); item.append(details); list.append(item) }); return list }
@@ -566,7 +619,7 @@ function searchResults(result) {
     })
   } else result.results.forEach(entry => list.append(row(entry)))
   if (!list.childElementCount) list.textContent = '没有匹配结果。'
-  holder.append(list); showPreviewNode(holder); message(`搜索完成：${result.results.length} 个匹配项。`)
+  holder.append(list); showPreviewNode(holder); message(result.truncated ? `搜索完成：仅显示前 ${result.results.length} 个匹配项，结果过多，请细化搜索条件。` : `搜索完成：${result.results.length} 个匹配项。`)
 }
 function openSearch() {
   const content = document.createElement('div'); content.className = 'form-stack'
@@ -717,8 +770,23 @@ function focusedRow(container) {
 }
 contentList.addEventListener('keydown', event => {
   if (isContextMenuKey(event)) { if (openContextForRow(focusedRow(contentList))) event.preventDefault(); return }
+  if (event.key === 'ArrowDown' && pagination.hasMore && !pagination.loading) {
+    const rows = [...contentList.querySelectorAll('button')].filter(button => button.offsetParent !== null)
+    if (rows.length && document.activeElement === rows[rows.length - 1]) {
+      event.preventDefault()
+      const before = rows.length
+      loadMoreItems().then(loaded => {
+        if (!loaded) return
+        const updated = [...contentList.querySelectorAll('button')].filter(button => button.offsetParent !== null)
+        const next = updated[before]
+        if (next) { next.focus(); markContentSelection(next) }
+      }).catch(error)
+      return
+    }
+  }
   moveListSelection(event, contentList, () => selectedFolderId)
 })
+contentList.addEventListener('scroll', scheduleLoadMoreCheck, { passive: true })
 folderTree.addEventListener('keydown', event => {
   if (isContextMenuKey(event)) { if (openContextForRow(focusedRow(folderTree))) event.preventDefault(); return }
   moveListSelection(event, folderTree, () => Number(document.activeElement?.dataset.folderId) || selectedFolderId)

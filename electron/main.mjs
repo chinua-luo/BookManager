@@ -10,6 +10,7 @@ import { acquireSingleInstance } from './single-instance.mjs'
 import { checkFrontend, startupFailure } from './startup-checks.mjs'
 import { createMainLogger } from './diagnostics.mjs'
 import { businessError, userError, notificationFromError, createFatalReporter } from './user-errors.mjs'
+import { normalizeFolderPageParams } from './src/pagination.js'
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -293,6 +294,12 @@ function installApplicationMenu() {
 
 ipcMain.handle('bridge:tree', () => readJson('/api/tree'))
 ipcMain.handle('bridge:folder', (_event, folderId) => readJson(`/api/folders/${encodeURIComponent(folderId)}/contents`))
+ipcMain.handle('bridge:folder-page', (_event, folderId, offset, limit) => {
+  // The renderer only gets paged contents through this handler; the main process
+  // owns the query string so the generic bridge path allow-list stays untouched.
+  const page = normalizeFolderPageParams(folderId, offset, limit)
+  return readJson(`/api/folders/${page.folderId}/contents?offset=${page.offset}&limit=${page.limit}`)
+})
 ipcMain.handle('bridge:document-url', (_event, documentId) => {
   if (!bridgeUrl) throw new Error('BookManager bridge is not ready')
   return documentUrl(documentId)

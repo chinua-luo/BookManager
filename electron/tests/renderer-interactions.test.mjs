@@ -121,3 +121,8 @@ test('successful imports clear the request identifier and location success updat
   assert.match(renderer, /async function showLocation\(/)
   assert.match(renderer, /已在文件管理器中显示底层文件/)
 })
+
+test('truncated search results are explained in the status bar', () => {
+  assert.match(renderer, /result\.truncated \? `搜索完成：仅显示前/)
+  assert.match(renderer, /结果过多，请细化搜索条件/)
+})
