@@ -15,6 +15,8 @@ import { isNavigationKey, nextRowIndex } from './selection.js'
 import { dialogKeyAction, focusTrapTarget, isContextMenuKey } from './dialog-keyboard.js'
 import { acceleratorFromKeyboardEvent } from './shortcut-capture.js'
 import { createPreviewResourceManager, waitForLayout } from './preview-lifecycle.js'
+import { textPreviewNotice, textPreviewRequest } from './text-preview.js'
+import { nextSearchChunk, searchMoreLabel, searchResultUnits } from './search-result-view.js'
 import './style.css'
 
 const $ = selector => document.querySelector(selector)
@@ -145,15 +147,20 @@ const previewCoordinator = createPreviewCoordinator({
     const extension = item.extension.toLowerCase()
     if (textExtensions.has(extension)) {
       const controller = previewResources.beginText()
+      const request = textPreviewRequest(item.size)
       let content
       try {
         const url = await window.bookManager.documentUrl(item.documentId)
-        const response = await fetch(url, { signal: controller.signal })
+        const response = await fetch(url, { signal: controller.signal, ...request.init })
         if (!response.ok) throw new Error('预览失败')
         content = await response.text()
       } finally { previewResources.settleText(controller) }
       if (!isCurrent()) return
-      const textPreview = document.createElement('pre'); textPreview.className = 'text-preview'; textPreview.textContent = content; showPreviewNode(textPreview)
+      const textPreview = document.createElement('pre'); textPreview.className = 'text-preview'; textPreview.textContent = content
+      const notice = textPreviewNotice(request.range)
+      if (!notice) { showPreviewNode(textPreview); return }
+      const shell = document.createElement('div'); shell.className = 'text-preview-shell'
+      shell.append(textPreview, element('p', 'preview-truncated', notice)); showPreviewNode(shell)
       return
     }
     if (isDjvuExtension(extension)) {
@@ -697,19 +704,26 @@ function searchResults(result) {
   const holder = document.createElement('section'); holder.className = 'search-results'; holder.style.cssText = 'height:100%;overflow:auto;padding:10px'
   const list = document.createElement('div'); list.className = 'result-list'
   const row = entry => { const button = element('button', 'result-row'); button.type = 'button'; button.append(element('span', '', entry.item.displayName), element('small', '', entry.folderPath), element('small', '', size(entry.item.size))); bindFileActivation(button, { preview: () => showItem(entry.item), open: () => openDefault(entry.item), onError: error, delayMs: doubleClickDelayMs }); button.addEventListener('contextmenu', event => openContext(event, { kind: 'file', item: entry.item })); return button }
-  if (result.kind === 'files') {
-    const groups = new Map()
-    result.results.forEach(entry => { const key = String(entry.item.documentId); groups.set(key, [...(groups.get(key) || []), entry]) })
-    groups.forEach(entries => {
-      if (entries.length === 1) { list.append(row(entries[0])); return }
-      const group = document.createElement('details'); group.className = 'search-group'
-      const heading = document.createElement('summary'); heading.className = 'group-row'; heading.textContent = `${entries[0].item.displayName}（${entries.length} 个镜像文件）`
-      const mirrors = document.createElement('div'); mirrors.className = 'result-list search-group-items'; entries.forEach(entry => mirrors.append(row(entry)))
-      group.append(heading, mirrors); list.append(group)
-    })
-  } else result.results.forEach(entry => list.append(row(entry)))
-  if (!list.childElementCount) list.textContent = '没有匹配结果。'
-  holder.append(list); showPreviewNode(holder); message(result.truncated ? `搜索完成：仅显示前 ${result.results.length} 个匹配项，结果过多，请细化搜索条件。` : `搜索完成：${result.results.length} 个匹配项。`)
+  const renderUnit = unit => {
+    if (unit.kind === 'entry') return row(unit.entries[0])
+    const group = document.createElement('details'); group.className = 'search-group'
+    const heading = document.createElement('summary'); heading.className = 'group-row'; heading.textContent = `${unit.entries[0].item.displayName}（${unit.entries.length} 个镜像文件）`
+    const mirrors = document.createElement('div'); mirrors.className = 'result-list search-group-items'; unit.entries.forEach(entry => mirrors.append(row(entry)))
+    group.append(heading, mirrors); return group
+  }
+  const units = searchResultUnits(result.kind, result.results)
+  let rendered = 0
+  const more = document.createElement('button'); more.type = 'button'; more.className = 'dialog-button result-more'; more.hidden = true
+  const renderNext = () => {
+    const chunk = nextSearchChunk(units, rendered)
+    chunk.units.forEach(unit => list.insertBefore(renderUnit(unit), more))
+    rendered = chunk.rendered
+    more.hidden = !chunk.hasMore
+    if (chunk.hasMore) more.textContent = searchMoreLabel(chunk.remaining)
+  }
+  more.addEventListener('click', renderNext); list.append(more)
+  if (units.length) renderNext(); else { more.remove(); list.textContent = '没有匹配结果。' }
+  holder.append(list); showPreviewNode(holder); message(result.truncated ? `搜索完成：仅显示前 ${units.length} 组匹配项，结果过多，请细化搜索条件。` : `搜索完成：${result.results?.length || 0} 个匹配项。`)
 }
 function openSearch() {
   const content = document.createElement('div'); content.className = 'form-stack'
