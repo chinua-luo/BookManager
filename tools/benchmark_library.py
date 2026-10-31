@@ -79,19 +79,25 @@ def seed_library(home: Path, item_count: int) -> int:
                 ensure_ascii=False,
                 sort_keys=True,
             )
+            title = f"Synthetic Book {index:05d}"
+            subtitle = f"Volume {index % 10}"
             rows.append(
                 (
                     1,
                     document_id,
-                    f"Synthetic Book {index:05d} _ Some Author.pdf",
+                    f"{title} _ Some Author.pdf",
                     name_data,
                     "2026-01-01T00:00:00Z",
                     "2026-01-01T00:00:00Z",
+                    title.lower(),
+                    subtitle.lower(),
+                    "some author",
                 )
             )
         store.conn.executemany(
-            "INSERT INTO items(folder_id, document_id, display_name, name_data, created_at, updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?)",
+            "INSERT INTO items(folder_id, document_id, display_name, name_data, created_at, updated_at, "
+            "main_title_norm, subtitle_norm, authors_norm) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
         )
         store.conn.executemany(
@@ -121,7 +127,7 @@ def store_benchmarks(home: Path, repeats: int) -> dict[str, dict[str, float]]:
     return results
 
 
-def _request(base: str, token: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
+def _request(base: str, token: str, path: str, payload: dict | None = None) -> tuple[int, dict, int]:
     data = json.dumps(payload).encode() if payload is not None else None
     request = urllib.request.Request(base + path, data=data, method="POST" if data else "GET")
     request.add_header("Authorization", "Bearer " + token)
@@ -129,9 +135,11 @@ def _request(base: str, token: str, path: str, payload: dict | None = None) -> t
         request.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(request, timeout=120) as response:
-            return response.status, json.loads(response.read())
+            body = response.read()
+            return response.status, json.loads(body), len(body)
     except urllib.error.HTTPError as error:
-        return error.code, json.loads(error.read())
+        body = error.read()
+        return error.code, json.loads(body), len(body)
 
 
 def api_benchmarks(home: Path, repeats: int) -> dict[str, dict[str, float]]:
@@ -195,6 +203,15 @@ def api_benchmarks(home: Path, repeats: int) -> dict[str, dict[str, float]]:
             repeats,
             lambda: _request(base, token, "/api/search", {"kind": "tags", "query": "article"}),
         )
+        sizes = {}
+        for name, path, payload in (
+            ("api_folder_page_bytes", "/api/folders/1/contents?offset=0&limit=200", None),
+            ("api_search_files_bytes", "/api/search", {"kind": "files", "mainTitle": "Synthetic"}),
+        ):
+            status, _body, size = _request(base, token, path, payload)
+            if status == 200:
+                sizes[name] = size
+        results["_bytes"] = sizes
         return results
     finally:
         process.terminate()
@@ -246,7 +263,11 @@ def main() -> int:
                   f"payload: {report['payload']['approx_json_bytes'] / 1024:.0f} KiB")
             for section in ("store", "api"):
                 for name, values in report.get(section, {}).items():
+                    if name == "_bytes":
+                        continue
                     print(f"  {name:<22} p50 {values['p50_ms']:>8.1f} ms   p95 {values['p95_ms']:>8.1f} ms")
+            for name, size in report.get("api", {}).get("_bytes", {}).items():
+                print(f"  {name:<22} {size / 1024:>8.1f} KiB")
         return 0
     finally:
         shutil.rmtree(home, ignore_errors=True)
