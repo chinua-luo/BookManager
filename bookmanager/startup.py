@@ -77,13 +77,19 @@ def check_storage(home: Path) -> None:
                 raise PermissionError('Database has no write permission bits')
             with database.open('r+b'):
                 pass
-            sqlite3 = importlib.import_module('sqlite3')
-            connection = sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True)
-            try:
-                if connection.execute('PRAGMA quick_check').fetchall() != [('ok',)]:
-                    raise StartupFailure('data_corrupt')
-            finally:
-                connection.close()
+            from .store import CLEAN_SHUTDOWN_MARKER
+            marker = home / CLEAN_SHUTDOWN_MARKER
+            if marker.is_file() and not marker.is_symlink():
+                # The previous run shut down cleanly: skip the full-page scan once.
+                marker.unlink(missing_ok=True)
+            else:
+                sqlite3 = importlib.import_module('sqlite3')
+                connection = sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True)
+                try:
+                    if connection.execute('PRAGMA quick_check').fetchall() != [('ok',)]:
+                        raise StartupFailure('data_corrupt')
+                finally:
+                    connection.close()
     except StartupFailure:
         raise
     except OSError as exc:

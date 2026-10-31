@@ -86,6 +86,7 @@ OPEN_CACHE_MANIFEST = ".bookmanager-open.json"
 # upgraded once instead of re-scanning every item on each request.
 SCHEMA_VERSION = 3
 MIGRATION_STAGING_PREFIX = ".bookmanager-migration-"
+CLEAN_SHUTDOWN_MARKER = ".bookmanager-clean-shutdown"
 MIGRATION_COMPLETE_MARKER = ".bookmanager-migration-complete"
 _BLOB_WRITE_LOCK = threading.RLock()
 
@@ -735,9 +736,26 @@ class LibraryStore:
 
     def cache_usage(self) -> dict[str, int]:
         return {
-            name: self._cache_entry_size(self.home / name)
+            name: self._cache_size_single_pass(self.home / name)
             for name in ("open_cache", "render_cache")
         }
+
+    @staticmethod
+    def _cache_size_single_pass(root: Path) -> int:
+        """Total cache bytes with one directory walk instead of per-entry rglob."""
+        if not root.is_dir() or root.is_symlink():
+            return 0
+        total = 0
+        for directory, subdirectories, filenames in os.walk(root, followlinks=False):
+            subdirectories[:] = [name for name in subdirectories if not (Path(directory) / name).is_symlink()]
+            for name in filenames:
+                path = Path(directory) / name
+                try:
+                    if not path.is_symlink():
+                        total += path.stat().st_size
+                except OSError:
+                    record_exception('store.cache_entry_stat_failed')
+        return total
 
     def prepare_cache_directory(self, cache_name: str, entry_name: str) -> Path:
         if cache_name not in {"open_cache", "render_cache"}:
@@ -756,18 +774,34 @@ class LibraryStore:
     ) -> None:
         """Record which document an externally opened cache copy belongs to."""
         cache_dir = Path(cache_dir)
-        manifest_path = cache_dir / OPEN_CACHE_MANIFEST
-        manifest_path.write_text(
-            json.dumps(
-                {
-                    "document_id": document_id,
-                    "source_hash": source_hash,
-                    "file_name": file_name,
-                },
-                ensure_ascii=False,
-            ),
+        manifest: dict[str, object] = {
+            "document_id": document_id,
+            "source_hash": source_hash,
+            "file_name": file_name,
+        }
+        try:
+            stat = (cache_dir / file_name).stat()
+            manifest.update(size=stat.st_size, mtime_ns=stat.st_mtime_ns)
+        except OSError:
+            record_exception('store.cache_manifest_invalid', data_home=self.home)
+        self._write_open_cache_manifest(cache_dir, manifest)
+
+    @staticmethod
+    def _write_open_cache_manifest(cache_dir: Path, manifest: dict[str, object]) -> None:
+        (Path(cache_dir) / OPEN_CACHE_MANIFEST).write_text(
+            json.dumps(manifest, ensure_ascii=False),
             encoding="utf-8",
         )
+
+    def mark_clean_shutdown(self) -> None:
+        marker = self.home / CLEAN_SHUTDOWN_MARKER
+        if marker.is_symlink():
+            return
+        marker.write_text(utc_now(), encoding="utf-8")
+        try:
+            marker.chmod(0o600)
+        except OSError:
+            record_exception('store.permission_apply_failed', data_home=self.home)
 
     def sync_open_cache_changes(self, *, strict: bool = False) -> int:
         """Write changed default-app copies back to their underlying documents."""
@@ -810,6 +844,32 @@ class LibraryStore:
         cached_path = cache_dir / file_name
         if not cached_path.is_file():
             return False
+        row = self.conn.execute(
+            "SELECT current_hash FROM documents WHERE id = ?", (document_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            cached_stat = cached_path.stat()
+        except OSError:
+            record_exception('store.cache_entry_stat_failed', data_home=self.home)
+            if strict:
+                raise
+            return False
+        # Unedited copies can be skipped without hashing: the manifest records the
+        # size/mtime at copy time and the document still has the same hash.
+        try:
+            source_hash = str(manifest["source_hash"])
+            manifest_stat = (manifest.get("size"), manifest.get("mtime_ns"))
+        except (KeyError, TypeError):
+            source_hash = ""
+            manifest_stat = (None, None)
+        if (
+            source_hash
+            and manifest_stat == (cached_stat.st_size, cached_stat.st_mtime_ns)
+            and str(row["current_hash"]) == source_hash
+        ):
+            return False
         try:
             cached_hash, _size = sha256_file(cached_path)
         except OSError:
@@ -817,18 +877,21 @@ class LibraryStore:
             if strict:
                 raise
             return False
-        row = self.conn.execute(
-            "SELECT current_hash FROM documents WHERE id = ?", (document_id,)
-        ).fetchone()
-        if row is None or cached_hash == str(row["current_hash"]):
+        if cached_hash == str(row["current_hash"]):
             return False
         try:
-            self.replace_document_content(document_id, cached_path)
+            document_id = self.replace_document_content(document_id, cached_path)
         except (OSError, ValueError):
             record_exception('store.open_cache_writeback_failed', data_home=self.home)
             if strict:
                 raise
             return False
+        try:
+            stat = cached_path.stat()
+            manifest.update(document_id=document_id, source_hash=cached_hash, size=stat.st_size, mtime_ns=stat.st_mtime_ns)
+            self._write_open_cache_manifest(cache_dir, manifest)
+        except OSError:
+            record_exception('store.cache_manifest_invalid', data_home=self.home)
         return True
 
     def touch_cache_directory(self, cache_dir: Path) -> None:

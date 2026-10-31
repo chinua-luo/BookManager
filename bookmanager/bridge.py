@@ -6,13 +6,14 @@ import mimetypes
 import os
 import re
 import shutil
+import threading
 import time
 import urllib.parse
 import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .crawler import crawl_into_library, new_crawl_stats
 from .file_copy import clone_or_copy
@@ -43,6 +44,8 @@ MAX_IMPORT_FOLDERS = 5_000
 MAX_SEARCH_RESULTS = 500
 DEFAULT_FOLDER_PAGE_SIZE = 200
 MAX_FOLDER_PAGE_SIZE = 1000
+FOLDER_IMPORT_BATCH_SIZE = 100
+MAX_FOLDER_IMPORT_JOBS = 20
 MAX_OPEN_CACHE_FILE_NAME_BYTES = 200
 REQUEST_SOCKET_TIMEOUT_SECONDS = 30
 CONTENT_SECURITY_POLICY = "; ".join(
@@ -70,6 +73,8 @@ ITEM_OPEN_PATH_PATTERN = re.compile(r"^/api/items/(?P<item_id>\d+)/open$")
 ITEM_LOCATION_PATH_PATTERN = re.compile(r"^/api/items/(?P<item_id>\d+)/location$")
 FOLDER_ACTION_PATH_PATTERN = re.compile(r"^/api/folders/(?P<folder_id>\d+)/(?P<action>rename|move|delete)$")
 ITEM_ACTION_PATH_PATTERN = re.compile(r"^/api/items/(?P<item_id>\d+)/(?P<action>rename|move|mirror|delete|delete-underlying)$")
+FOLDER_IMPORT_PROGRESS_PATTERN = re.compile(r"^/api/import/folder/progress/(?P<job_id>[A-Za-z0-9_-]{1,80})$")
+FOLDER_IMPORT_CANCEL_PATTERN = re.compile(r"^/api/import/folder/cancel/(?P<job_id>[A-Za-z0-9_-]{1,80})$")
 DOCUMENT_ACTION_PATH_PATTERN = re.compile(r"^/api/documents/(?P<document_id>\d+)/(?P<action>replace)$")
 
 POST_OPERATION_NAMES = {
@@ -178,8 +183,6 @@ class BridgeServer(ThreadingHTTPServer):
             initial_store = self.open_store(run_maintenance=True)
             try:
                 self.library_home = initial_store.home
-                # Apply retention days and size limits as soon as the library is known.
-                initial_store.cleanup_caches("startup")
             finally:
                 initial_store.close()
         except Exception:
@@ -187,9 +190,86 @@ class BridgeServer(ThreadingHTTPServer):
             raise
         self.operation_logger = OperationLogger(self.library_home)
         self.capabilities: dict[str, bool] = {}
+        self._folder_jobs: dict[str, dict[str, Any]] = {}
+        self._folder_job_lock = threading.Lock()
+        # Cache retention can delete gigabytes; do it after the window is usable.
+        self._startup_cleanup_done = threading.Event()
+        self._startup_cleanup_thread = threading.Thread(
+            target=self._apply_startup_cache_policy,
+            name="bookmanager-startup-cache",
+            daemon=True,
+        )
+        self._startup_cleanup_thread.start()
+
+    def _apply_startup_cache_policy(self) -> None:
+        try:
+            store = self.open_store()
+            try:
+                store.cleanup_caches("startup")
+            finally:
+                store.close()
+        except Exception as exc:
+            record_exception('cache.startup_cleanup_failed', exc, data_home=self.library_home)
+        finally:
+            self._startup_cleanup_done.set()
+
+    def wait_for_startup_cleanup(self, timeout: float | None = None) -> bool:
+        return self._startup_cleanup_done.wait(timeout)
 
     def open_store(self, *, run_maintenance: bool = False) -> LibraryStore:
         return LibraryStore(self.library_home, run_maintenance=run_maintenance)
+
+    def begin_folder_job(self, job_id: str) -> None:
+        with self._folder_job_lock:
+            finished = [key for key, job in self._folder_jobs.items() if job["state"] != "running"]
+            while len(self._folder_jobs) >= MAX_FOLDER_IMPORT_JOBS and finished:
+                self._folder_jobs.pop(finished.pop(0), None)
+            previous = self._folder_jobs.get(job_id)
+            cancel_requested = bool(previous and previous.get("state") == "running" and previous.get("cancelRequested"))
+            self._folder_jobs[job_id] = {
+                "jobId": job_id,
+                "state": "running",
+                "examined": 0,
+                "imported": 0,
+                "totalFiles": 0,
+                "folderCount": 0,
+                "errorCount": 0,
+                "message": "",
+                "cancelRequested": cancel_requested,
+            }
+
+    def update_folder_job(self, job_id: str, **fields: Any) -> None:
+        with self._folder_job_lock:
+            job = self._folder_jobs.get(job_id)
+            if job is not None:
+                job.update(fields)
+
+    def finish_folder_job(self, job_id: str, state: str, message: str = "") -> None:
+        with self._folder_job_lock:
+            job = self._folder_jobs.get(job_id)
+            if job is not None:
+                job.update(state=state, message=message)
+
+    def folder_job_progress(self, job_id: str) -> dict[str, Any]:
+        with self._folder_job_lock:
+            job = self._folder_jobs.get(job_id)
+            if job is None:
+                return {"jobId": job_id, "state": "unknown", "examined": 0, "imported": 0,
+                        "totalFiles": 0, "folderCount": 0, "errorCount": 0, "message": ""}
+            return {key: value for key, value in job.items() if key != "cancelRequested"}
+
+    def cancel_folder_job(self, job_id: str) -> bool:
+        with self._folder_job_lock:
+            job = self._folder_jobs.get(job_id)
+            if job is None or job["state"] != "running":
+                return False
+            job["cancelRequested"] = True
+            return True
+
+    def folder_job_cancelled(self, job_id: str) -> bool:
+        with self._folder_job_lock:
+            job = self._folder_jobs.get(job_id)
+            return bool(job and job.get("cancelRequested"))
 
     def log_operation(self, **record: Any) -> None:
         try:
@@ -395,6 +475,10 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             finally:
                 store.close()
             return
+        progress_match = FOLDER_IMPORT_PROGRESS_PATTERN.match(parsed.path)
+        if progress_match:
+            self._send_json(HTTPStatus.OK, self.server.folder_job_progress(progress_match.group("job_id")))
+            return
         if parsed.path == "/api/health":
             self._send_json(HTTPStatus.OK, {"ok": True})
             return
@@ -406,6 +490,10 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                         cleanup()
                     except Exception as exc:
                         record_exception('cache.exit_cleanup_failed', exc)
+                try:
+                    store.mark_clean_shutdown()
+                except OSError as exc:
+                    record_exception('store.clean_shutdown_marker_failed', exc, data_home=store.home)
             finally:
                 store.close()
             self._send_json(HTTPStatus.OK, {"ok": True})
@@ -446,6 +534,11 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
     def _handle_post(self, request_path: str, payload: dict[str, Any]) -> None:
+        cancel_match = FOLDER_IMPORT_CANCEL_PATTERN.match(request_path)
+        if cancel_match:
+            job_id = cancel_match.group("job_id")
+            self._send_json(HTTPStatus.OK, {"jobId": job_id, "cancelRequested": self.server.cancel_folder_job(job_id)})
+            return
         if request_path == "/api/folders":
             self._create_folder(payload)
             return
@@ -650,37 +743,85 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         finally:
             store.close()
 
-    def _import_folder_tree(self, store: LibraryStore, source_dir: Path, parent_id: int, tags: tuple[str, ...]) -> tuple[int, int, int, list[str]]:
+    def _scan_folder_tree(self, source_dir: Path) -> tuple[int, int]:
+        total_files = 0
+        total_folders = 1
+        for directory_text, directory_names, file_names in os.walk(source_dir, topdown=True, followlinks=False):
+            directory = Path(directory_text)
+            directory_names[:] = sorted(name for name in directory_names if not (directory / name).is_symlink())
+            total_folders += len(directory_names)
+            total_files += sum(
+                1 for name in file_names
+                if not (directory / name).is_symlink() and (directory / name).is_file()
+            )
+            if total_folders > MAX_IMPORT_FOLDERS:
+                raise ValueError(f"单次最多导入 {MAX_IMPORT_FOLDERS} 个文件夹")
+            if total_files > MAX_IMPORT_FILES:
+                raise ValueError(f"单次最多导入 {MAX_IMPORT_FILES} 个文件")
+        return total_files, total_folders
+
+    def _import_folder_tree(
+        self,
+        store: LibraryStore,
+        source_dir: Path,
+        parent_id: int,
+        tags: tuple[str, ...],
+        *,
+        on_progress: Callable[..., None] | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> tuple[int, int, int, list[str]]:
+        total_files, total_folders = self._scan_folder_tree(source_dir)
         root_id = store.create_folder(parent_id, source_dir.name)
         folder_ids = {source_dir: root_id}
         folder_count = 1
         file_count = 0
         examined_file_count = 0
         errors: list[str] = []
-        try:
-            for directory_text, directory_names, file_names in os.walk(source_dir, topdown=True, followlinks=False):
-                directory = Path(directory_text)
-                target_id = folder_ids[directory]
-                directory_names[:] = sorted(name for name in directory_names if not (directory / name).is_symlink())
-                if folder_count + len(directory_names) > MAX_IMPORT_FOLDERS:
-                    raise ValueError(f"单次最多导入 {MAX_IMPORT_FOLDERS} 个文件夹")
-                if examined_file_count + len(file_names) > MAX_IMPORT_FILES:
-                    raise ValueError(f"单次最多导入 {MAX_IMPORT_FILES} 个文件")
-                examined_file_count += len(file_names)
-                for name in directory_names:
-                    child = directory / name
-                    folder_ids[child] = store.create_folder(target_id, name)
-                    folder_count += 1
-                for name in sorted(file_names):
-                    source = directory / name
-                    if source.is_symlink() or not source.is_file():
-                        continue
+        pending: list[tuple[Path, int]] = []
+
+        def progress(**fields: object) -> None:
+            if on_progress is not None:
+                on_progress(**fields)
+
+        progress(totalFiles=total_files, folderCount=total_folders, examined=0, imported=0, errorCount=0)
+
+        def flush_batch() -> None:
+            nonlocal file_count
+            if not pending:
+                return
+            batch = list(pending)
+            pending.clear()
+            with store.transaction():
+                for source, target_id in batch:
                     try:
                         store.add_local_file(source, target_id, infer_structured_file_name(source.name), tags=tags)
                         file_count += 1
                     except (OSError, ValueError) as exc:
                         record_exception('import.file_skipped', exc, source_name=source.name)
                         errors.append('文件无法读取或内容无效，已跳过')
+            progress(examined=examined_file_count, imported=file_count, errorCount=len(errors))
+
+        try:
+            for directory_text, directory_names, file_names in os.walk(source_dir, topdown=True, followlinks=False):
+                directory = Path(directory_text)
+                target_id = folder_ids[directory]
+                directory_names[:] = sorted(name for name in directory_names if not (directory / name).is_symlink())
+                for name in directory_names:
+                    child = directory / name
+                    folder_ids[child] = store.create_folder(target_id, name)
+                    folder_count += 1
+                for name in sorted(file_names):
+                    if cancel_requested is not None and cancel_requested():
+                        raise ImportProblem('import_cancelled', '已取消导入，本次未保留任何文件')
+                    source = directory / name
+                    if source.is_symlink() or not source.is_file():
+                        continue
+                    examined_file_count += 1
+                    pending.append((source, target_id))
+                    if len(pending) >= FOLDER_IMPORT_BATCH_SIZE:
+                        flush_batch()
+                progress(examined=examined_file_count, imported=file_count, folderCount=folder_count)
+            flush_batch()
         except Exception:
             store.delete_folder(root_id)
             raise
@@ -690,13 +831,38 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         source = Path(str(payload.get("path", ""))).expanduser()
         if not source.is_dir():
             raise ValueError("无法读取文件夹")
+        job_id: str | None = None
+        if "jobId" in payload:
+            job_id = validate_request_id(str(payload.get("jobId")))
+        on_progress = None
+        cancel_requested = None
+        if job_id is not None:
+            self.server.begin_folder_job(job_id)
+            on_progress = lambda **fields: self.server.update_folder_job(job_id, **fields)  # noqa: E731
+            cancel_requested = lambda: self.server.folder_job_cancelled(job_id)  # noqa: E731
         store = self.server.open_store()
         try:
             root_id, folder_count, file_count, errors = self._import_folder_tree(
-                store, source, int(payload["folderId"]), normalize_tag_names(payload.get("tags", ()))
+                store,
+                source,
+                int(payload["folderId"]),
+                normalize_tag_names(payload.get("tags", ())),
+                on_progress=on_progress,
+                cancel_requested=cancel_requested,
             )
             self._operation_details.update({"folder_count": folder_count, "file_count": file_count, "error_count": len(errors)})
-            self._send_json(HTTPStatus.CREATED, {"folderId": root_id, "folderCount": folder_count, "fileCount": file_count, "errors": errors})
+            if job_id is not None:
+                self.server.finish_folder_job(job_id, "done", f"已导入 {file_count} 个文件")
+            self._send_json(HTTPStatus.CREATED, {"folderId": root_id, "folderCount": folder_count, "fileCount": file_count, "errors": errors, "jobId": job_id})
+        except ImportProblem as exc:
+            if job_id is not None:
+                state = "cancelled" if exc.import_error_type == "import_cancelled" else "failed"
+                self.server.finish_folder_job(job_id, state, str(exc))
+            raise
+        except Exception:
+            if job_id is not None:
+                self.server.finish_folder_job(job_id, "failed", "导入失败")
+            raise
         finally:
             store.close()
 

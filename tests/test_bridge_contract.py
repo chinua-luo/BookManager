@@ -22,6 +22,7 @@ class BridgeContractTests(unittest.TestCase):
         self.env = mock.patch.dict(os.environ, {'BOOKMANAGER_DIAGNOSTIC_HOME': str(self.root / 'fallback')})
         self.env.start()
         self.server = BridgeServer(('127.0.0.1', 0), self.root / 'data', self.token, self.root)
+        self.server.wait_for_startup_cleanup(5)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
@@ -261,6 +262,72 @@ class BridgeContractTests(unittest.TestCase):
             self.assertIs(result['data']['truncated'], False)
 
 
+
+    def test_folder_import_reports_progress_and_completes(self):
+        folder = self.root / 'progress-import'
+        (folder / 'nested').mkdir(parents=True)
+        for index in range(3):
+            (folder / f'book-{index}.txt').write_text(f'book {index}', encoding='utf-8')
+        (folder / 'nested' / 'deep.txt').write_text('deep', encoding='utf-8')
+
+        status, result = self.request('/api/import/folder', {
+            'path': str(folder),
+            'folderId': 1,
+            'tags': [],
+            'jobId': 'job-success',
+        })
+        self.assertEqual(status, 201)
+        self.assertEqual(result['data']['fileCount'], 4)
+        self.assertEqual(result['data']['jobId'], 'job-success')
+
+        status, progress = self.request('/api/import/folder/progress/job-success')
+        self.assertEqual(status, 200)
+        self.assertEqual(progress['data']['state'], 'done')
+        self.assertEqual(progress['data']['imported'], 4)
+        self.assertEqual(progress['data']['totalFiles'], 4)
+        self.assertEqual(progress['data']['examined'], 4)
+        self.assertEqual(progress['data']['folderCount'], 2)
+
+    def test_folder_import_cancel_rolls_back_and_reports_state(self):
+        folder = self.root / 'cancelled-import'
+        folder.mkdir()
+        (folder / 'book.txt').write_text('book', encoding='utf-8')
+
+        self.server.begin_folder_job('job-cancel')
+        status, progress = self.request('/api/import/folder/progress/job-cancel')
+        self.assertEqual(progress['data']['state'], 'running')
+        status, cancel = self.request('/api/import/folder/cancel/job-cancel', {})
+        self.assertEqual(status, 200)
+        self.assertTrue(cancel['data']['cancelRequested'])
+
+        status, result = self.request('/api/import/folder', {
+            'path': str(folder), 'folderId': 1, 'tags': [], 'jobId': 'job-cancel',
+        })
+        self.assertEqual(status, 400)
+        self.assertEqual(result['error_type'], 'import_cancelled')
+        status, progress = self.request('/api/import/folder/progress/job-cancel')
+        self.assertEqual(progress['data']['state'], 'cancelled')
+
+        status, tree = self.request('/api/tree')
+        names = json.dumps(tree['data']['folders'])
+        self.assertNotIn('cancelled-import', names)
+
+    def test_folder_import_job_validation_and_unknown_progress(self):
+        folder = self.root / 'invalid-job'
+        folder.mkdir()
+        (folder / 'book.txt').write_text('book', encoding='utf-8')
+        status, result = self.request('/api/import/folder', {
+            'path': str(folder), 'folderId': 1, 'tags': [], 'jobId': 'bad id!',
+        })
+        self.assertEqual(status, 400)
+        self.assertEqual(result['error_type'], 'invalid_request_id')
+        status, progress = self.request('/api/import/folder/progress/does-not-exist')
+        self.assertEqual(status, 200)
+        self.assertEqual(progress['data']['state'], 'unknown')
+        status, cancel = self.request('/api/import/folder/cancel/does-not-exist', {})
+        self.assertEqual(status, 200)
+        self.assertFalse(cancel['data']['cancelRequested'])
+
     def test_open_copy_materializes_an_independent_cache_file(self):
         source = self.root / 'opened.txt'
         source.write_text('opened content', encoding='utf-8')
@@ -279,14 +346,21 @@ class BridgeContractTests(unittest.TestCase):
         self.assertEqual(cached.read_text(encoding='utf-8'), 'opened content')
         self.assertIn('open_cache', str(cached))
 
-    def test_startup_applies_the_cache_policy_immediately(self):
+    def test_startup_applies_the_cache_policy_in_the_background(self):
         with mock.patch.object(LibraryStore, 'cleanup_caches', return_value=0) as cleanup:
             server = BridgeServer(('127.0.0.1', 0), self.root / 'cleanup-data', self.token, self.root)
             try:
+                self.assertTrue(server.wait_for_startup_cleanup(5))
                 cleanup.assert_called_once_with('startup')
             finally:
                 server.server_close()
         self.assertTrue((self.root / 'cleanup-data' / 'library.db').is_file())
+
+    def test_shutdown_writes_a_clean_shutdown_marker(self):
+        status, result = self.request('/api/shutdown')
+        self.assertEqual(status, 200)
+        self.assertTrue(result['ok'])
+        self.assertTrue((self.server.library_home / '.bookmanager-clean-shutdown').is_file())
 
     def test_per_request_store_skips_the_startup_maintenance_scan(self):
         with mock.patch('bookmanager.bridge.LibraryStore') as store_class:

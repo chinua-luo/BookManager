@@ -38,6 +38,26 @@ class StartupTests(unittest.TestCase):
         self.assertEqual((self.home / 'library.db').read_bytes(), before)
         self.assertEqual(list(self.home.rglob('.bookmanager-preflight-*')), [])
 
+
+    def test_clean_shutdown_marker_skips_the_integrity_scan_once(self):
+        store = LibraryStore(self.home)
+        store.mark_clean_shutdown()
+        store.close()
+        marker = self.home / '.bookmanager-clean-shutdown'
+        self.assertTrue(marker.is_file())
+        check_storage(self.home)
+        self.assertFalse(marker.exists())
+
+        database = self.home / 'library.db'
+        database.write_bytes(b'not a valid sqlite database')
+        marker.write_text('2026-01-01T00:00:00Z', encoding='utf-8')
+        check_storage(self.home)  # marker trusts the previous clean shutdown
+        marker.write_text('2026-01-01T00:00:00Z', encoding='utf-8')
+        marker.unlink()
+        with self.assertRaises(StartupFailure) as raised:
+            check_storage(self.home)
+        self.assertEqual(raised.exception.error_type, 'data_corrupt')
+
     def test_readonly_database_or_existing_cache_directory_blocks_startup(self):
         store = LibraryStore(self.home)
         store.close()

@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from bookmanager.bridge import MAX_OPEN_CACHE_FILE_NAME_BYTES, truncate_open_cache_file_name
@@ -73,6 +74,20 @@ class OpenCacheSyncTests(unittest.TestCase):
             self.store.get_item(self.item_id).stored_path.read_text(encoding="utf-8"),
             "original",
         )
+
+
+    def test_unedited_open_copies_are_not_hashed_again(self) -> None:
+        cached_path = self.open_copy("fast-path")
+        with mock.patch('bookmanager.store.sha256_file', side_effect=AssertionError('should not hash unchanged copies')):
+            self.assertEqual(self.store.sync_open_cache_changes(), 0)
+
+        cached_path.write_text("edited", encoding="utf-8")
+        self.assertEqual(self.store.sync_open_cache_changes(), 1)
+        self.assertEqual(self.store.get_item(self.item_id).stored_path.read_text(encoding="utf-8"), "edited")
+
+        # After writeback the manifest records the new hash, so it is skipped again.
+        with mock.patch('bookmanager.store.sha256_file', side_effect=AssertionError('should not hash unchanged copies')):
+            self.assertEqual(self.store.sync_open_cache_changes(), 0)
 
     def test_menu_saves_open_cache_instead_of_inline_text(self) -> None:
         renderer = (PROJECT_DIR / "electron" / "src" / "main.js").read_text(encoding="utf-8")
