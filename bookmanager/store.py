@@ -84,7 +84,8 @@ CACHE_POLICY_NAMES = tuple(CACHE_POLICIES)
 OPEN_CACHE_MANIFEST = ".bookmanager-open.json"
 # Bump when the base schema or a data migration changes; existing libraries are
 # upgraded once instead of re-scanning every item on each request.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+SQLITE_BUSY_TIMEOUT_MS = 5000
 MIGRATION_STAGING_PREFIX = ".bookmanager-migration-"
 CLEAN_SHUTDOWN_MARKER = ".bookmanager-clean-shutdown"
 MIGRATION_COMPLETE_MARKER = ".bookmanager-migration-complete"
@@ -520,6 +521,9 @@ class LibraryStore:
         try:
             self.conn.row_factory = sqlite3.Row
             self.conn.execute("PRAGMA foreign_keys = ON")
+            # Frames read from a WAL database do not block writers, but concurrent
+            # maintenance/import transactions still need a bounded retry window.
+            self.conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
             self._ensure_schema()
             self._secure_library_permissions()
             if self.migrated_legacy_library:
@@ -602,6 +606,12 @@ class LibraryStore:
                 "UPDATE items SET main_title_norm = ?, subtitle_norm = ?, authors_norm = ? WHERE id = ?",
                 updates,
             )
+        self.conn.commit()
+
+    def _apply_schema_v4(self) -> None:
+        # WAL keeps per-request reads running while an import or cache sync
+        # commits; the mode persists in the database file.
+        self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.commit()
 
     @silent_background('cache.stale_temporary_cleanup_failed')

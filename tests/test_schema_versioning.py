@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from bookmanager.store import SCHEMA_VERSION, LibraryStore
+from bookmanager.store import SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT_MS, LibraryStore
 
 
 class SchemaVersioningTests(unittest.TestCase):
@@ -91,6 +91,32 @@ class SchemaVersioningTests(unittest.TestCase):
         finally:
             store.close()
         self.assertEqual(self.version(), SCHEMA_VERSION)
+
+    def test_library_uses_wal_and_sets_a_busy_timeout(self) -> None:
+        store = LibraryStore(self.home)
+        try:
+            self.assertEqual(store.conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+            self.assertEqual(store.conn.execute("PRAGMA busy_timeout").fetchone()[0], SQLITE_BUSY_TIMEOUT_MS)
+        finally:
+            store.close()
+
+    def test_v3_library_upgrades_to_wal_without_losing_rows(self) -> None:
+        store = LibraryStore(self.home)
+        try:
+            store.conn.execute("PRAGMA user_version = 3")
+            store.conn.execute("PRAGMA journal_mode = DELETE")
+            store.conn.execute("INSERT INTO folders(parent_id, name, created_at) VALUES(1, 'kept', '2026-01-01T00:00:00Z')")
+            store.conn.commit()
+        finally:
+            store.close()
+
+        store = LibraryStore(self.home)
+        try:
+            self.assertEqual(int(store.conn.execute("PRAGMA user_version").fetchone()[0]), SCHEMA_VERSION)
+            self.assertEqual(store.conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+            self.assertEqual(store.conn.execute("SELECT name FROM folders WHERE name = 'kept'").fetchone()[0], "kept")
+        finally:
+            store.close()
 
 
 if __name__ == "__main__":
