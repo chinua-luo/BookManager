@@ -174,6 +174,8 @@ test('crawl warnings aggregate raw failures and explicitly identify HTML fallbac
   assert.equal(fallback.title, '未能下载文档'); assert.match(fallback.msg, /已保存源页面/)
   assert.equal(importSummary({ fileCount: 0, errors: ['broken'] }).level, 'error')
   assert.equal(notificationFromError(businessError('fetch failed', '/api/tree', true)).level, 'fatal')
+  const blocked = notificationFromError(businessError({ error_type: 'unsafe_file_type', msg: '该文件类型不允许用系统默认程序打开，请使用预览或手动处理', level: 'error' }, '/api/items/1/open'))
+  assert.equal(blocked.title, '文件类型受限'); assert.match(blocked.msg, /系统默认程序/)
 })
 
 import { startupFailure } from '../startup-checks.mjs'
