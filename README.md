@@ -171,6 +171,8 @@ pnpm test
 pnpm build
 ```
 
+仓库包含 `.github/workflows/ci.yml`：在 Python 3.10 / 3.12 / 3.13 上运行单元测试与 `compileall`，并在 Node 上运行渲染层测试。前端构建依赖 Electron 与原生包，需在匹配的本地环境执行。
+
 ## 许可证
 
 本项目代码采用 [GNU Affero General Public License v3.0](LICENSE)（`AGPL-3.0-only`）。使用、修改、分发本项目，或通过网络向用户提供其功能时，须遵守该许可证；第三方依赖继续适用各自的许可证。
