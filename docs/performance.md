@@ -165,6 +165,51 @@ P1 阶段解决的是“单个大文件、整目录导入、启动与缓存、�
 - 本环境无法执行 `pnpm build`，因此前端首屏包体积/真实 Electron 端到端收益未在此测量；
   代码通过 147 个 `node:test` 与语法检查，正式效果需在可构建环境复测（详见 README）。
 
+## P2：文本预览、WAL、请求并发与搜索结果渲染
+
+P2 目标是不改业务语义、只把剩余的“资源无上限”点收口。基准复用
+`tools/benchmark_library.py --p2`（5000 个合成镜像 + 10 MiB 文本文件）。
+
+### P2-1 大文本预览只读取前 2 MiB
+
+- 原先文本预览 `fetch(documentUrl)` 后 `response.text()` 读取整个文件；10 MiB
+  日志会完整进入渲染进程再生成超长文本节点。
+- bridge 的 `_stream_file` 本来就支持 `Range`；现在渲染层对 `size > 2 MiB` 的
+  文本请求 `Range: bytes=0-2097151`（`electron/src/text-preview.js`），预览底部
+  显示“文件较大（X MB），仅显示前 2 MB”。小文件/未知大小仍走完整读取。
+- 实测同一 10 MiB 文本：HTTP 响应体 **10,485,760 B → 2,097,152 B（约 −80%）**，
+  本地回环耗时 12.1 ms → 4.0 ms；渲染进程同时少解码约 8 MiB 文本。
+
+### P2-2 SQLite WAL + busy_timeout
+
+- schema 升到 v4，迁移时执行一次 `PRAGMA journal_mode = WAL`（模式写入数据库文件
+  并持久化）；每个连接设置 `PRAGMA busy_timeout = 5000`。
+- WAL 让每个请求新建的只读连接在导入/缓存写入提交期间继续读取，不再等待
+  rollback journal 的提交锁；写事务之间仍有 5 s 重试窗口。
+- 实测 5000 项书库、写线程连续 500 次小事务提交时，读取线程
+  `list_items` p50 54.7 → 54.4 ms（基本不变），最坏样本 261.5 → 69.5 ms；
+  单次运行噪声较大，但长尾阻塞明显收敛。WAL 文件已包含在迁移复制的
+  `LIBRARY_DATA_NAMES` 中，旧库升级测试验证数据不丢失。
+
+### P2-3 bridge 请求并发上限
+
+- `ThreadingHTTPServer` 原先每个连接都新建线程，突发请求会同时创建大量线程和
+  `LibraryStore`/SQLite 连接。
+- 新增 `MAX_CONCURRENT_REQUESTS = 16` 的 `BoundedSemaphore`，在每个连接的处理
+  线程结束时释放；监听 backlog 提高到 64。超过上限的请求排队等待，不受理半开
+  请求，也不丢弃连接。
+- 回归测试同时发 32 个 `/api/health`，峰值并发处理线程 ≤ 16、32 个请求全部
+  返回 200，随后仍可正常服务。
+
+### P2-4 搜索结果分块渲染
+
+- 搜索 API 仍最多返回 500 条；前端原先一次创建全部结果行（镜像/标签最多 500 行，
+  底层文件按文档分组）。
+- 新增 `electron/src/search-result-view.js`：先渲染 100 个渲染单元，底部
+  “显示更多（剩余 N 项）”每次追加 100 个；分组逻辑与点击行为不变。
+- 初始 DOM 行数从最多 500 降到 100，结果很多时展开成本由用户按需触发。
+  本环境无法构建 Electron，收益以 `node:test` 行为测试与代码路径验证为准。
+
 ## 仍然保留的已知上限
 
 - 未实现虚拟列表：前端已加载的页面会保留在 DOM 中，超大文件夹滚动到底后仍会
@@ -174,9 +219,11 @@ P1 阶段解决的是“单个大文件、整目录导入、启动与缓存、�
 - 标签搜索仍会对 tags 表做 `LIKE`（表很小，14 ms 级）；书库到数万级且标签搜索
   成为瓶颈时可评估 FTS5 trigram。
 - 前端只做了事件委托与渲染器懒加载，未做虚拟列表；首屏资源的真实收益需在可构建环境测量。
-- 本机无法构建 Electron 产物（原生绑定签名限制），本轮前端分页只经过
+- 本机无法构建 Electron 产物（原生绑定签名限制），本轮前端渲染改动只经过
   node:test 与语法检查；正式使用前需在可构建环境执行 `pnpm build` 后做一次
   手工验证。
+- 文本预览只限制了纯文本路径；PDF/Office/EPUB/图片仍整份交给对应渲染器，
+  超大文件的峰值内存由第三方渲染器决定。
 
 ## 回归保护
 
@@ -188,4 +235,9 @@ P1 阶段解决的是“单个大文件、整目录导入、启动与缓存、�
   镜像分组、截断标记、标签搜索。
 - `tests/test_bridge_contract.py` 覆盖分页参数校验、上限钳制与
   `truncated` 返回。
+- `tests/test_schema_versioning.py` 覆盖 WAL 模式、busy_timeout 与 v3→v4
+  升级不丢数据；`tests/test_bridge_concurrency.py` 覆盖 32 请求突发下的并发
+  上限与全部成功返回。
+- `electron/tests/text-preview.test.mjs`、`electron/tests/search-result-view.test.mjs`
+  覆盖 Range 请求边界、截断提示、文件分组与 100 项分块。
 - `tools/benchmark_library.py` 可随时复跑上述场景，防止后续退化。

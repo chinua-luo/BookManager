@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import shutil
@@ -342,6 +343,96 @@ def p1_benchmarks(root: Path) -> dict[str, object]:
     return report
 
 
+def p2_benchmarks(root: Path) -> dict[str, object]:
+    """Scenarios targeted by the P2 work: WAL reads, bounded text previews."""
+    import threading
+
+    report: dict[str, object] = {}
+    home = root / "p2-wal"
+    seed_library(home, 5000)
+    probe = LibraryStore(home)
+    try:
+        report["journal_mode"] = probe.conn.execute("PRAGMA journal_mode").fetchone()[0]
+        report["busy_timeout_ms"] = int(probe.conn.execute("PRAGMA busy_timeout").fetchone()[0])
+    finally:
+        probe.close()
+
+    latencies: list[float] = []
+    done = threading.Event()
+
+    def writer() -> None:
+        store = LibraryStore(home)
+        try:
+            for index in range(500):
+                with store.transaction():
+                    store.conn.execute("UPDATE cache_settings SET open_days = ? WHERE id = 1", (7 + index % 2,))
+        finally:
+            store.close()
+            done.set()
+
+    def reader() -> None:
+        store = LibraryStore(home)
+        try:
+            while not done.is_set() or len(latencies) < 20:
+                began = time.perf_counter()
+                store.list_items(1)
+                latencies.append((time.perf_counter() - began) * 1000)
+        finally:
+            store.close()
+
+    reader_thread = threading.Thread(target=reader)
+    writer_thread = threading.Thread(target=writer)
+    reader_thread.start()
+    writer_thread.start()
+    writer_thread.join()
+    done.set()
+    reader_thread.join()
+    report["reader_during_writes_ms"] = {
+        "samples": len(latencies),
+        "p50_ms": round(statistics.median(latencies), 1),
+        "p95_ms": round(percentile(latencies, 0.95), 1),
+        "max_ms": round(max(latencies), 1),
+    }
+
+    big = root / "p2-big.txt"
+    big.write_text("x" * (10 * 1024 * 1024), encoding="utf-8")
+    store = LibraryStore(home)
+    try:
+        item = store.get_item(store.add_local_file(big, 1))
+        document_id = item.document_id
+    finally:
+        store.close()
+
+    from bookmanager.bridge import BridgeServer
+
+    token = "b" * 64
+    server = BridgeServer(("127.0.0.1", 0), home, token, PROJECT_DIR / "electron" / "dist")
+    server.wait_for_startup_cleanup(60)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    try:
+        def fetch_text(range_header: str | None = None) -> dict[str, float]:
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=120)
+            headers = {"Authorization": "Bearer " + token}
+            if range_header:
+                headers["Range"] = range_header
+            began = time.perf_counter()
+            connection.request("GET", f"/api/documents/{document_id}/content", headers=headers)
+            response = connection.getresponse()
+            body = response.read()
+            elapsed = (time.perf_counter() - began) * 1000
+            connection.close()
+            return {"status": response.status, "bytes": len(body), "ms": round(elapsed, 1)}
+
+        report["text_preview_full"] = fetch_text()
+        report["text_preview_range_2mb"] = fetch_text("bytes=0-2097151")
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+    return report
+
+
 def payload_size(home: Path) -> dict[str, int]:
     # A cheap approximation of the JSON body users have to download per folder click.
     store = LibraryStore(home)
@@ -364,6 +455,7 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--no-api", action="store_true", help="skip bridge HTTP benchmarks")
     parser.add_argument("--p1", action="store_true", help="also run P1 import/copy/cache/startup scenarios")
+    parser.add_argument("--p2", action="store_true", help="also run P2 WAL/text-preview scenarios")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     args = parser.parse_args()
 
@@ -380,6 +472,8 @@ def main() -> int:
             report["api"] = api_benchmarks(home, args.repeats)
         if args.p1:
             report["p1"] = p1_benchmarks(Path(tempfile.mkdtemp(prefix="bm-benchmark-p1-")))
+        if args.p2:
+            report["p2"] = p2_benchmarks(Path(tempfile.mkdtemp(prefix="bm-benchmark-p2-")))
         if args.json:
             print(json.dumps(report, ensure_ascii=False, indent=2))
         else:
@@ -393,6 +487,8 @@ def main() -> int:
             for name, size in report.get("api", {}).get("_bytes", {}).items():
                 print(f"  {name:<22} {size / 1024:>8.1f} KiB")
             for name, value in report.get("p1", {}).items():
+                print(f"  {name:<28} {value}")
+            for name, value in report.get("p2", {}).items():
                 print(f"  {name:<28} {value}")
         return 0
     finally:
