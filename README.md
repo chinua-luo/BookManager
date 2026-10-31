@@ -119,7 +119,7 @@ python3 tools/create_macos_launcher.py
 library.db       书库结构、镜像、元数据和 Hash 索引
 blobs/           SHA-256 底层文件
 open_cache/      使用系统默认程序打开的临时副本
-preview_cache/   文档预览缓存
+render_cache/    文档预览缓存
 tmp/             导入和渲染过程中的临时文件
 ```
 
