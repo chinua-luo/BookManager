@@ -201,6 +201,65 @@ class BridgeContractTests(unittest.TestCase):
         self.assertNotIn('/private/cache', json.dumps(result))
 
 
+
+    def test_folder_contents_are_returned_in_pages(self):
+        for index in range(5):
+            source = self.root / f'paged-{index}.txt'
+            source.write_text(f'content {index}', encoding='utf-8')
+            status, _result = self.request('/api/import/file', {
+                'path': str(source),
+                'folderIds': [1],
+                'nameParts': {'mainTitle': f'Paged {index}', 'edition': '1', 'extension': '.txt'},
+                'requestId': f'paged-{index}',
+            })
+            self.assertEqual(status, 201)
+
+        status, result = self.request('/api/folders/1/contents?offset=0&limit=2')
+        self.assertEqual(status, 200)
+        first = result['data']
+        self.assertEqual(len(first['items']), 2)
+        self.assertEqual(first['pagination'], {'offset': 0, 'limit': 2, 'total': 5, 'hasMore': True})
+        self.assertEqual(first['stats']['itemCount'], 5)
+
+        status, result = self.request('/api/folders/1/contents?offset=2&limit=2')
+        second = result['data']
+        self.assertEqual(len(second['items']), 2)
+        self.assertFalse({item['id'] for item in first['items']} & {item['id'] for item in second['items']})
+        self.assertTrue(second['pagination']['hasMore'])
+
+        status, result = self.request('/api/folders/1/contents?offset=4&limit=2')
+        last = result['data']
+        self.assertEqual(len(last['items']), 1)
+        self.assertFalse(last['pagination']['hasMore'])
+
+        for query in ('?offset=-1', '?limit=0', '?limit=abc'):
+            status, result = self.request(f'/api/folders/1/contents{query}')
+            self.assertEqual(status, 400, query)
+            self.assertEqual(result['error_type'], 'invalid_pagination')
+        status, result = self.request('/api/folders/1/contents?limit=99999')
+        self.assertEqual(status, 200)
+        self.assertEqual(result['data']['pagination']['limit'], 1000)
+
+
+    def test_search_reports_whether_results_were_truncated(self):
+        source = self.root / 'search-only.txt'
+        source.write_text('search body', encoding='utf-8')
+        status, _result = self.request('/api/import/file', {
+            'path': str(source),
+            'folderIds': [1],
+            'nameParts': {'mainTitle': 'Search Only', 'edition': '1', 'extension': '.txt'},
+            'requestId': 'search-only',
+        })
+        self.assertEqual(status, 201)
+        for payload in (
+            {'kind': 'files', 'mainTitle': 'Search'},
+            {'kind': 'mirrors', 'mainTitle': 'Search'},
+            {'kind': 'tags', 'query': 'no-such-tag'},
+        ):
+            status, result = self.request('/api/search', payload)
+            self.assertEqual(status, 200)
+            self.assertIs(result['data']['truncated'], False)
+
     def test_startup_applies_the_cache_policy_immediately(self):
         with mock.patch.object(LibraryStore, 'cleanup_caches', return_value=0) as cleanup:
             server = BridgeServer(('127.0.0.1', 0), self.root / 'cleanup-data', self.token, self.root)

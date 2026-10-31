@@ -84,11 +84,10 @@ CACHE_POLICY_NAMES = tuple(CACHE_POLICIES)
 OPEN_CACHE_MANIFEST = ".bookmanager-open.json"
 # Bump when the base schema or a data migration changes; existing libraries are
 # upgraded once instead of re-scanning every item on each request.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MIGRATION_STAGING_PREFIX = ".bookmanager-migration-"
 MIGRATION_COMPLETE_MARKER = ".bookmanager-migration-complete"
 _BLOB_WRITE_LOCK = threading.RLock()
-MAX_SEARCH_SCAN_ROWS = 50_000
 
 
 def resolve_default_library_home() -> tuple[Path, bool]:
@@ -422,6 +421,15 @@ def _note_from_json(value: str) -> str:
     return _normalize_note(data.get("note", ""))
 
 
+def _name_norms(parts: StructuredFileName) -> tuple[str, str, str]:
+    return (parts.main_title.strip().lower(), parts.subtitle.strip().lower(), parts.authors.strip().lower())
+
+
+def _like_contains(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
 def _parse_name_data(value: str) -> tuple[StructuredFileName, str]:
     """Parse name_data once for the hot item-listing path."""
     try:
@@ -567,6 +575,23 @@ class LibraryStore:
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_items_folder_name ON items(folder_id, display_name)"
         )
+        self.conn.commit()
+
+    def _apply_schema_v3(self) -> None:
+        # Normalized search columns let SQL filter rows before any Python parsing.
+        columns = {str(row["name"]) for row in self.conn.execute("PRAGMA table_info(items)")}
+        for column in ("main_title_norm", "subtitle_norm", "authors_norm"):
+            if column not in columns:
+                self.conn.execute(f"ALTER TABLE items ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+        updates: list[tuple[str, str, str, int]] = []
+        for row in self.conn.execute("SELECT id, name_data FROM items").fetchall():
+            parts, _note = _parse_name_data(row["name_data"])
+            updates.append((*_name_norms(parts), int(row["id"])))
+        if updates:
+            self.conn.executemany(
+                "UPDATE items SET main_title_norm = ?, subtitle_norm = ?, authors_norm = ? WHERE id = ?",
+                updates,
+            )
         self.conn.commit()
 
     @silent_background('cache.stale_temporary_cleanup_failed')
@@ -1338,8 +1363,19 @@ class LibraryStore:
         }
 
     def list_items(self, folder_id: int) -> list[Item]:
-        rows = self.conn.execute(
-            """
+        items, _total = self.list_items_page(folder_id, 0, None)
+        return items
+
+    def list_items_page(
+        self,
+        folder_id: int,
+        offset: int = 0,
+        limit: int | None = 200,
+    ) -> tuple[list[Item], int]:
+        total = int(
+            self.conn.execute("SELECT COUNT(*) AS count FROM items WHERE folder_id = ?", (folder_id,)).fetchone()["count"]
+        )
+        query = """
             SELECT i.id, i.folder_id, i.document_id, i.display_name, i.name_data, b.sha256, b.size, b.mime,
                    b.stored_path, d.updated_at
             FROM items i
@@ -1347,11 +1383,14 @@ class LibraryStore:
             JOIN blobs b ON b.sha256 = d.current_hash
             WHERE i.folder_id = ?
             ORDER BY i.display_name
-            """,
-            (folder_id,),
-        ).fetchall()
+        """
+        params: list[int] = [folder_id]
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params.extend([max(0, int(limit)), max(0, int(offset))])
+        rows = self.conn.execute(query, tuple(params)).fetchall()
         tags = self._tags_for_item_ids(int(row["id"]) for row in rows)
-        return [self._item_from_row(row, tags.get(int(row["id"]), ())) for row in rows]
+        return [self._item_from_row(row, tags.get(int(row["id"]), ())) for row in rows], total
 
     def get_item(self, item_id: int) -> Item:
         row = self.conn.execute(
@@ -1430,10 +1469,13 @@ class LibraryStore:
             name, parts = self._item_name_parts(parts)
             cursor = self.conn.execute(
                 """
-                INSERT INTO items(folder_id, document_id, display_name, name_data, created_at, updated_at)
-                VALUES(?, ?, ?, ?, ?, ?)
+                INSERT INTO items(
+                    folder_id, document_id, display_name, name_data, created_at, updated_at,
+                    main_title_norm, subtitle_norm, authors_norm
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (folder_id, document_id, name, _name_parts_to_json(parts, note), now, now),
+                (folder_id, document_id, name, _name_parts_to_json(parts, note), now, now, *_name_norms(parts)),
             )
             self._replace_item_tags(int(cursor.lastrowid), tags)
         item_id = int(cursor.lastrowid)
@@ -1502,8 +1544,11 @@ class LibraryStore:
             name, parts = self._item_name_parts(parts)
             cursor = self.conn.execute(
                 """
-                INSERT INTO items(folder_id, document_id, display_name, name_data, created_at, updated_at)
-                VALUES(?, ?, ?, ?, ?, ?)
+                INSERT INTO items(
+                    folder_id, document_id, display_name, name_data, created_at, updated_at,
+                    main_title_norm, subtitle_norm, authors_norm
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     target_folder_id,
@@ -1512,6 +1557,7 @@ class LibraryStore:
                     _name_parts_to_json(parts, item.note if note is None else note),
                     now,
                     now,
+                    *_name_norms(parts),
                 ),
             )
             self._replace_item_tags(int(cursor.lastrowid), item.tags if tags is None else tags)
@@ -1555,8 +1601,19 @@ class LibraryStore:
         with self.conn:
             name, parts = self._item_name_parts(parts)
             self.conn.execute(
-                "UPDATE items SET display_name = ?, name_data = ?, updated_at = ? WHERE id = ?",
-                (name, _name_parts_to_json(parts, item.note if note is None else note), utc_now(), item_id),
+                """
+                UPDATE items
+                SET display_name = ?, name_data = ?, updated_at = ?,
+                    main_title_norm = ?, subtitle_norm = ?, authors_norm = ?
+                WHERE id = ?
+                """,
+                (
+                    name,
+                    _name_parts_to_json(parts, item.note if note is None else note),
+                    utc_now(),
+                    *_name_norms(parts),
+                    item_id,
+                ),
             )
             if tags is not None:
                 self._replace_item_tags(item_id, tags)
@@ -1636,8 +1693,20 @@ class LibraryStore:
         name, parts = self._item_name_parts(item.name_parts)
         with self.conn:
             self.conn.execute(
-                "UPDATE items SET folder_id = ?, display_name = ?, name_data = ?, updated_at = ? WHERE id = ?",
-                (target_folder_id, name, _name_parts_to_json(parts, item.note), utc_now(), item_id),
+                """
+                UPDATE items
+                SET folder_id = ?, display_name = ?, name_data = ?, updated_at = ?,
+                    main_title_norm = ?, subtitle_norm = ?, authors_norm = ?
+                WHERE id = ?
+                """,
+                (
+                    target_folder_id,
+                    name,
+                    _name_parts_to_json(parts, item.note),
+                    utc_now(),
+                    *_name_norms(parts),
+                    item_id,
+                ),
             )
 
     def replace_document_content(self, document_id: int, source_path: Path) -> int:
@@ -1671,43 +1740,66 @@ class LibraryStore:
             )
         return document_id
 
+    def _search_where(self, filters: tuple[str, str, str]) -> tuple[str, list[str]]:
+        clauses: list[str] = []
+        params: list[str] = []
+        for column, needle in zip(("main_title_norm", "subtitle_norm", "authors_norm"), filters):
+            if needle:
+                clauses.append(f"{column} LIKE ? ESCAPE '\\'")
+                params.append(_like_contains(needle))
+        return (" AND ".join(clauses) if clauses else "1 = 1"), params
+
+    def _item_select(self) -> str:
+        return """
+            SELECT i.id, i.folder_id, i.document_id, i.display_name, i.name_data, b.sha256, b.size, b.mime,
+                   b.stored_path, d.updated_at
+            FROM items i
+            JOIN documents d ON d.id = i.document_id
+            JOIN blobs b ON b.sha256 = d.current_hash
+        """
+
     def search_unique_documents(
         self,
         main_title: str = "",
         subtitle: str = "",
         authors: str = "",
         limit: int = 500,
-    ) -> list[tuple[str, Item]]:
+    ) -> tuple[list[tuple[str, Item]], bool]:
         limit = max(1, min(int(limit), 5000))
         filters = (main_title.strip().lower(), subtitle.strip().lower(), authors.strip().lower())
-        rows = self.conn.execute(
-            """
-            SELECT i.id, i.folder_id, i.document_id, i.display_name, i.name_data, b.sha256, b.size, b.mime,
-                   b.stored_path, d.updated_at
-            FROM items i
-            JOIN documents d ON d.id = i.document_id
-            JOIN blobs b ON b.sha256 = d.current_hash
-            ORDER BY i.display_name
-            LIMIT ?
-            """,
-            (MAX_SEARCH_SCAN_ROWS,),
+        where, params = self._search_where(filters)
+        document_rows = self.conn.execute(
+            f"SELECT DISTINCT document_id FROM items WHERE {where} ORDER BY document_id LIMIT 10001",
+            tuple(params),
         ).fetchall()
+        truncated = len(document_rows) > 10000
+        document_ids = [int(row["document_id"]) for row in document_rows[:10000]]
+        if not document_ids:
+            return [], truncated
+
+        placeholders = ",".join("?" for _ in document_ids)
+        rows = self.conn.execute(
+            self._item_select()
+            + f" WHERE i.document_id IN ({placeholders}) ORDER BY i.display_name, i.id",
+            tuple(document_ids),
+        ).fetchall()
+        tags = self._tags_for_item_ids(int(row["id"]) for row in rows)
+        resolve_path = self._folder_path_lookup()
         grouped: dict[int, list[Item]] = {}
         for row in rows:
-            item = self._item_from_row(row)
+            item = self._item_from_row(row, tags.get(int(row["id"]), ()))
             grouped.setdefault(item.document_id, []).append(item)
 
         results: list[tuple[str, Item]] = []
         for mirrors in grouped.values():
-            matching_mirrors = [item for item in mirrors if structured_name_matches(item.name_parts, filters)]
-            if not matching_mirrors:
-                continue
             remaining = limit - len(results)
-            results.extend((self.folder_path(item.folder_id), item) for item in mirrors[:remaining])
-            if len(results) >= limit:
+            if remaining <= 0:
+                truncated = True
                 break
-
-        return sorted(results, key=lambda result: (result[1].display_name.lower(), result[0].lower()))
+            if len(mirrors) > remaining:
+                truncated = True
+            results.extend((resolve_path(item.folder_id), item) for item in mirrors[:remaining])
+        return sorted(results, key=lambda result: (result[1].display_name.lower(), result[0].lower())), truncated
 
     def search_mirror_items(
         self,
@@ -1715,35 +1807,29 @@ class LibraryStore:
         subtitle: str = "",
         authors: str = "",
         limit: int = 500,
-    ) -> list[tuple[str, Item]]:
+    ) -> tuple[list[tuple[str, Item]], bool]:
         limit = max(1, min(int(limit), 5000))
         filters = (main_title.strip().lower(), subtitle.strip().lower(), authors.strip().lower())
+        where, params = self._search_where(filters)
         rows = self.conn.execute(
-            """
-            SELECT i.id, i.folder_id, i.document_id, i.display_name, i.name_data, b.sha256, b.size, b.mime,
-                   b.stored_path, d.updated_at
-            FROM items i
-            JOIN documents d ON d.id = i.document_id
-            JOIN blobs b ON b.sha256 = d.current_hash
-            ORDER BY i.display_name
-            LIMIT ?
-            """,
-            (MAX_SEARCH_SCAN_ROWS,),
+            self._item_select() + f" WHERE {where} ORDER BY i.display_name LIMIT ?",
+            tuple(params) + (limit + 1,),
         ).fetchall()
-        results: list[tuple[str, Item]] = []
-        for row in rows:
-            item = self._item_from_row(row)
-            if structured_name_matches(item.name_parts, filters):
-                results.append((self.folder_path(item.folder_id), item))
-                if len(results) >= limit:
-                    break
-        return sorted(results, key=lambda result: (result[1].display_name.lower(), result[0].lower()))
+        truncated = len(rows) > limit
+        rows = rows[:limit]
+        tags = self._tags_for_item_ids(int(row["id"]) for row in rows)
+        resolve_path = self._folder_path_lookup()
+        results = [
+            (resolve_path(int(row["folder_id"])), self._item_from_row(row, tags.get(int(row["id"]), ())))
+            for row in rows
+        ]
+        return sorted(results, key=lambda result: (result[1].display_name.lower(), result[0].lower())), truncated
 
-    def search_tagged_items(self, tag_query: str, limit: int = 500) -> list[tuple[str, Item]]:
+    def search_tagged_items(self, tag_query: str, limit: int = 500) -> tuple[list[tuple[str, Item]], bool]:
         limit = max(1, min(int(limit), 5000))
         query = tag_query.strip()
         if not query:
-            return []
+            return [], False
         rows = self.conn.execute(
             """
             SELECT DISTINCT i.id, i.folder_id, i.document_id, i.display_name, i.name_data, b.sha256, b.size,
@@ -1753,15 +1839,18 @@ class LibraryStore:
             JOIN blobs b ON b.sha256 = d.current_hash
             JOIN item_tags it ON it.item_id = i.id
             JOIN tags t ON t.id = it.tag_id
-            WHERE lower(t.name) LIKE ?
+            WHERE t.normalized_name LIKE ? ESCAPE '\\'
             ORDER BY i.display_name
             LIMIT ?
             """,
-            (f"%{query.lower()}%", limit),
+            (_like_contains(query.casefold()), limit + 1),
         ).fetchall()
-        results = [(self.folder_path(row["folder_id"]), self._item_from_row(row)) for row in rows]
-        return sorted(results, key=lambda result: (result[1].display_name.lower(), result[0].lower()))
-
-def structured_name_matches(parts: StructuredFileName, filters: tuple[str, str, str]) -> bool:
-    values = (parts.main_title.lower(), parts.subtitle.lower(), parts.authors.lower())
-    return all(not needle or needle in value for needle, value in zip(filters, values))
+        truncated = len(rows) > limit
+        rows = rows[:limit]
+        tags = self._tags_for_item_ids(int(row["id"]) for row in rows)
+        resolve_path = self._folder_path_lookup()
+        results = [
+            (resolve_path(int(row["folder_id"])), self._item_from_row(row, tags.get(int(row["id"]), ())))
+            for row in rows
+        ]
+        return sorted(results, key=lambda result: (result[1].display_name.lower(), result[0].lower())), truncated

@@ -21,6 +21,8 @@ def failure_details(error: BaseException | str, path: str = '', status: int = 40
         kind, msg = 'not_found', '请求的文件、文件夹或功能不存在，请刷新后重试'
     elif '请求内容过大' in text:
         kind, msg = 'request_too_large', '请求内容过大，请减少输入内容后重试'
+    elif '分页参数' in text:
+        kind, msg = 'invalid_pagination', '分页参数无效，请刷新列表后重试'
     elif getattr(error, 'error_type', '') == 'unsafe_file_type':
         kind, msg = 'unsafe_file_type', '该文件类型不允许用系统默认程序打开，请使用预览或手动处理'
     elif 'UnsafeUrl' in type(error).__name__:

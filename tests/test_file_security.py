@@ -102,8 +102,10 @@ class FileSecurityTests(unittest.TestCase):
                     1,
                     StructuredFileName("", "", f"Security Book {index}", "", "1", "", ".txt"),
                 )
-            self.assertEqual(len(store.search_mirror_items("Security", limit=2)), 2)
-            self.assertEqual(len(store.search_unique_documents("Security", limit=3)), 3)
+            mirrors, _truncated = store.search_mirror_items("Security", limit=2)
+            self.assertEqual(len(mirrors), 2)
+            unique, _truncated = store.search_unique_documents("Security", limit=3)
+            self.assertEqual(len(unique), 3)
         finally:
             store.close()
 

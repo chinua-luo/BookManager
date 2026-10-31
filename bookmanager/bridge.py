@@ -40,6 +40,8 @@ MAX_SEARCH_QUERY_LENGTH = 256
 MAX_IMPORT_FILES = 10_000
 MAX_IMPORT_FOLDERS = 5_000
 MAX_SEARCH_RESULTS = 500
+DEFAULT_FOLDER_PAGE_SIZE = 200
+MAX_FOLDER_PAGE_SIZE = 1000
 MAX_OPEN_CACHE_FILE_NAME_BYTES = 200
 REQUEST_SOCKET_TIMEOUT_SECONDS = 30
 CONTENT_SECURITY_POLICY = "; ".join(
@@ -425,7 +427,8 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             return
         folder_match = FOLDER_PATH_PATTERN.match(parsed.path)
         if folder_match:
-            self._send_folder_contents(int(folder_match.group("folder_id")))
+            offset, limit = self._folder_page_params(parsed.query)
+            self._send_folder_contents(int(folder_match.group("folder_id")), offset, limit)
             return
         item_open_match = ITEM_OPEN_PATH_PATTERN.match(parsed.path)
         if item_open_match:
@@ -704,16 +707,16 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         try:
             kind = str(payload.get("kind", ""))
             if kind == "files":
-                results = store.search_unique_documents(str(payload.get("mainTitle", "")), str(payload.get("subtitle", "")), str(payload.get("authors", "")), MAX_SEARCH_RESULTS)
+                results, truncated = store.search_unique_documents(str(payload.get("mainTitle", "")), str(payload.get("subtitle", "")), str(payload.get("authors", "")), MAX_SEARCH_RESULTS)
             elif kind == "mirrors":
-                results = store.search_mirror_items(str(payload.get("mainTitle", "")), str(payload.get("subtitle", "")), str(payload.get("authors", "")), MAX_SEARCH_RESULTS)
+                results, truncated = store.search_mirror_items(str(payload.get("mainTitle", "")), str(payload.get("subtitle", "")), str(payload.get("authors", "")), MAX_SEARCH_RESULTS)
             elif kind == "tags":
-                results = store.search_tagged_items(str(payload.get("query", "")), MAX_SEARCH_RESULTS)
+                results, truncated = store.search_tagged_items(str(payload.get("query", "")), MAX_SEARCH_RESULTS)
             else:
                 raise ValueError("请选择搜索范围")
             results = results[:MAX_SEARCH_RESULTS]
-            self._operation_details.update({"scope": kind, "match_count": len(results)})
-            self._send_json(HTTPStatus.OK, {"kind": kind, "results": [{"folderPath": folder_path, "item": item_payload(item)} for folder_path, item in results]})
+            self._operation_details.update({"scope": kind, "match_count": len(results), "truncated": truncated})
+            self._send_json(HTTPStatus.OK, {"kind": kind, "results": [{"folderPath": folder_path, "item": item_payload(item)} for folder_path, item in results], "truncated": truncated})
         finally:
             store.close()
 
@@ -911,11 +914,23 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             for folder in store.folders(parent_id)
         ]
 
-    def _send_folder_contents(self, folder_id: int) -> None:
+    def _folder_page_params(self, query: str) -> tuple[int, int]:
+        params = urllib.parse.parse_qs(query, keep_blank_values=False)
+        try:
+            offset = int(params.get("offset", ["0"])[0])
+            limit = int(params.get("limit", [str(DEFAULT_FOLDER_PAGE_SIZE)])[0])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("分页参数无效") from exc
+        if offset < 0 or limit < 1:
+            raise ValueError("分页参数无效")
+        return offset, min(limit, MAX_FOLDER_PAGE_SIZE)
+
+    def _send_folder_contents(self, folder_id: int, offset: int = 0, limit: int = DEFAULT_FOLDER_PAGE_SIZE) -> None:
         store = self.server.open_store()
         try:
             folder = store.get_folder(folder_id)
             stats = store.folder_stats(folder_id)
+            items, total = store.list_items_page(folder_id, offset, limit)
             payload = {
                 "folder": {"id": folder.id, "parentId": folder.parent_id, "name": folder.name},
                 "stats": {
@@ -928,7 +943,13 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                     {"id": child.id, "parentId": child.parent_id, "name": child.name}
                     for child in store.folders(folder_id)
                 ],
-                "items": [item_payload(item) for item in store.list_items(folder_id)],
+                "items": [item_payload(item) for item in items],
+                "pagination": {
+                    "offset": offset,
+                    "limit": limit,
+                    "total": total,
+                    "hasMore": offset + len(items) < total,
+                },
             }
         except ValueError as exc:
             self._send_failure(exc, HTTPStatus.NOT_FOUND)

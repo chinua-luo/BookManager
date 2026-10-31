@@ -59,6 +59,21 @@ class StoreQueryTests(unittest.TestCase):
         # One query for the page, one for all of its tags; no per-row lookups.
         self.assertLessEqual(len(statements), 3, statements)
 
+
+    def test_list_items_page_returns_a_stable_slice_and_total(self) -> None:
+        first_page, total = self.store.list_items_page(1, 0, 2)
+        second_page, total_again = self.store.list_items_page(1, 2, 2)
+        last_page, _ = self.store.list_items_page(1, 4, 2)
+        self.assertEqual(total, 4)
+        self.assertEqual(total_again, 4)
+        self.assertEqual(len(first_page), 2)
+        self.assertEqual(len(second_page), 2)
+        self.assertEqual(last_page, [])
+        self.assertEqual(
+            [item.display_name for item in first_page + second_page],
+            sorted(item.display_name for item in self.store.list_items(1)),
+        )
+
     def test_folder_stats_uses_recursive_descendants(self) -> None:
         sibling = self.store.create_folder(1, "Sibling")
         nested = self.store.create_folder(sibling, "Nested")
