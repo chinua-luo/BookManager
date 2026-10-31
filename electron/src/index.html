@@ -11,14 +11,14 @@
         <nav id="app-menu" aria-label="主菜单">
           <details><summary>添加</summary><div class="menu-popup"><button data-action="import-file">导入文件</button><button data-action="add-folder">添加文件夹</button></div></details>
           <button class="toolbar-button" data-action="create-folder">新建文件夹</button>
-          <details><summary>打开</summary><div class="menu-popup"><button data-action="open-selected">打开文件</button><button data-action="show-location-selected">打开底层</button></div></details>
+          <details id="open-menu"><summary id="open-menu-summary">打开</summary><div class="menu-popup"><button data-action="open-selected">打开文件</button><button data-action="show-location-selected">打开底层</button></div></details>
           <button class="toolbar-button" data-action="rename-selected">按规则重命名</button>
           <button class="toolbar-button" data-action="save-text">保存打开缓存改动</button>
           <button class="toolbar-button" data-action="crawl">爬取系列</button>
           <details><summary>设置</summary><div class="menu-popup"><button data-action="data-location">数据位置</button><button data-action="cache-settings">缓存管理</button></div></details>
           <details><summary>帮助</summary><div class="menu-popup"><button data-action="help">功能介绍</button><button data-action="shortcuts">快捷键</button></div></details>
         </nav>
-        <span id="status">正在连接资料库…</span>
+        <span id="status" role="status" aria-live="polite">正在连接资料库…</span>
         <button id="search-button" class="toolbar-button" data-action="search">搜索</button>
       </header>
       <section class="workspace">

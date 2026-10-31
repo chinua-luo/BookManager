@@ -1,5 +1,7 @@
 :root { font-family: "Segoe UI", Arial, sans-serif; color: #1e2932; background: #f6f7f8; }
 * { box-sizing: border-box; }
+button:focus-visible, summary:focus-visible, [tabindex]:focus-visible { outline: 2px solid #357391; outline-offset: -2px; }
+button:disabled, select:disabled, input:disabled, textarea:disabled { opacity: 0.55; cursor: default; }
 body { margin: 0; overflow: hidden; }
 #app { height: 100vh; display: grid; grid-template-rows: 44px minmax(0, 1fr); }
 .toolbar { display: flex; align-items: stretch; gap: 0; overflow: visible; padding: 0 14px; background: #fff; border-bottom: 1px solid #cfd5d8; }
@@ -28,6 +30,7 @@ h1 { font-size: 16px; min-height: 28px; overflow: hidden; text-overflow: ellipsi
 .preview-title-track { display: inline-block; min-width: max-content; white-space: pre; }
 .preview-title-track.marquee { animation: preview-title-marquee var(--marquee-duration) linear infinite; }
 @keyframes preview-title-marquee { from { transform: translateX(0); } to { transform: translateX(calc(-1 * var(--marquee-shift))); } }
+@media (prefers-reduced-motion: reduce) { .preview-title-track.marquee { animation: none; } }
 h2 { font-size: 13px; }
 .panel-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
 #content-count { color: #69737b; font-size: 12px; }
@@ -38,7 +41,9 @@ h2 { font-size: 13px; }
 #folder-tree details[open] > summary::before { transform: rotate(90deg); }
 #folder-tree details:not(:has(> ul)) > summary::before { visibility: hidden; }
 #folder-tree button { border: 0; background: none; flex: 1; min-width: 0; padding: 4px 6px; text-align: left; color: #27343d; border-radius: 3px; }
-#folder-tree button:hover, #folder-tree button:focus, .content-row:hover, .content-row:focus, .content-row.selected { background: #e8f0f3; outline: 0; }
+#folder-tree button:hover, .content-row:hover, .content-row.selected { background: #e8f0f3; }
+#folder-tree button:focus-visible, .content-row:focus-visible { outline: 2px solid #357391; outline-offset: -2px; }
+#folder-tree button.current { background: #d9e9f0; box-shadow: inset 3px 0 #357391; font-weight: 600; }
 .content-row { width: 100%; display: grid; grid-template-columns: 50px minmax(0, 1fr) auto; align-items: center; gap: 8px; border: 0; border-bottom: 1px solid #edf0f1; background: #fff; padding: 8px 5px; color: #27343d; text-align: left; }
 .content-row span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: center; }
 .content-row small { color: #69737b; font-size: 11px; }
@@ -60,6 +65,9 @@ h2 { font-size: 13px; }
 .viewer-host[hidden], .djvu-viewer-host[hidden] { display: none !important; }
 .text-preview { width: 100%; height: 100%; margin: 0; overflow: auto; padding: 14px; white-space: pre-wrap; color: #26353e; background: #fff; font: 13px/1.55 ui-monospace, Menlo, monospace; }
 .folder-summary { max-width: 440px; margin: 36px auto; padding: 20px; }
+.preview-error { display: grid; justify-items: start; gap: 12px; max-width: 440px; margin: 48px auto; padding: 22px; border: 1px solid #d9e0e3; background: #fff; }
+.preview-error h2 { font-size: 15px; }
+.preview-error .dialog-hint { margin: 0; }
 .folder-summary dl { display: grid; grid-template-columns: 1fr auto; gap: 10px 20px; }
 .folder-summary dt { color: #69737b; }.folder-summary dd { margin: 0; font-variant-numeric: tabular-nums; }
 .djvu-viewer-host { width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden; background: #e8ecee; }
@@ -97,6 +105,9 @@ h2 { font-size: 13px; }
 .modal-warning > header { border-left: 4px solid #a67519; }
 .modal-success > header { border-left: 4px solid #36794c; }
 .dialog-button:disabled { opacity: 0.55; cursor: wait; }
+.menu-popup button:disabled, .context-menu button:disabled { opacity: 0.55; cursor: default; }
+.toolbar-button:disabled, #app-menu summary.disabled { color: #9aa7ae; cursor: default; }
+.toolbar-button:disabled:hover, #app-menu summary.disabled:hover { background: transparent; }
 
 .name-field-error { color: #c33b35; display: block; margin-top: 4px; }
 .form-grid input[aria-invalid="true"] { border-color: #c33b35; }

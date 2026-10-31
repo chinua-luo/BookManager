@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { createModalManager } from '../src/modal-manager.js'
+import { dialogKeyAction, focusTrapTarget } from '../src/dialog-keyboard.js'
 import { userError, businessError, notificationFromError, importSummary, crawlSummary, createFatalReporter } from '../user-errors.mjs'
 
 function harness() {
@@ -116,12 +117,12 @@ function domHarness() {
     focus() {}
     async click() { if (!this.disabled) for (const fn of this.listeners.get('click') || []) await fn({}) }
   }
-  const document = { createElement(tag) { const node = new Node(); node.tag = tag; return node }, activeElement: null }
+  const document = { createElement(tag) { const node = new Node(); node.tag = tag; return node }, activeElement: null, listeners: new Map(), addEventListener(type, fn) { const list = this.listeners.get(type) || []; list.push(fn); this.listeners.set(type, list) }, removeEventListener(type, fn) { this.listeners.set(type, (this.listeners.get(type) || []).filter(value => value !== fn)) } }
   const root = new Node(); const failures = []
   const start = renderer.indexOf('function modal('); const end = renderer.indexOf('function tagValues(', start)
-  const make = new Function('document', 'modalRoot', 'modalManager', 'element', 'error', `${renderer.slice(start, end)}; return { modal, ask, promptValue }`)
+  const make = new Function('document', 'modalRoot', 'modalManager', 'element', 'error', 'dialogKeyAction', 'focusTrapTarget', `${renderer.slice(start, end)}; return { modal, ask, promptValue }`)
   const element = (tag, className, text) => { const node = document.createElement(tag); node.className = className; node.textContent = text; return node }
-  const adapter = make(document, root, h.manager, element, issue => failures.push(issue))
+  const adapter = make(document, root, h.manager, element, issue => failures.push(issue), dialogKeyAction, focusTrapTarget)
   return { ...h, ...adapter, document, root, failures }
 }
 
@@ -269,4 +270,54 @@ test('production modal refuses dismissal until the guarded import outcome is res
   dialog.close()
   assert.equal(dismissed, 1)
   assert.equal(h.root.children.length, 0)
+})
+
+test('document-level modal keyboard closes on Escape and detaches the listener', () => {
+  const h = domHarness()
+  h.modal('设置', h.document.createElement('div'), { buttons: [{ label: '关闭', primary: true, action: close => close() }] })
+  assert.equal(h.root.children.length, 1)
+  const listeners = h.document.listeners.get('keydown') || []
+  assert.equal(listeners.length, 1)
+  const event = { key: 'Escape', target: {}, defaultPrevented: false, preventDefault() { this.defaultPrevented = true } }
+  listeners[0](event)
+  assert.equal(event.defaultPrevented, true)
+  assert.equal(h.root.children.length, 0)
+  assert.equal((h.document.listeners.get('keydown') || []).length, 0)
+})
+
+test('Enter submits the primary action except inside textareas and IME composition', async () => {
+  const h = domHarness()
+  let saves = 0
+  h.modal('设置', h.document.createElement('div'), { buttons: [{ label: '保存', primary: true, action: async () => { saves++ } }] })
+  const keydown = (h.document.listeners.get('keydown') || [])[0]
+  const press = (target, extra = {}) => keydown({ key: 'Enter', target, defaultPrevented: false, preventDefault() {}, ...extra })
+  press({ tagName: 'TEXTAREA' })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(saves, 0)
+  press({ tagName: 'INPUT', readOnly: true })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(saves, 0)
+  press({ tagName: 'INPUT' }, { isComposing: true })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(saves, 0)
+  press({ tagName: 'INPUT' })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(saves, 1)
+})
+
+test('a hidden parent dialog ignores Escape while the nested dialog owns the keyboard', () => {
+  const h = domHarness()
+  h.modal('父窗口', h.document.createElement('div'), { buttons: [{ label: '关闭', primary: true, action: close => close() }] })
+  h.modal('子窗口', h.document.createElement('div'), { nested: true, buttons: [{ label: '关闭', primary: true, action: close => close() }] })
+  assert.equal(h.root.children.length, 2)
+  const listeners = h.document.listeners.get('keydown') || []
+  assert.equal(listeners.length, 2)
+  const event = { key: 'Escape', target: {}, defaultPrevented: false, preventDefault() { this.defaultPrevented = true } }
+  listeners[0](event)
+  assert.equal(event.defaultPrevented, false)
+  listeners[1](event)
+  assert.equal(event.defaultPrevented, true)
+  h.tick()
+  assert.equal(h.root.children.length, 1)
+  assert.equal((h.document.listeners.get('keydown') || []).length, 1)
 })

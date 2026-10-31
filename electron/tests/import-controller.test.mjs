@@ -16,12 +16,23 @@ test('request and draft are persisted before import; success clears the draft', 
   const state = storage(); const sent = []
   const controller = createImportController({ storage: state, libraryId: 'library', newId: () => 'request-1', api: { post: async (path, body) => {
     assert.equal(state.values.size, 1)
+    assert.equal(controller.lastRequestId, 'request-1')
     sent.push({ path, body }); return result
   } } })
   assert.deepEqual(await controller.run(payload), result)
   assert.deepEqual(sent, [{ path: '/api/import/file', body: { ...payload, requestId: 'request-1', libraryId: 'library' } }])
   assert.equal(controller.pending, null)
+  assert.equal(controller.lastRequestId, null)
   assert.equal(state.values.size, 0)
+})
+
+test('confirming a recovered success also clears the support request identifier', async () => {
+  const state = storage()
+  state.setItem('bookmanager.pendingImport.library', JSON.stringify({ requestId: 'request-1', payload }))
+  const controller = createImportController({ storage: state, libraryId: 'library', api: { get: async () => ({ state: 'success', result }), post: async () => { throw new Error('must not repost') } } })
+  assert.equal(controller.lastRequestId, 'request-1')
+  assert.deepEqual(await controller.run(payload), result)
+  assert.equal(controller.lastRequestId, null)
 })
 
 test('server success with lost response is recovered without creating another import', async () => {
@@ -37,6 +48,7 @@ test('unknown outcome locks the original draft across restart and returns the co
   const controller = createImportController({ storage: state, libraryId: 'library', newId: () => 'request-1', api: { post: async () => { posts++; throw issue('backend') }, get: async () => ({ state: 'pending' }) } })
   await assert.rejects(controller.run(payload), error => notificationFromError(error).errorType === 'import_unknown')
   assert.deepEqual(controller.pending, { requestId: 'request-1', payload })
+  assert.equal(controller.lastRequestId, 'request-1')
   await assert.rejects(controller.run({ ...payload, folderIds: [3] }), error => notificationFromError(error).errorType === 'request_conflict')
   const recovered = createImportController({ storage: state, libraryId: 'library', api: { get: async path => { assert.equal(path, '/api/import/requests/request-1'); return { state: 'success', result } }, post: async () => { throw new Error('must not repost') } } })
   assert.deepEqual(await recovered.run(payload), result)

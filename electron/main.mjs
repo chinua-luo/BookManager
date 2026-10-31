@@ -203,10 +203,12 @@ async function showItemLocation(itemId, fallbackDocumentName = '') {
     documentName = result.documentName
     shell.showItemInFolder(result.path)
     await logOperation({ event: 'file.show_underlying', message: '在文件管理器中显示底层文件', documentName, result: 'success', durationMs: performance.now() - started })
+    return true
   } catch (error) {
     await logOperation({ event: 'file.show_underlying', message: '在文件管理器中显示底层文件', documentName, result: 'failure', error: error instanceof Error ? error.message : String(error), durationMs: performance.now() - started })
     if (notificationFromError(error).level === 'fatal') return false
     mainWindow?.webContents.send('business-error', { ...userError(error), title: '打开底层位置失败', msg: '无法打开文件所在位置，请检查文件是否存在及访问权限', errorType: 'location_failed' })
+    return false
   }
 }
 

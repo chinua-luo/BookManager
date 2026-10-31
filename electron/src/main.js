@@ -15,6 +15,11 @@ import { businessError, notificationFromError, importSummary, crawlSummary } fro
 import { submitNameForm } from './name-validation.js'
 import { createImportController, importSummaryText } from './import-controller.js'
 import { folderTargets, MAX_IMPORT_TARGETS } from './folder-targets.js'
+import { createRequestSequence } from './request-sequence.js'
+import { isNavigationKey, nextRowIndex } from './selection.js'
+import { dialogKeyAction, focusTrapTarget, isContextMenuKey } from './dialog-keyboard.js'
+import { acceleratorFromKeyboardEvent } from './shortcut-capture.js'
+import { createPreviewResourceManager, waitForLayout } from './preview-lifecycle.js'
 import './style.css'
 
 const $ = selector => document.querySelector(selector)
@@ -22,11 +27,18 @@ const folderTree = $('#folder-tree'); const contentList = $('#content-list')
 const contentTitle = $('#content-title'); const contentCount = $('#content-count')
 const previewTitle = $('#preview-title'); const preview = $('#preview'); const status = $('#status')
 const appMenu = $('#app-menu'); const contextElement = $('#context-menu'); const modalRoot = $('#modal-root')
+const openMenuSummary = $('#open-menu-summary')
 const workspace = $('.workspace'); const workspaceSplitter = $('#workspace-splitter')
 const textExtensions = new Set(['.txt', '.md', '.py', '.json', '.xml', '.html', '.htm', '.css', '.js', '.csv', '.log'])
 let libraryId = null; let importController = null
 let tree = []; let selectedFolderId = null; let selectedItem = null; let contextTarget = null; let shortcuts = {}; let doubleClickDelayMs = 600
 const sortModes = new Map()
+const expandedFolderIds = new Set()
+const folderRequests = createRequestSequence()
+const refreshRequests = createRequestSequence()
+const rowItems = new WeakMap()
+const rowFolders = new WeakMap()
+let contextReturnFocus = null
 
 function setSidebarWidth(requestedWidth, persist = false) {
   const bounds = workspace.getBoundingClientRect()
@@ -69,6 +81,15 @@ const viewer = mountViewer(viewerHost, { options: { rendererMode: 'replace', ren
 viewerHost.hidden = true
 const djvuHost = document.createElement('div'); djvuHost.className = 'djvu-viewer-host'; djvuHost.hidden = true; preview.append(djvuHost)
 const djvuPreview = createDjvuPreview(djvuHost)
+const previewResources = createPreviewResourceManager({
+  unloadViewer: reason => {
+    try {
+      const api = viewer.getApi?.()
+      if (!api?.unload) return Promise.resolve()
+      return Promise.resolve(api.unload(reason)).catch(issue => console.warn('释放预览资源失败:', issue))
+    } catch (issue) { console.warn('释放预览资源失败:', issue); return Promise.resolve() }
+  }
+})
 
 function message(value) { status.textContent = value }
 const modalManager = createModalManager()
@@ -99,21 +120,13 @@ function setPreviewTitle(title) {
     })
   })
 }
-function clearPreview() { viewerHost.hidden = true; djvuHost.hidden = true; [...preview.children].forEach(node => { if (node !== viewerHost && node !== djvuHost) node.remove() }) }
-function showPreviewNode(node) { clearPreview(); preview.append(node) }
-function showViewerHost() { clearPreview(); viewerHost.hidden = false }
-function showDjvuHost() { clearPreview(); djvuHost.hidden = false }
+function clearPreview() { previewResources.release(); viewerHost.hidden = true; djvuHost.hidden = true; [...preview.children].forEach(node => { if (node !== viewerHost && node !== djvuHost) node.remove() }) }
+function showPreviewNode(node) { clearPreview(); previewResources.begin('html'); preview.append(node) }
+function showViewerHost() { clearPreview(); previewResources.begin('viewer'); viewerHost.hidden = false }
+function showDjvuHost() { clearPreview(); previewResources.begin('djvu'); djvuHost.hidden = false }
 
 function waitForViewerLayout(isCurrent) {
-  return new Promise(resolve => {
-    const check = () => {
-      if (!isCurrent()) { resolve(false); return }
-      const bounds = viewerHost.getBoundingClientRect()
-      if (viewerHost.isConnected && bounds.width > 0 && bounds.height > 0) { resolve(true); return }
-      requestAnimationFrame(check)
-    }
-    check()
-  })
+  return waitForLayout({ isCurrent, measure: () => viewerHost.getBoundingClientRect(), timeoutMs: 5000 })
 }
 
 const previewCoordinator = createPreviewCoordinator({
@@ -121,8 +134,14 @@ const previewCoordinator = createPreviewCoordinator({
   load: async (item, isCurrent) => {
     const extension = item.extension.toLowerCase()
     if (textExtensions.has(extension)) {
-      const url = await window.bookManager.documentUrl(item.documentId)
-      const content = await fetch(url).then(response => { if (!response.ok) throw new Error('预览失败'); return response.text() })
+      const controller = previewResources.beginText()
+      let content
+      try {
+        const url = await window.bookManager.documentUrl(item.documentId)
+        const response = await fetch(url, { signal: controller.signal })
+        if (!response.ok) throw new Error('预览失败')
+        content = await response.text()
+      } finally { previewResources.settleText(controller) }
       if (!isCurrent()) return
       const textPreview = document.createElement('pre'); textPreview.className = 'text-preview'; textPreview.textContent = content; showPreviewNode(textPreview)
       return
@@ -134,9 +153,12 @@ const previewCoordinator = createPreviewCoordinator({
       return
     }
     showViewerHost()
-    if (!(await waitForViewerLayout(isCurrent))) return
+    const layoutReady = await waitForViewerLayout(isCurrent)
+    if (!isCurrent()) return
+    if (!layoutReady) throw new Error('预览区域未能在限定时间内就绪')
     const url = await window.bookManager.documentUrl(item.documentId)
     if (!isCurrent()) return
+    await previewResources.settle()
     await viewer.load({ url, filename: item.displayName, size: item.size })
     if (isCurrent() && viewerHost.getBoundingClientRect().width > 0) {
       await viewer.fitToView({ mode: 'width', resize: 'until-interaction' })
@@ -166,7 +188,17 @@ function modal(title, content, options = {}) {
     finally { busy = false; controls.forEach(control => { control.disabled = false }) }
   }); footer.append(button) }
   const primary = footer.querySelector('.primary')
-  panel.addEventListener('keydown', event => { if (cover.hidden) return; if (event.key === 'Enter' && !event.defaultPrevented && !event.isComposing && primary) { event.preventDefault(); primary.click() } })
+  const onKeyDown = event => {
+    if (cover.hidden || event.defaultPrevented) return
+    const action = dialogKeyAction({ key: event.key, target: event.target, isComposing: event.isComposing, shiftKey: event.shiftKey, busy })
+    if (!action) return
+    if (action === 'submit') { event.preventDefault(); primary?.click(); return }
+    if (action === 'close') { event.preventDefault(); close(); return }
+    const controls = [...panel.querySelectorAll('input,button,textarea,select,[tabindex]')].filter(control => !control.disabled && control.tabIndex !== -1)
+    const next = focusTrapTarget(controls.length, controls.indexOf(document.activeElement), event.shiftKey)
+    if (next >= 0) { event.preventDefault(); controls[next]?.focus() }
+  }
+  document.addEventListener('keydown', onKeyDown, true)
   header.addEventListener('pointerdown', event => {
     if (event.button !== 0) return
     const bounds = panel.getBoundingClientRect(); const startX = event.clientX; const startY = event.clientY; const originX = bounds.left; const originY = bounds.top
@@ -176,21 +208,13 @@ function modal(title, content, options = {}) {
     header.addEventListener('pointermove', move); header.addEventListener('pointerup', end); header.addEventListener('pointercancel', end)
   })
   cover.addEventListener('mousedown', event => { if (event.target === cover && !busy) close() })
-  panel.addEventListener('keydown', event => {
-    if (cover.hidden) return
-    if (event.key === 'Tab') {
-      const controls = [...panel.querySelectorAll('input,button,textarea,select,[tabindex]')].filter(control => !control.disabled && control.tabIndex !== -1)
-      const first = controls[0]; const last = controls.at(-1)
-      if (controls.length && (event.shiftKey ? document.activeElement === first : document.activeElement === last)) { event.preventDefault(); (event.shiftKey ? last : first).focus() }
-    }
-    if (event.key === 'Escape' && !busy) { event.preventDefault(); close() } })
   panel.append(header, body, footer); cover.append(panel); cover.hidden = true; modalRoot.append(cover)
   const previousFocus = document.activeElement
   release = modalManager.show({
     allowChild: !options.level && !options.key,
     show: () => { modalRoot.hidden = false; cover.hidden = false; cover.inert = false; (panel.querySelector('input,button,textarea,select') || panel).focus() },
     hide: () => { cover.hidden = true; cover.inert = true },
-    dismiss: () => { cover.remove(); modalRoot.hidden = ![...modalRoot.children].some(child => !child.hidden); options.onDismiss?.(); if (previousFocus?.isConnected) previousFocus.focus() }
+    dismiss: () => { document.removeEventListener('keydown', onKeyDown, true); cover.remove(); modalRoot.hidden = ![...modalRoot.children].some(child => !child.hidden); options.onDismiss?.(); if (previousFocus?.isConnected) previousFocus.focus() }
   }, { key: options.key, dedup: options.dedup, nested: options.nested })
   return { close, panel, body, cover }
 }
@@ -210,7 +234,7 @@ async function openTagPicker(input) {
   modal('选择标签', content, { nested: true, buttons: [{ label: '取消', action: close => close() }, { label: '确定', primary: true, action: close => { input.value = [...selected.values()].join(', '); input.dispatchEvent(new Event('input', { bubbles: true })); close() } }] })
 }
 
-function closeContext() { contextTarget = null; contextElement.hidden = true; contextElement.replaceChildren() }
+function closeContext() { contextTarget = null; contextElement.hidden = true; contextElement.replaceChildren(); const returnFocus = contextReturnFocus; contextReturnFocus = null; if (returnFocus?.isConnected) returnFocus.focus() }
 function editableControl(target) { return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement }
 const inputHistory = new WeakMap()
 function rememberInput(input) {
@@ -242,21 +266,33 @@ document.addEventListener('keydown', event => {
   if (key === 'x') { void window.bookManager.clipboardWriteText(input.value.slice(start, end)); input.setRangeText('', start, end, 'start'); input.dispatchEvent(new Event('input', { bubbles: true })); return }
   window.bookManager.clipboardReadText().then(text => { input.setRangeText(text, start, end, 'end'); input.dispatchEvent(new Event('input', { bubbles: true })) }).catch(error)
 }, true)
-function contextButton(label, action, parent = contextElement) { const button = document.createElement('button'); button.type = 'button'; button.textContent = label; button.dataset.action = action; parent.append(button); return button }
-function openContext(event, target) {
-  event.preventDefault(); contextTarget = target; contextElement.replaceChildren()
+function contextButton(label, action, parent = contextElement) { const button = document.createElement('button'); button.type = 'button'; button.textContent = label; button.dataset.action = action; button.setAttribute('role', 'menuitem'); parent.append(button); return button }
+function showContext(target, clientX, clientY, focusFirst = false) {
+  contextTarget = target; contextElement.replaceChildren(); contextElement.setAttribute('role', 'menu'); contextElement.setAttribute('aria-label', target.kind === 'folder' ? '文件夹操作' : '文件操作')
   if (target.kind === 'folder') {
     contextButton('打开文件夹', 'folder-open'); contextButton('新建子文件夹', 'folder-create'); contextButton('重命名文件夹', 'folder-rename'); contextButton('移动', 'folder-move')
     const sortButton = contextButton('排序方式', '')
-    const sortMenu = document.createElement('div'); sortMenu.className = 'context-submenu'; sortMenu.hidden = true; sortMenu.style.top = '124px'
+    const sortMenu = document.createElement('div'); sortMenu.className = 'context-submenu'; sortMenu.hidden = true; sortMenu.style.top = '124px'; sortMenu.setAttribute('role', 'menu')
     contextButton(currentSort(target.folder.id) === '标准' ? '标准（当前）' : '标准', 'sort-standard', sortMenu)
     contextButton(currentSort(target.folder.id) === '序列' ? '序列（当前）' : '序列', 'sort-series', sortMenu)
-    sortButton.addEventListener('click', event => { event.stopPropagation(); sortMenu.hidden = !sortMenu.hidden })
+    sortButton.setAttribute('aria-haspopup', 'menu'); sortButton.setAttribute('aria-expanded', 'false')
+    sortButton.addEventListener('click', event => { event.stopPropagation(); sortMenu.hidden = !sortMenu.hidden; sortButton.setAttribute('aria-expanded', String(!sortMenu.hidden)) })
     contextElement.append(sortMenu); contextButton('删除文件夹', 'folder-delete')
   } else {
     contextButton('用系统默认方式打开', 'file-open'); contextButton('打开底层位置', 'file-location'); contextButton('复制文件名', 'file-copy'); contextButton('删除', 'file-delete'); contextButton('删除底层文件', 'file-delete-underlying'); contextButton('重命名', 'file-rename'); contextButton('移动', 'file-move'); contextButton('镜像到文件夹', 'file-mirror'); contextButton('替换底层文件', 'file-replace')
   }
-  contextElement.style.left = `${Math.min(event.clientX, window.innerWidth - 210)}px`; contextElement.style.top = `${Math.min(event.clientY, window.innerHeight - 340)}px`; contextElement.hidden = false
+  contextElement.style.left = `${Math.min(clientX, window.innerWidth - 210)}px`; contextElement.style.top = `${Math.min(clientY, window.innerHeight - 340)}px`; contextElement.hidden = false
+  if (focusFirst) contextElement.querySelector('button')?.focus()
+}
+function openContext(event, target) { event.preventDefault(); contextReturnFocus = null; showContext(target, event.clientX, event.clientY) }
+function contextRowTarget(row) { return rowItems.get(row) ? { kind: 'file', item: rowItems.get(row) } : rowFolders.get(row) ? { kind: 'folder', folder: rowFolders.get(row) } : null }
+function openContextForRow(row) {
+  if (!row) return false
+  const target = contextRowTarget(row); if (!target) return false
+  const bounds = row.getBoundingClientRect()
+  contextReturnFocus = row
+  showContext(target, Math.round(bounds.right - 8), Math.round(bounds.top + 8), true)
+  return true
 }
 
 async function chooseFolder(title, excludedId = null) {
@@ -411,9 +447,49 @@ async function nameDialog(title, item = null, sourcePath = null, options = {}) {
 }
 
 async function showItem(item) {
-  selectedItem = item; setPreviewTitle(item.displayName); await previewCoordinator.show(item).catch(issue => { console.error(issue); notice({ title: '预览失败', msg: '该文档无法预览，请尝试使用系统默认程序打开', errorType: 'preview_failed' }) })
+  setSelectedItem(item); setPreviewTitle(item.displayName)
+  try { await previewCoordinator.show(item) } catch (issue) { console.error(issue); previewCoordinator.invalidate(); previewError(item) }
 }
-function markContentSelection(button) { contentList.querySelectorAll('.content-row.selected').forEach(row => row.classList.remove('selected')); button.classList.add('selected') }
+function clearContentSelection() { contentList.querySelectorAll('.content-row.selected').forEach(row => { row.classList.remove('selected'); row.removeAttribute('aria-current') }) }
+function markContentSelection(button) {
+  clearContentSelection()
+  button.classList.add('selected'); button.setAttribute('aria-current', 'true')
+  setSelectedItem(rowItems.get(button) || null)
+}
+function setSelectedItem(item) { selectedItem = item || null; updateToolbarState() }
+function updateToolbarState() {
+  const available = Boolean(selectedItem)
+  appMenu.querySelectorAll('button[data-action="open-selected"],button[data-action="show-location-selected"],button[data-action="rename-selected"]').forEach(button => {
+    button.disabled = !available
+    if (available) button.removeAttribute('title'); else button.title = '请先选择文件'
+  })
+  openMenuSummary?.classList.toggle('disabled', !available)
+  if (!openMenuSummary) return
+  if (available) openMenuSummary.removeAttribute('aria-disabled'); else openMenuSummary.setAttribute('aria-disabled', 'true')
+}
+function markTreeSelection() {
+  folderTree.querySelectorAll('button[data-folder-id]').forEach(button => {
+    const current = Number(button.dataset.folderId) === selectedFolderId
+    button.classList.toggle('current', current)
+    if (current) button.setAttribute('aria-current', 'true'); else button.removeAttribute('aria-current')
+  })
+}
+function expandAncestors(id) {
+  const found = findFolder(id); if (!found) return
+  for (const folder of [...found.parents, found.folder]) expandedFolderIds.add(folder.id)
+  folderTree.querySelectorAll('details').forEach(details => {
+    const button = details.querySelector('summary > button')
+    if (button && expandedFolderIds.has(Number(button.dataset.folderId))) details.open = true
+  })
+}
+function previewError(item) {
+  const section = element('section', 'preview-error')
+  const button = element('button', 'dialog-button', '用系统默认程序打开'); button.type = 'button'
+  button.addEventListener('click', () => openDefault(item).catch(error))
+  section.append(element('h2', '', '无法预览此文件'), element('p', 'dialog-hint', '该文档无法预览，请尝试使用系统默认程序打开。'), button)
+  showPreviewNode(section)
+  message('预览失败：该文档无法预览，请尝试使用系统默认程序打开。')
+}
 function fileIconClass(extension) {
   const ext = String(extension || '').replace(/^\./, '').toLowerCase()
   if (ext === 'pdf') return 'file-icon-pdf'
@@ -426,20 +502,26 @@ function fileIconClass(extension) {
   if (['txt', 'md', 'log', 'json', 'xml', 'html', 'htm'].includes(ext)) return 'file-icon-text'
   return 'file-icon-other'
 }
-function fileRow(item) { const button = element('button', 'content-row file-row'); button.type = 'button'; button.append(element('span', `file-icon ${fileIconClass(item.extension)}`, item.extension.slice(1).toUpperCase() || 'FILE'), element('span', '', item.listName), element('small', '', size(item.size))); bindFileActivation(button, { select: () => markContentSelection(button), preview: () => showItem(item), open: () => openDefault(item), onError: error, delayMs: doubleClickDelayMs }); button.addEventListener('contextmenu', event => openContext(event, { kind: 'file', item })); return button }
+function fileRow(item) { const button = element('button', 'content-row file-row'); button.type = 'button'; rowItems.set(button, item); button.append(element('span', `file-icon ${fileIconClass(item.extension)}`, item.extension.slice(1).toUpperCase() || 'FILE'), element('span', '', item.listName), element('small', '', size(item.size))); bindFileActivation(button, { select: () => markContentSelection(button), preview: () => showItem(item), open: () => openDefault(item), onError: error, delayMs: doubleClickDelayMs }); button.addEventListener('contextmenu', event => openContext(event, { kind: 'file', item })); return button }
 async function selectFolder(id) {
-  selectedFolderId = id; selectedItem = null; const payload = await window.bookManager.folder(id)
+  const request = folderRequests.begin()
+  setSelectedItem(null); clearContentSelection(); previewCoordinator.invalidate(); expandAncestors(id)
+  const payload = await window.bookManager.folder(id)
+  if (!folderRequests.isCurrent(request)) return false
+  selectedFolderId = id; markTreeSelection()
   contentTitle.textContent = payload.folder.name; contentCount.textContent = `${payload.folders.length + payload.items.length} 项`; contentList.replaceChildren()
   ;[...payload.folders].sort((a, b) => a.name.localeCompare(b.name)).forEach(folder => {
-    const button = element('button', 'content-row folder-row'); button.type = 'button'; button.append(element('span', 'folder-icon', 'DIR'), element('span', '', folder.name))
-    button.addEventListener('click', () => { markContentSelection(button); selectFolder(folder.id).then(() => contentList.focus()).catch(error) }); button.addEventListener('contextmenu', event => openContext(event, { kind: 'folder', folder })); contentList.append(button)
+    const button = element('button', 'content-row folder-row'); button.type = 'button'; rowFolders.set(button, folder); button.append(element('span', 'folder-icon', 'DIR'), element('span', '', folder.name))
+    button.addEventListener('click', () => { markContentSelection(button); selectFolder(folder.id).then(rendered => { if (rendered) contentList.focus() }).catch(error) }); button.addEventListener('contextmenu', event => openContext(event, { kind: 'folder', folder })); contentList.append(button)
   })
   sortedItems(payload.items, id).forEach(item => contentList.append(fileRow(item))); folderSummary(payload)
+  return true
 }
-function renderTree(nodes) { const list = document.createElement('ul'); nodes.forEach((folder, index) => { const item = document.createElement('li'); const details = document.createElement('details'); details.open = index === 0; const summary = document.createElement('summary'); summary.addEventListener('click', event => { if (event.target === summary) selectFolder(folder.id).catch(error) }); const button = document.createElement('button'); button.type = 'button'; button.dataset.folderId = String(folder.id); button.textContent = folder.name; button.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); selectFolder(folder.id).catch(error) }); button.addEventListener('contextmenu', event => openContext(event, { kind: 'folder', folder })); summary.append(button); details.append(summary); if (folder.children.length) details.append(renderTree(folder.children)); item.append(details); list.append(item) }); return list }
-async function refresh(select = selectedFolderId) { const data = await window.bookManager.tree(); if (libraryId !== data.libraryId) { libraryId = data.libraryId; importController = createImportController({ api: window.bookManager, storage: localStorage, libraryId }) }; tree = data.folders; folderTree.replaceChildren(renderTree(tree)); const id = findFolder(select) ? select : tree[0]?.id; if (id) await selectFolder(id) }
+function renderTree(nodes) { const list = document.createElement('ul'); nodes.forEach(folder => { const item = document.createElement('li'); const details = document.createElement('details'); details.open = expandedFolderIds.has(folder.id); details.addEventListener('toggle', () => { if (details.open) expandedFolderIds.add(folder.id); else expandedFolderIds.delete(folder.id) }); const summary = document.createElement('summary'); summary.addEventListener('click', event => { if (event.target === summary) selectFolder(folder.id).catch(error) }); const button = document.createElement('button'); button.type = 'button'; button.dataset.folderId = String(folder.id); button.textContent = folder.name; if (folder.id === selectedFolderId) { button.classList.add('current'); button.setAttribute('aria-current', 'true') }; button.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); selectFolder(folder.id).catch(error) }); button.addEventListener('contextmenu', event => openContext(event, { kind: 'folder', folder })); rowFolders.set(button, folder); summary.append(button); details.append(summary); if (folder.children.length) details.append(renderTree(folder.children)); item.append(details); list.append(item) }); return list }
+async function refresh(select = selectedFolderId) { const request = refreshRequests.begin(); const data = await window.bookManager.tree(); if (!refreshRequests.isCurrent(request)) return false; if (libraryId !== data.libraryId) { libraryId = data.libraryId; importController = createImportController({ api: window.bookManager, storage: localStorage, libraryId }) }; tree = data.folders; folderTree.replaceChildren(renderTree(tree)); const id = findFolder(select) ? select : tree[0]?.id; if (id) return selectFolder(id); return true }
 
 async function openDefault(item = selectedItem) { if (!item) throw new Error('请先选择文件'); if (await window.bookManager.openDocument(item.id, item.displayName)) message(`已用系统默认方式打开：${item.displayName}`) }
+async function showLocation(item = selectedItem) { if (!item) throw new Error('请先选择文件'); if (await window.bookManager.showLocation(item.id, item.displayName)) message(`已在文件管理器中显示底层文件：${item.displayName}`) }
 async function createFolder(parent = selectedFolderId) { const name = await promptValue('新建文件夹', '文件夹名称'); if (!name) return; const result = await window.bookManager.post('/api/folders', { parentId: parent, name }); await refresh(result.folder.id); message('已新建文件夹。') }
 async function renameFolder(folder) { const name = await promptValue('重命名文件夹', '新的文件夹名称', folder.name); if (!name) return; await window.bookManager.post(`/api/folders/${folder.id}/rename`, { name }); await refresh(folder.id); message('文件夹已重命名。') }
 async function moveFolder(folder) { const target = await chooseFolder('选择移动目标文件夹', folder.id); if (!target) return; await window.bookManager.post(`/api/folders/${folder.id}/move`, { targetFolderId: target }); await refresh(folder.id); message('文件夹已移动。') }
@@ -468,7 +550,7 @@ async function replaceDocument(item) { const path = await window.bookManager.sel
 async function saveOpenCacheChanges() { message('正在检查打开缓存中的改动…'); const result = await window.bookManager.post('/api/open-cache/sync', {}); await refresh(selectedFolderId); message(result.saved ? `已保存 ${result.saved} 个缓存改动，所有镜像已同步更新。` : '打开缓存中没有需要保存的改动。') }
 
 function searchResults(result) {
-  previewCoordinator.invalidate(); selectedItem = null; setPreviewTitle(result.kind === 'files' ? '底层文件搜索结果' : result.kind === 'tags' ? '标签搜索结果' : '镜像文件搜索结果')
+  previewCoordinator.invalidate(); setSelectedItem(null); clearContentSelection(); setPreviewTitle(result.kind === 'files' ? '底层文件搜索结果' : result.kind === 'tags' ? '标签搜索结果' : '镜像文件搜索结果')
   const holder = document.createElement('section'); holder.className = 'search-results'; holder.style.cssText = 'height:100%;overflow:auto;padding:10px'
   const list = document.createElement('div'); list.className = 'result-list'
   const row = entry => { const button = element('button', 'result-row'); button.type = 'button'; button.append(element('span', '', entry.item.displayName), element('small', '', entry.folderPath), element('small', '', size(entry.item.size))); bindFileActivation(button, { preview: () => showItem(entry.item), open: () => openDefault(entry.item), onError: error, delayMs: doubleClickDelayMs }); button.addEventListener('contextmenu', event => openContext(event, { kind: 'file', item: entry.item })); return button }
@@ -495,26 +577,19 @@ function openSearch() {
 function confirmRecursiveRisk() {
   return new Promise(resolve => {
     let settled = false
-    let dialog
+    // Escape / backdrop dismissal is handled by the shared modal keyboard layer;
+    // keeping a second document listener here would close the dialog twice.
     const finish = (confirmed, close) => {
       if (settled) return
       settled = true
-      document.removeEventListener('keydown', onKeyDown, true)
       resolve(confirmed)
       close()
     }
-    const onKeyDown = event => {
-      if (event.key === 'Escape') finish(false, dialog.close)
-    }
     const warning = element('p', 'dialog-hint recursive-risk-text', '开启后软件会自动抓取当前页面内的同站链接。不可信网站可能触发异常网络请求。仅用于你信任的书籍站点。')
-    dialog = modal('风险提示', warning, { nested: true, key: 'recursive-risk', onDismiss: () => { if (!settled) { settled = true; document.removeEventListener('keydown', onKeyDown, true); resolve(false) } }, buttons: [
+    modal('风险提示', warning, { nested: true, key: 'recursive-risk', onDismiss: () => { if (!settled) { settled = true; resolve(false) } }, buttons: [
       { label: '取消', action: close => finish(false, close) },
       { label: '我已了解风险，确认开启', primary: true, action: close => finish(true, close) }
     ] })
-    dialog.cover.addEventListener('mousedown', event => {
-      if (event.target === dialog.cover) finish(false, dialog.close)
-    })
-    document.addEventListener('keydown', onKeyDown, true)
   })
 }
 
@@ -584,7 +659,22 @@ async function cacheSettings() {
   const current = (await window.bookManager.get('/api/settings')).cache
   const content = document.createElement('div'); content.className = 'form-grid'
   const policyNames = [...Object.keys(cachePresets), '自定义']
-  content.innerHTML = `<label class="span-2">清理方案<select class="dialog-select" data-key="policy">${policyNames.map(name => `<option${current.policy === name ? ' selected' : ''}>${name}</option>`).join('')}</select></label><label>打开缓存保留天数<input data-key="openDays" type="number" min="0" value="${current.openDays}"></label><label>渲染缓存保留天数<input data-key="renderDays" type="number" min="0" value="${current.renderDays}"></label><label>总缓存上限（GB）<input data-key="maxBytes" type="number" min="0" step="0.1" value="${(current.maxBytes / 1024 ** 3).toFixed(2)}"></label><label>回收目标容量（GB）<input data-key="targetBytes" type="number" min="0" step="0.1" value="${(current.targetBytes / 1024 ** 3).toFixed(2)}"></label><label class="span-2 cache-exit-toggle"><input data-key="clearOpenOnExit" type="checkbox"${current.clearOpenOnExit ? ' checked' : ''}>退出软件时清理打开缓存</label><p class="dialog-hint span-2">当前占用：打开缓存 ${size(current.usage.open_cache)}；渲染缓存 ${size(current.usage.render_cache)}</p>`
+  const field = (label, input, className = '') => { const wrapper = document.createElement('label'); if (className) wrapper.className = className; wrapper.textContent = label; wrapper.append(input); return wrapper }
+  const numberInput = (key, value, step = '') => { const input = document.createElement('input'); input.dataset.key = key; input.type = 'number'; input.min = '0'; if (step) input.step = step; input.value = String(value); return input }
+  const policy = document.createElement('select'); policy.className = 'dialog-select'; policy.dataset.key = 'policy'
+  policyNames.forEach(name => policy.append(new Option(name, name, false, current.policy === name)))
+  const exitToggle = document.createElement('input'); exitToggle.dataset.key = 'clearOpenOnExit'; exitToggle.type = 'checkbox'; exitToggle.checked = Boolean(current.clearOpenOnExit)
+  const exitField = document.createElement('label'); exitField.className = 'span-2 cache-exit-toggle'; exitField.append(exitToggle, document.createTextNode('退出软件时清理打开缓存'))
+  const usage = element('p', 'dialog-hint span-2', `当前占用：打开缓存 ${size(current.usage.open_cache)}；渲染缓存 ${size(current.usage.render_cache)}`)
+  content.append(
+    field('清理方案', policy, 'span-2'),
+    field('打开缓存保留天数', numberInput('openDays', current.openDays)),
+    field('渲染缓存保留天数', numberInput('renderDays', current.renderDays)),
+    field('总缓存上限（GB）', numberInput('maxBytes', (current.maxBytes / 1024 ** 3).toFixed(2), '0.1')),
+    field('回收目标容量（GB）', numberInput('targetBytes', (current.targetBytes / 1024 ** 3).toFixed(2), '0.1')),
+    exitField,
+    usage
+  )
   const value = key => content.querySelector(`[data-key="${key}"]`)
   value('policy').addEventListener('change', () => {
     const preset = cachePresets[value('policy').value]
@@ -600,30 +690,45 @@ async function cacheSettings() {
     { label: '保存设置', primary: true, action: async close => { const selected = value('policy').value; const requested = { openDays: Number(value('openDays').value), renderDays: Number(value('renderDays').value), maxGb: Number(value('maxBytes').value), targetGb: Number(value('targetBytes').value), clearOpenOnExit: value('clearOpenOnExit').checked }; const preset = cachePresets[selected]; const matchesPreset = preset && preset.openDays === requested.openDays && preset.renderDays === requested.renderDays && preset.maxGb === requested.maxGb && preset.targetGb === requested.targetGb && preset.clearOpenOnExit === requested.clearOpenOnExit; await window.bookManager.post('/api/settings/cache', { policy: matchesPreset ? selected : '自定义', openDays: requested.openDays, renderDays: requested.renderDays, maxBytes: Math.round(requested.maxGb * 1024 ** 3), targetBytes: Math.round(requested.targetGb * 1024 ** 3), clearOpenOnExit: requested.clearOpenOnExit }); close(); message('缓存设置已保存。') }}]
   })
 }
-function help() { const content = element('div', 'form-stack'); ['添加：导入文件或整个文件夹。', '新建文件夹：在当前文件夹下创建虚拟文件夹。', '打开：用系统默认程序打开文件，或显示底层 Hash 文件。', '按规则重命名：编辑系列、标题、版本、作者、备注与标签。', '保存打开缓存改动：把经系统默认程序修改的缓存副本写回底层文件，并同步所有镜像。', '爬取系列：输入网址或 Springer 系列编号；高级选项可在确认风险后抓取当前页面的一层同站链接。', '右键菜单：文件夹可新建、重命名、移动、排序、删除；文件可打开、复制、移动、镜像、替换、删除。'].forEach(text => content.append(element('p', '', text))); modal('功能介绍', content, { buttons: [{ label: '关闭', primary: true, action: close => close() }] }) }
-async function shortcutDialog() { shortcuts = (await window.bookManager.get('/api/shortcuts')).shortcuts || {}; const actions = [['import-file', '导入文件'], ['create-folder', '新建文件夹'], ['open-selected', '打开文件'], ['rename-selected', '按规则重命名'], ['search', '搜索'], ['crawl', '爬取系列'], ['save-text', '保存打开缓存改动']]; const content = document.createElement('div'); content.className = 'shortcut-grid'; actions.forEach(([action, label]) => { const name = document.createElement('div'); name.textContent = label; const input = document.createElement('input'); input.readOnly = true; input.placeholder = '点击后按键设置；退格清除'; input.value = shortcuts[action] || ''; input.addEventListener('keydown', async event => { event.preventDefault(); const accelerator = event.key === 'Backspace' ? '' : `${event.metaKey || event.ctrlKey ? 'CommandOrControl+' : ''}${event.altKey ? 'Alt+' : ''}${event.shiftKey ? 'Shift+' : ''}${event.key.length === 1 ? event.key.toUpperCase() : event.key}`; try { shortcuts = (await window.bookManager.post('/api/settings/shortcuts', { action, accelerator })).shortcuts; input.value = shortcuts[action] || '' } catch (issue) { error(issue) } }); content.append(name, input) }); modal('快捷键', content, { wide: true, buttons: [{ label: '关闭', primary: true, action: close => close() }] }) }
+function help() { const content = element('div', 'form-stack'); ['添加：导入文件或整个文件夹。', '新建文件夹：在当前文件夹下创建虚拟文件夹。', '打开：用系统默认程序打开文件，或显示底层 Hash 文件。', '按规则重命名：编辑系列、标题、版本、作者、备注与标签。', '保存打开缓存改动：把经系统默认程序修改的缓存副本写回底层文件，并同步所有镜像。', '爬取系列：输入网址或 Springer 系列编号；高级选项可在确认风险后抓取当前页面的一层同站链接。', '右键菜单：文件夹可新建、重命名、移动、排序、删除；文件可打开、复制、移动、镜像、替换、删除。选中后也可按 Shift+F10 或菜单键打开，按 Escape 关闭。', '预览：单击文件预览，双击用系统默认程序打开。'].forEach(text => content.append(element('p', '', text))); modal('功能介绍', content, { buttons: [{ label: '关闭', primary: true, action: close => close() }] }) }
+async function shortcutDialog() { shortcuts = (await window.bookManager.get('/api/shortcuts')).shortcuts || {}; const actions = [['import-file', '导入文件'], ['create-folder', '新建文件夹'], ['open-selected', '打开文件'], ['rename-selected', '按规则重命名'], ['search', '搜索'], ['crawl', '爬取系列'], ['save-text', '保存打开缓存改动']]; const content = document.createElement('div'); content.className = 'shortcut-grid'; actions.forEach(([action, label]) => { const name = document.createElement('div'); name.textContent = label; const input = document.createElement('input'); input.readOnly = true; input.placeholder = '点击后按键设置；退格清除'; input.value = shortcuts[action] || ''; input.addEventListener('keydown', async event => { const accelerator = acceleratorFromKeyboardEvent(event); if (accelerator === null) return; event.preventDefault(); try { shortcuts = (await window.bookManager.post('/api/settings/shortcuts', { action, accelerator })).shortcuts; input.value = shortcuts[action] || '' } catch (issue) { error(issue) } }); content.append(name, input) }); modal('快捷键', content, { wide: true, buttons: [{ label: '关闭', primary: true, action: close => close() }] }) }
 
-async function contextAction(action) { const target = contextTarget; closeContext(); if (!target) return; const folder = target.folder; const item = target.item; if (action === 'folder-open') return selectFolder(folder.id); if (action === 'folder-create') return createFolder(folder.id); if (action === 'folder-rename') return renameFolder(folder); if (action === 'folder-move') return moveFolder(folder); if (action === 'folder-delete') return deleteFolder(folder); if (action === 'sort-standard' || action === 'sort-series') { sortModes.set(folder.id, action === 'sort-series' ? '序列' : '标准'); await selectFolder(selectedFolderId); message(`当前文件夹及子文件夹已按“${sortModes.get(folder.id)}”排序。`); return } if (action === 'file-open') return openDefault(item); if (action === 'file-location') return window.bookManager.showLocation(item.id, item.displayName); if (action === 'file-copy') { await window.bookManager.copyFileName(item.displayName); message('已复制文件名。'); return } if (action === 'file-delete') return deleteItem(item); if (action === 'file-delete-underlying') return deleteUnderlying(item); if (action === 'file-rename') return renameItem(item); if (action === 'file-move') return moveItem(item); if (action === 'file-mirror') return mirrorItem(item); if (action === 'file-replace') return replaceDocument(item) }
-async function action(name) { closeMenus(); if (name === 'import-file') return importFile(); if (name === 'add-folder') return importFolder(); if (name === 'create-folder') return createFolder(); if (name === 'open-selected') return openDefault(); if (name === 'show-location-selected') { if (!selectedItem) throw new Error('请先选择文件'); return window.bookManager.showLocation(selectedItem.id, selectedItem.displayName) } if (name === 'rename-selected') return renameItem(); if (name === 'save-text') return saveOpenCacheChanges(); if (name === 'crawl') return crawl(); if (name === 'data-location') return dataLocation(); if (name === 'cache-settings') return cacheSettings(); if (name === 'help') return help(); if (name === 'shortcuts') return shortcutDialog(); if (name === 'search') return openSearch() }
+async function contextAction(action) { const target = contextTarget; closeContext(); if (!target) return; const folder = target.folder; const item = target.item; if (action === 'folder-open') return selectFolder(folder.id); if (action === 'folder-create') return createFolder(folder.id); if (action === 'folder-rename') return renameFolder(folder); if (action === 'folder-move') return moveFolder(folder); if (action === 'folder-delete') return deleteFolder(folder); if (action === 'sort-standard' || action === 'sort-series') { sortModes.set(folder.id, action === 'sort-series' ? '序列' : '标准'); await selectFolder(selectedFolderId); message(`当前文件夹及子文件夹已按“${sortModes.get(folder.id)}”排序。`); return } if (action === 'file-open') return openDefault(item); if (action === 'file-location') return showLocation(item); if (action === 'file-copy') { await window.bookManager.copyFileName(item.displayName); message('已复制文件名。'); return } if (action === 'file-delete') return deleteItem(item); if (action === 'file-delete-underlying') return deleteUnderlying(item); if (action === 'file-rename') return renameItem(item); if (action === 'file-move') return moveItem(item); if (action === 'file-mirror') return mirrorItem(item); if (action === 'file-replace') return replaceDocument(item) }
+async function action(name) { closeMenus(); if (name === 'import-file') return importFile(); if (name === 'add-folder') return importFolder(); if (name === 'create-folder') return createFolder(); if (name === 'open-selected') return openDefault(); if (name === 'show-location-selected') return showLocation(); if (name === 'rename-selected') return renameItem(); if (name === 'save-text') return saveOpenCacheChanges(); if (name === 'crawl') return crawl(); if (name === 'data-location') return dataLocation(); if (name === 'cache-settings') return cacheSettings(); if (name === 'help') return help(); if (name === 'shortcuts') return shortcutDialog(); if (name === 'search') return openSearch() }
 
 function moveListSelection(event, container, folderIdForParent) {
-  if (!['ArrowUp', 'ArrowDown', 'ArrowLeft'].includes(event.key)) return
-  const rows = [...container.querySelectorAll('button')].filter(button => button.offsetParent !== null); if (!rows.length) return
   if (event.key === 'ArrowLeft') {
     const folderId = folderIdForParent(); const parent = findFolder(folderId)?.parents.at(-1)
     if (parent) { event.preventDefault(); selectFolder(parent.id).catch(error) }
     return
   }
+  // Leave Enter/Space and other keys to the focused button; only arrows move the row cursor.
+  if (!isNavigationKey(event.key)) return
+  const rows = [...container.querySelectorAll('button')].filter(button => button.offsetParent !== null); if (!rows.length) return
+  const next = nextRowIndex(rows.length, rows.indexOf(document.activeElement), event.key)
+  if (next < 0) return
   event.preventDefault()
-  const current = rows.indexOf(document.activeElement); const next = current < 0 ? (event.key === 'ArrowDown' ? 0 : rows.length - 1) : Math.max(0, Math.min(rows.length - 1, current + (event.key === 'ArrowDown' ? 1 : -1)))
   rows[next].focus(); if (container === contentList) markContentSelection(rows[next])
 }
-contentList.addEventListener('keydown', event => moveListSelection(event, contentList, () => selectedFolderId))
-folderTree.addEventListener('keydown', event => moveListSelection(event, folderTree, () => Number(document.activeElement?.dataset.folderId) || selectedFolderId))
+function focusedRow(container) {
+  const active = document.activeElement
+  if (active && container.contains(active) && active.matches?.('button')) return active
+  return container.querySelector('.content-row.selected, button.current')
+}
+contentList.addEventListener('keydown', event => {
+  if (isContextMenuKey(event)) { if (openContextForRow(focusedRow(contentList))) event.preventDefault(); return }
+  moveListSelection(event, contentList, () => selectedFolderId)
+})
+folderTree.addEventListener('keydown', event => {
+  if (isContextMenuKey(event)) { if (openContextForRow(focusedRow(folderTree))) event.preventDefault(); return }
+  moveListSelection(event, folderTree, () => Number(document.activeElement?.dataset.folderId) || selectedFolderId)
+})
 
 appMenu.querySelectorAll('summary').forEach(summary => summary.addEventListener('click', () => { for (const menu of appMenu.querySelectorAll('details')) if (menu !== summary.parentElement) menu.open = false }))
-appMenu.addEventListener('click', event => { const button = event.target.closest('button[data-action]'); if (button) action(button.dataset.action).catch(error) }); $('#search-button').addEventListener('click', () => action('search').catch(error)); contextElement.addEventListener('click', event => { const button = event.target.closest('button[data-action]'); if (button) contextAction(button.dataset.action).catch(error) }); document.addEventListener('pointerdown', event => { if (!appMenu.contains(event.target)) closeMenus(); if (!contextElement.hidden && !contextElement.contains(event.target)) closeContext() }, true); window.addEventListener('resize', () => { closeMenus(); closeContext() })
-window.addEventListener('keydown', event => { if ([...modalRoot.children].some(child => !child.hidden) || event.target.matches('input,textarea,select')) return; const key = `${event.metaKey || event.ctrlKey ? 'CommandOrControl+' : ''}${event.altKey ? 'Alt+' : ''}${event.shiftKey ? 'Shift+' : ''}${event.key.length === 1 ? event.key.toUpperCase() : event.key}`; const name = Object.entries(shortcuts).find(([, accelerator]) => accelerator === key)?.[0]; if (name) { event.preventDefault(); action(name).catch(error) } })
+openMenuSummary?.addEventListener('click', event => { if (selectedItem) return; event.preventDefault(); message('请先在文件列表中选择一个文件。') })
+appMenu.addEventListener('click', event => { const button = event.target.closest('button[data-action]'); if (button && !button.disabled) action(button.dataset.action).catch(error) }); $('#search-button').addEventListener('click', () => action('search').catch(error)); contextElement.addEventListener('click', event => { const button = event.target.closest('button[data-action]'); if (button) contextAction(button.dataset.action).catch(error) }); document.addEventListener('pointerdown', event => { if (!appMenu.contains(event.target)) closeMenus(); if (!contextElement.hidden && !contextElement.contains(event.target)) closeContext() }, true); document.addEventListener('keydown', event => { if (event.key !== 'Escape' || contextElement.hidden || [...modalRoot.children].some(child => !child.hidden)) return; event.preventDefault(); closeContext() }, true); window.addEventListener('resize', () => { closeMenus(); closeContext() })
+window.addEventListener('keydown', event => { if (event.repeat || [...modalRoot.children].some(child => !child.hidden) || event.target.matches('input,textarea,select')) return; const key = `${event.metaKey || event.ctrlKey ? 'CommandOrControl+' : ''}${event.altKey ? 'Alt+' : ''}${event.shiftKey ? 'Shift+' : ''}${event.key.length === 1 ? event.key.toUpperCase() : event.key}`; const name = Object.entries(shortcuts).find(([, accelerator]) => accelerator === key)?.[0]; if (name) { event.preventDefault(); action(name).catch(error) } })
+updateToolbarState()
 async function bootstrap() { doubleClickDelayMs = await window.bookManager.doubleClickDelay(); await refresh(); shortcuts = (await window.bookManager.get('/api/shortcuts')).shortcuts || {}; message(importController.restoreIssue ? '待确认导入记录无法读取，导入功能已暂停，请检查本地应用存储。' : importController.pending ? '上次导入结果待确认，请点击“导入文件”继续确认。' : '资料库已连接') }
 window.bookManager.onBusinessError(notice)
 bootstrap().catch(error); window.bookManager.onMenuAction(payload => { if (payload?.name) action(payload.name).catch(error) })

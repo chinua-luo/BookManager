@@ -29,9 +29,10 @@ export function createImportController({ api, storage, libraryId, newId = () => 
     restoreIssue = problem('import_state_unavailable', '无法读取待确认导入记录，为避免重复导入已暂停导入功能。请检查本地应用存储后重新打开程序。')
   }
   function clear() { storage.removeItem(key); pending = null }
+  function complete(result) { clear(); lastRequestId = null; return result }
   async function query() {
     const status = await api.get(`/api/import/requests/${pending.requestId}`)
-    if (status.state === 'success') { const result = status.result; clear(); return result }
+    if (status.state === 'success') return complete(status.result)
     if (status.state === 'failed') { clear(); throw problem(status.errorType, status.message) }
     return null
   }
@@ -54,8 +55,7 @@ export function createImportController({ api, storage, libraryId, newId = () => 
       }
       try {
         const result = await api.post('/api/import/file', { ...pending.payload, requestId: pending.requestId, libraryId })
-        clear()
-        return result
+        return complete(result)
       } catch (error) {
         if (notificationFromError(error).errorType === 'library_changed') throw error
         if (certainFailures.has(notificationFromError(error).errorType)) { clear(); throw error }
