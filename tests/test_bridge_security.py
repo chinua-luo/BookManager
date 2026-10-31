@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import http.client
+import json
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 
-from bookmanager.bridge import BridgeServer, CONTENT_SECURITY_POLICY, MAX_REQUEST_BODY_BYTES
+from bookmanager.bridge import (
+    BridgeRequestHandler,
+    BridgeServer,
+    CONTENT_SECURITY_POLICY,
+    MAX_OPEN_CACHE_FILE_NAME_BYTES,
+    MAX_REQUEST_BODY_BYTES,
+)
+from bookmanager.naming import StructuredFileName
 
 
 class BridgeSecurityTests(unittest.TestCase):
@@ -63,6 +71,78 @@ class BridgeSecurityTests(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertIn("请求内容过大".encode(), body)
+
+
+    def authorized(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.token}"}
+
+    def test_handler_enforces_a_thirty_second_socket_timeout(self) -> None:
+        self.assertEqual(BridgeRequestHandler.timeout, 30)
+
+    def test_open_rejects_dangerous_display_extension_before_copying(self) -> None:
+        store = self.server.open_store()
+        try:
+            source = self.root / "Safe.txt"
+            source.write_text("content", encoding="utf-8")
+            item_id = store.add_local_file(source, 1)
+            store.rename_item(item_id, StructuredFileName("", "", "Book", "", "1", "", ".exe"))
+        finally:
+            store.close()
+
+        status, _headers, body = self.request(
+            "GET", f"/api/items/{item_id}/open", self.authorized()
+        )
+
+        payload = json.loads(body)
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error_type"], "unsafe_file_type")
+        self.assertIn("不允许用系统默认程序打开", payload["msg"])
+        cache_root = self.server.library_home / "open_cache"
+        self.assertFalse(cache_root.exists() and any(cache_root.iterdir()))
+
+    def test_open_rejects_dangerous_underlying_extension(self) -> None:
+        store = self.server.open_store()
+        try:
+            source = self.root / "Book.exe"
+            source.write_text("content", encoding="utf-8")
+            item_id = store.add_local_file(source, 1)
+            store.rename_item(item_id, StructuredFileName("", "", "Book", "", "1", "", ".txt"))
+            item = store.get_item(item_id)
+        finally:
+            store.close()
+        self.assertEqual(item.stored_path.suffix.lower(), ".exe")
+        self.assertEqual(item.display_name, "Book.txt")
+
+        status, _headers, body = self.request(
+            "GET", f"/api/items/{item_id}/open", self.authorized()
+        )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body)["error_type"], "unsafe_file_type")
+
+    def test_long_chinese_names_are_truncated_but_keep_their_extension(self) -> None:
+        title = "超长中文书名" * 30
+        store = self.server.open_store()
+        try:
+            source = self.root / "Long.txt"
+            source.write_text("long content", encoding="utf-8")
+            item_id = store.add_local_file(
+                source, 1, StructuredFileName("", "", title, "", "1", "", ".txt")
+            )
+        finally:
+            store.close()
+
+        status, _headers, body = self.request(
+            "GET", f"/api/items/{item_id}/open", self.authorized()
+        )
+
+        payload = json.loads(body)
+        self.assertEqual(status, 200)
+        open_path = Path(payload["data"]["path"])
+        self.assertTrue(open_path.is_file())
+        self.assertLessEqual(len(open_path.name.encode("utf-8")), MAX_OPEN_CACHE_FILE_NAME_BYTES)
+        self.assertTrue(open_path.name.endswith(".txt"))
+        self.assertEqual(open_path.read_text(encoding="utf-8"), "long content")
 
 
 if __name__ == "__main__":

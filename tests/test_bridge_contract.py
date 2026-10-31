@@ -199,3 +199,84 @@ class BridgeContractTests(unittest.TestCase):
         self.assertEqual(result['level'], 'error')
         self.assertEqual(result['error_type'], 'permission_denied')
         self.assertNotIn('/private/cache', json.dumps(result))
+
+
+    def test_startup_applies_the_cache_policy_immediately(self):
+        with mock.patch.object(LibraryStore, 'cleanup_caches', return_value=0) as cleanup:
+            server = BridgeServer(('127.0.0.1', 0), self.root / 'cleanup-data', self.token, self.root)
+            try:
+                cleanup.assert_called_once_with('startup')
+            finally:
+                server.server_close()
+        self.assertTrue((self.root / 'cleanup-data' / 'library.db').is_file())
+
+    def test_data_migration_copies_then_writes_config_then_deletes_source(self):
+        import bookmanager.store as store_module
+
+        source = self.server.library_home
+        target = self.root / 'moved-data'
+        settings_path = self.root / 'settings.json'
+        events = []
+        real_copy = store_module.copy_library_home_atomically
+        real_delete = store_module.delete_library_source_data
+
+        def copy_spy(source_path, target_path):
+            events.append('copy')
+            return real_copy(source_path, target_path)
+
+        def delete_spy(source_path):
+            events.append('delete')
+            return real_delete(source_path)
+
+        def config_spy(_home):
+            events.append('config')
+
+        with (
+            mock.patch('bookmanager.store.SETTINGS_PATH', settings_path),
+            mock.patch('bookmanager.bridge.copy_library_home_atomically', side_effect=copy_spy),
+            mock.patch('bookmanager.bridge.delete_library_source_data', side_effect=delete_spy),
+            mock.patch('bookmanager.bridge.set_configured_library_home', side_effect=config_spy),
+        ):
+            status, result = self.request('/api/settings/data/migrate', {'path': str(target)})
+        self.assertEqual(status, 200)
+        self.assertTrue(result['ok'])
+        self.assertEqual(events, ['copy', 'config', 'delete'])
+        self.assertEqual(self.server.library_home, target.resolve())
+        self.assertTrue((target / 'library.db').is_file())
+        self.assertFalse((source / 'library.db').exists())
+
+    def test_data_migration_rolls_back_config_and_target_when_source_removal_fails(self):
+        source = self.server.library_home
+        target = self.root / 'moved-data'
+        settings_path = self.root / 'settings.json'
+
+        with (
+            mock.patch('bookmanager.store.SETTINGS_PATH', settings_path),
+            mock.patch('bookmanager.bridge.delete_library_source_data', side_effect=OSError('cannot delete source')),
+        ):
+            status, result = self.request('/api/settings/data/migrate', {'path': str(target)})
+
+        self.assertEqual(status, 400)
+        self.assertEqual(result['error_type'], 'migration_failed')
+        self.assertEqual(self.server.library_home, source)
+        self.assertEqual(json.loads(settings_path.read_text(encoding='utf-8'))['data_home'], str(source.resolve()))
+        self.assertFalse(target.exists())
+        self.assertTrue((source / 'library.db').is_file())
+
+    def test_data_migration_copy_failure_leaves_config_and_source_untouched(self):
+        source = self.server.library_home
+        target = self.root / 'moved-data'
+        settings_path = self.root / 'settings.json'
+
+        with (
+            mock.patch('bookmanager.store.SETTINGS_PATH', settings_path),
+            mock.patch('bookmanager.bridge.copy_library_home_atomically', side_effect=OSError('copy failed')),
+        ):
+            status, result = self.request('/api/settings/data/migrate', {'path': str(target)})
+
+        self.assertEqual(status, 400)
+        self.assertEqual(result['error_type'], 'migration_failed')
+        self.assertEqual(self.server.library_home, source)
+        self.assertFalse(settings_path.exists())
+        self.assertFalse(target.exists())
+        self.assertTrue((source / 'library.db').is_file())

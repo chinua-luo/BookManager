@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import datetime as dt
 import json
 import tempfile
 import threading
 import unittest
+import warnings
 from pathlib import Path
 from unittest import mock
 
 from bookmanager.diagnostics import diagnostic_scope, record_exception
-from bookmanager.store import CacheSettings, LibraryStore
+from bookmanager.store import CacheSettings, LibraryStore, utc_now
 
 
 class DiagnosticsTests(unittest.TestCase):
@@ -109,5 +111,41 @@ class DiagnosticsTests(unittest.TestCase):
                     self.assertTrue(cached.exists())
             self.assertEqual(cached.read_text(), 'changed')
             self.assertEqual(item.stored_path.read_text(), 'original')
+        finally:
+            store.close()
+
+    def test_utc_now_is_aware_utc_without_deprecation_warning(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            value = utc_now()
+        self.assertRegex(value, r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$')
+        dt.datetime.strptime(value, '%Y-%m-%dT%H:%M:%SZ')
+        self.assertEqual([warning for warning in caught if issubclass(warning.category, DeprecationWarning)], [])
+
+    def test_expected_cache_corruption_uses_specific_info_events(self):
+        store = LibraryStore(self.root / 'events')
+        try:
+            cache_dir = store.prepare_cache_directory('open_cache', 'entry')
+            (cache_dir / '.bookmanager-open.json').write_text('not json', encoding='utf-8')
+            with mock.patch('bookmanager.store.record_event') as event, mock.patch('bookmanager.store.record_exception') as exception:
+                self.assertEqual(store.sync_open_cache_changes(), 0)
+            event.assert_any_call('store.cache_manifest_invalid', data_home=store.home)
+            exception.assert_not_called()
+        finally:
+            store.close()
+
+    def test_invalid_historical_name_data_is_an_expected_info_event(self):
+        store = LibraryStore(self.root / 'names')
+        try:
+            source = self.root / 'Book.txt'
+            source.write_text('book', encoding='utf-8')
+            item_id = store.add_local_file(source, 1)
+            with store.conn:
+                store.conn.execute('UPDATE items SET name_data = ? WHERE id = ?', ('[]', item_id))
+            with mock.patch('bookmanager.store.record_event') as event, mock.patch('bookmanager.store.record_exception') as exception:
+                store._migrate_item_name_data()
+            event.assert_any_call('store.name_data_invalid')
+            exception.assert_not_called()
+            self.assertEqual(store.get_item(item_id).name_parts.extension, '.txt')
         finally:
             store.close()

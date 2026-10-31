@@ -7,6 +7,36 @@ from pathlib import Path
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
 MAX_ARCHIVE_MEMBER_BYTES = 32 * 1024 * 1024
 
+# These formats either execute code or launch scripts through the desktop shell.
+UNSAFE_SYSTEM_OPEN_EXTENSIONS = frozenset(
+    {
+        ".exe", ".bat", ".cmd", ".com", ".scr", ".pif", ".vbs", ".vbe", ".js", ".jse",
+        ".wsf", ".wsh", ".ps1", ".msi", ".msp", ".lnk", ".jar", ".app", ".command",
+        ".sh", ".bash", ".zsh", ".py", ".pl", ".rb", ".php", ".reg", ".hta", ".cpl",
+        ".dll", ".scf", ".msh", ".mshxml", ".gadget", ".inf", ".ins", ".isp", ".url",
+        ".search-ms",
+    }
+)
+
+
+class UnsafeFileTypeError(ValueError):
+    """A curated rejection for opening executable or script content with the desktop shell."""
+
+    error_type = "unsafe_file_type"
+
+
+def system_open_extension(value: str) -> str:
+    """Return the effective lowercase extension, matching Windows trailing-dot rules."""
+    name = Path(str(value).strip()).name.strip().rstrip(" .")
+    return Path(name).suffix.lower() if name else ""
+
+
+def ensure_safe_system_open(*values: str) -> None:
+    """Reject risky content before the desktop shell launches it with the default app."""
+    for value in values:
+        if system_open_extension(value) in UNSAFE_SYSTEM_OPEN_EXTENSIONS:
+            raise UnsafeFileTypeError("该文件类型不允许用系统默认程序打开，请使用预览或手动处理")
+
 
 def validate_supported_document(path: Path) -> None:
     """Reject mislabeled parser inputs before they reach third-party libraries."""

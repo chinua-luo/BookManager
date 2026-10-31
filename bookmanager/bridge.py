@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .crawler import crawl_into_library, new_crawl_stats
+from .file_security import ensure_safe_system_open
 from .importing import ImportProblem, import_file, import_status, target_ids, validate_request_id
 from .metadata import extract_metadata
 from .naming import NamingValidationError, StructuredFileName, build_structured_file_name, infer_structured_file_name
@@ -22,12 +23,11 @@ from .operation_log import OperationLogger
 from .diagnostics import diagnostic_scope, record_event, record_exception
 from .responses import response_envelope
 from .store import (
-    CACHE_POLICIES,
-    CACHE_POLICY_NAMES,
     CacheSettings,
     Item,
     LibraryStore,
-    migrate_library_home,
+    copy_library_home_atomically,
+    delete_library_source_data,
     normalize_tag_names,
     safe_name,
     set_configured_library_home,
@@ -40,6 +40,8 @@ MAX_SEARCH_QUERY_LENGTH = 256
 MAX_IMPORT_FILES = 10_000
 MAX_IMPORT_FOLDERS = 5_000
 MAX_SEARCH_RESULTS = 500
+MAX_OPEN_CACHE_FILE_NAME_BYTES = 200
+REQUEST_SOCKET_TIMEOUT_SECONDS = 30
 CONTENT_SECURITY_POLICY = "; ".join(
     (
         "default-src 'self'",
@@ -148,6 +150,21 @@ def name_parts_from_payload(payload: dict[str, Any], fallback_name: str = "") ->
     )
 
 
+def truncate_open_cache_file_name(file_name: str, max_bytes: int = MAX_OPEN_CACHE_FILE_NAME_BYTES) -> str:
+    """Keep cache copy names within filesystem byte limits without dropping the extension."""
+    if len(file_name.encode("utf-8")) <= max_bytes:
+        return file_name
+    suffix = Path(file_name).suffix
+    suffix_bytes = suffix.encode("utf-8")
+    budget = max_bytes - len(suffix_bytes)
+    if budget < 1:
+        suffix = ""
+        budget = max_bytes
+    stem = file_name[: -len(suffix)] if suffix else file_name
+    truncated = stem.encode("utf-8")[:budget].decode("utf-8", errors="ignore").strip()
+    return f"{truncated or 'bookmanager'}{suffix}"
+
+
 class BridgeServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], library_home: Path | None, token: str, static_dir: Path) -> None:
         super().__init__(address, BridgeRequestHandler)
@@ -158,6 +175,8 @@ class BridgeServer(ThreadingHTTPServer):
             initial_store = self.open_store()
             try:
                 self.library_home = initial_store.home
+                # Apply retention days and size limits as soon as the library is known.
+                initial_store.cleanup_caches("startup")
             finally:
                 initial_store.close()
         except Exception:
@@ -181,6 +200,7 @@ class BridgeServer(ThreadingHTTPServer):
 
 class BridgeRequestHandler(BaseHTTPRequestHandler):
     server: BridgeServer
+    timeout = REQUEST_SOCKET_TIMEOUT_SECONDS
 
     def log_message(self, _format: str, *_args: object) -> None:
         # Electron owns user-visible diagnostics; do not duplicate normal requests on stdout.
@@ -793,11 +813,32 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             return
         if target.exists() and any(target.iterdir()):
             raise ValueError("新的数据文件夹必须为空")
-        set_configured_library_home(target)
+        target_existed = target.exists()
+        copied = False
+        configured = False
         try:
-            migrate_library_home(source, target)
+            # Copy first: a failure here leaves both the source and the config untouched.
+            copied = copy_library_home_atomically(source, target)
+            set_configured_library_home(target)
+            configured = True
+            # Only remove the old copy after the new library and its config are durable.
+            delete_library_source_data(source)
         except Exception:
-            set_configured_library_home(source)
+            if configured:
+                try:
+                    set_configured_library_home(source)
+                except OSError as rollback_error:
+                    record_exception('data_home.config_rollback_failed', rollback_error, data_home=source)
+            if copied:
+                try:
+                    shutil.rmtree(target)
+                except OSError as cleanup_error:
+                    record_exception('data_home.target_cleanup_failed', cleanup_error, data_home=target)
+                if target_existed:
+                    try:
+                        target.mkdir(parents=True, exist_ok=True)
+                    except OSError as restore_error:
+                        record_exception('data_home.target_restore_failed', restore_error, data_home=target)
             raise
         self.server.library_home = target
         self.server.operation_logger.set_data_home(target)
@@ -830,12 +871,14 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         store = self.server.open_store()
         try:
             item = store.get_item(item_id)
+            ensure_safe_system_open(item.display_name, str(item.stored_path))
             cache_dir = store.prepare_cache_directory(
                 "open_cache", f"electron-open-{uuid.uuid4().hex}"
             )
             file_name = safe_name(item.display_name)
             if not Path(file_name).suffix and item.stored_path.suffix:
                 file_name += item.stored_path.suffix
+            file_name = truncate_open_cache_file_name(file_name)
             open_path = cache_dir / file_name
             shutil.copy2(item.stored_path, open_path)
             store.register_open_cache_copy(
@@ -1002,7 +1045,8 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         super().end_headers()
 
     def _send_failure(self, error: BaseException, status: HTTPStatus) -> None:
-        if isinstance(error, NamingValidationError) or getattr(error, 'import_error_type', '') in {'invalid_targets', 'target_missing', 'invalid_request_id', 'request_conflict', 'import_pending'}:
+        rejection_type = getattr(error, 'import_error_type', '') or getattr(error, 'error_type', '')
+        if isinstance(error, NamingValidationError) or rejection_type in {'invalid_targets', 'target_missing', 'invalid_request_id', 'request_conflict', 'import_pending', 'unsafe_file_type'}:
             record_event('bridge.validation_rejected', data_home=self.server.library_home, request_path=urllib.parse.urlparse(self.path).path, reason=str(error))
         else:
             record_exception('bridge.request_failed', error, data_home=self.server.library_home, request_path=urllib.parse.urlparse(self.path).path)

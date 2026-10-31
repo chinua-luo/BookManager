@@ -131,3 +131,16 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(raised.exception.error_type, 'data_corrupt')
         self.assertEqual(database.read_bytes(), b'corrupt legacy library')
         self.assertFalse((self.home / 'library.db').exists())
+
+    def test_successful_startup_migration_publishes_only_the_completed_library(self):
+        source = self.root / 'legacy'
+        store = LibraryStore(source)
+        store.close()
+        with mock.patch('bookmanager.store.DEFAULT_LIBRARY_HOME', self.home), mock.patch('bookmanager.store.PROJECT_LIBRARY_HOME', source), mock.patch('bookmanager.store.configured_library_home', return_value=None):
+            with mock.patch('bookmanager.startup.check_dependencies', return_value={}):
+                home, _capabilities = preflight(None, self.static)
+        self.assertEqual(home, self.home)
+        self.assertTrue((self.home / 'library.db').is_file())
+        self.assertFalse((source / 'library.db').exists())
+        self.assertEqual([path for path in self.root.iterdir() if path.name.startswith('.bookmanager-migration-')], [])
+        self.assertFalse((self.home / '.bookmanager-migration-complete').exists())

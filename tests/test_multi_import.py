@@ -6,6 +6,7 @@ import os
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -292,6 +293,86 @@ class MultiImportTests(unittest.TestCase):
                 self.run_import()
         self.assertEqual(self.counts(), [0, 0, 0])
         log.assert_any_call('import.cleanup_failed', data_home=self.store.home, request_id='request-1')
+
+
+    def test_delete_underlying_file_rolls_back_blob_when_database_fails(self):
+        self.run_import([self.a], 'original')
+        item = self.store.list_items(self.a)[0]
+        blob_path = item.stored_path
+        connection = self.store.conn
+
+        class FailingConnection:
+            def execute(self, sql, *parameters):
+                if 'DELETE FROM items' in sql:
+                    raise sqlite3.OperationalError('simulated write failure')
+                return connection.execute(sql, *parameters)
+
+            def __getattr__(self, name):
+                return getattr(connection, name)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return connection.__exit__(exc_type, exc, traceback)
+
+        self.store.conn = FailingConnection()
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                self.store.delete_underlying_file(item.id)
+        finally:
+            self.store.conn = connection
+        self.assertTrue(blob_path.is_file())
+        self.assertEqual(list(blob_path.parent.glob('.bookmanager-tmp-*')), [])
+        self.assertEqual(self.counts(), [1, 1, 1])
+        self.assertEqual(self.store.get_item(item.id).sha256, item.sha256)
+
+    def test_delete_underlying_file_removes_blob_and_every_mirror(self):
+        self.run_import([self.a, self.b], 'original')
+        item = self.store.list_items(self.a)[0]
+        blob_path = item.stored_path
+
+        self.assertEqual(self.store.delete_underlying_file(item.id), 2)
+
+        self.assertEqual(self.counts(), [0, 0, 0])
+        self.assertFalse(blob_path.exists())
+        self.assertEqual(list(blob_path.parent.glob('.bookmanager-tmp-*')), [])
+
+    def test_delete_underlying_file_hands_locked_temporary_files_to_startup_cleanup(self):
+        self.run_import([self.a], 'original')
+        item = self.store.list_items(self.a)[0]
+        blob_path = item.stored_path
+        original_unlink = Path.unlink
+
+        def locked_temp_unlink(path, *args, **kwargs):
+            if path.name.startswith('.bookmanager-tmp-'):
+                raise PermissionError('temporary file locked')
+            return original_unlink(path, *args, **kwargs)
+
+        with mock.patch('pathlib.Path.unlink', locked_temp_unlink), mock.patch('bookmanager.store.record_exception') as log:
+            self.assertEqual(self.store.delete_underlying_file(item.id), 1)
+        self.assertEqual(self.counts(), [0, 0, 0])
+        leftovers = list(blob_path.parent.glob('.bookmanager-tmp-*'))
+        self.assertEqual(len(leftovers), 1)
+        log.assert_any_call('store.blob_unlink_failed', mock.ANY, data_home=self.store.home)
+
+        old = time.time() - 25 * 60 * 60
+        os.utime(leftovers[0], (old, old))
+        self.store.close()
+        self.store = LibraryStore(self.root / 'data')
+        self.assertFalse(leftovers[0].exists())
+
+    def test_delete_underlying_file_accepts_already_missing_blob(self):
+        self.run_import([self.a], 'original')
+        item = self.store.list_items(self.a)[0]
+        item.stored_path.unlink()
+
+        with mock.patch('bookmanager.store.record_event') as log:
+            self.assertEqual(self.store.delete_underlying_file(item.id), 1)
+
+        self.assertEqual(self.counts(), [0, 0, 0])
+        log.assert_any_call('store.blob_already_missing', data_home=self.store.home)
+
 
 
 if __name__ == '__main__':

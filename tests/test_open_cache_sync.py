@@ -7,6 +7,7 @@ import time
 import unittest
 from pathlib import Path
 
+from bookmanager.bridge import MAX_OPEN_CACHE_FILE_NAME_BYTES, truncate_open_cache_file_name
 from bookmanager.store import LibraryStore
 
 
@@ -80,3 +81,9 @@ class OpenCacheSyncTests(unittest.TestCase):
         self.assertIn("/api/open-cache/sync", bridge)
         self.assertNotIn("replace-text", renderer)
         self.assertNotIn("replace-text", bridge)
+
+    def test_open_cache_copy_name_fits_filesystem_byte_limits(self) -> None:
+        name = truncate_open_cache_file_name('测' * 120 + '.pdf')
+        self.assertLessEqual(len(name.encode('utf-8')), MAX_OPEN_CACHE_FILE_NAME_BYTES)
+        self.assertTrue(name.endswith('.pdf'))
+        self.assertEqual(truncate_open_cache_file_name('Book.txt'), 'Book.txt')

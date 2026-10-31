@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from .diagnostics import record_exception, silent_background
+from .diagnostics import record_event, record_exception, silent_background
 from typing import Iterable, Optional
 
 from .naming import (
@@ -82,6 +82,8 @@ CACHE_POLICIES = {
 }
 CACHE_POLICY_NAMES = tuple(CACHE_POLICIES)
 OPEN_CACHE_MANIFEST = ".bookmanager-open.json"
+MIGRATION_STAGING_PREFIX = ".bookmanager-migration-"
+MIGRATION_COMPLETE_MARKER = ".bookmanager-migration-complete"
 _BLOB_WRITE_LOCK = threading.RLock()
 MAX_SEARCH_SCAN_ROWS = 50_000
 
@@ -104,7 +106,7 @@ def resolve_default_library_home() -> tuple[Path, bool]:
         except OSError:
             # Keep using the intact old library instead of opening an empty new one.
             # A later launch can retry the migration without changing the source.
-            record_exception('store.recovered')
+            record_event('store.migration_postponed', data_home=source, target=str(target))
             return source, False
         return target, True
     return target, False
@@ -117,7 +119,7 @@ def configured_library_home() -> Path | None:
         settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
         configured_path = str(settings.get("data_home", "")).strip()
     except (OSError, json.JSONDecodeError, TypeError):
-        record_exception('store.recovered')
+        record_event('store.settings_invalid', settings_path=str(SETTINGS_PATH))
         return None
     return Path(configured_path).expanduser() if configured_path else None
 
@@ -130,53 +132,94 @@ def set_configured_library_home(home: Path) -> None:
 
 
 def migrate_library_home(source: Path, target: Path) -> None:
-    """Move the complete data directory while preserving the installation files around it."""
+    """Copy the complete data directory atomically, then remove the old source files."""
+    if not copy_library_home_atomically(source, target):
+        return
+    delete_library_source_data(source)
+
+
+def copy_library_home_atomically(source: Path, target: Path) -> bool:
+    """Copy into a sibling staging directory and rename it to target only when complete.
+
+    A crash can therefore never leave a partial target library behind: the target
+    directory only appears through one atomic rename after every file is copied.
+    """
     source = source.expanduser().resolve()
     target = target.expanduser().resolve()
     if source == target:
-        return
+        return False
     if not source.joinpath("library.db").exists():
         raise OSError(f"找不到资料库数据库：{source / 'library.db'}")
-    if target.exists() and any(target.iterdir()):
+    if target.exists() and (not target.is_dir() or any(target.iterdir())):
         raise OSError(f"目标数据文件夹必须为空：{target}")
-
-    target.mkdir(parents=True, exist_ok=True)
-    copied_paths: list[Path] = []
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _remove_stale_migration_staging(target)
+    staging = target.parent / f"{MIGRATION_STAGING_PREFIX}{target.name}-{uuid.uuid4().hex}"
     try:
+        staging.mkdir()
         for name in LIBRARY_DATA_NAMES:
             source_path = source / name
-            target_path = target / name
             if not source_path.exists():
                 continue
+            target_path = staging / name
             if source_path.is_dir():
                 shutil.copytree(source_path, target_path)
             else:
                 shutil.copy2(source_path, target_path)
-            copied_paths.append(target_path)
-        _rewrite_blob_paths_in_database(target / "library.db", source / "blobs", target / "blobs")
-    except (OSError, sqlite3.Error) as exc:
-        for copied_path in reversed(copied_paths):
-            if copied_path.is_dir():
-                shutil.rmtree(copied_path, onerror=lambda _fn, _path, exc: record_exception('store.migration_cleanup_failed', exc[1]))
-            else:
-                copied_path.unlink(missing_ok=True)
-        try:
+        _rewrite_blob_paths_in_database(staging / "library.db", source / "blobs", target / "blobs")
+        (staging / MIGRATION_COMPLETE_MARKER).write_text(utc_now(), encoding="utf-8")
+        if target.exists():
             target.rmdir()
-        except OSError:
-            record_exception('store.recovered')
-            pass
-        raise OSError(f"迁移资料库失败：{exc}") from exc
+        os.replace(staging, target)
+    except BaseException as exc:
+        _remove_migration_staging(staging)
+        if isinstance(exc, (OSError, sqlite3.Error)):
+            record_exception('store.migration_failed', exc, data_home=source, target=str(target))
+            raise OSError(f"迁移资料库失败：{exc}") from exc
+        raise
+    try:
+        (target / MIGRATION_COMPLETE_MARKER).unlink()
+    except OSError:
+        record_exception('store.migration_marker_cleanup_failed', data_home=target)
+    return True
 
+
+def _remove_stale_migration_staging(target: Path) -> None:
+    """Drop staging directories left behind by an interrupted earlier migration."""
+    prefix = f"{MIGRATION_STAGING_PREFIX}{target.name}-"
+    try:
+        candidates = list(target.parent.iterdir())
+    except OSError:
+        return
+    for candidate in candidates:
+        if not candidate.name.startswith(prefix) or candidate.is_symlink() or not candidate.is_dir():
+            continue
+        _remove_migration_staging(candidate)
+
+
+def _remove_migration_staging(staging: Path) -> None:
+    if not staging.exists():
+        return
+    try:
+        shutil.rmtree(staging, onerror=lambda _function, path, details: record_exception('store.migration_cleanup_failed', details[1], data_home=path))
+    except OSError as exc:
+        record_exception('store.migration_cleanup_failed', exc, data_home=staging)
+
+
+def delete_library_source_data(source: Path) -> None:
+    """Remove the copied dataset from the old home now that the new home is in place."""
+    source = source.expanduser().resolve()
     for name in LIBRARY_DATA_NAMES:
         source_path = source / name
-        if source_path.is_dir():
-            shutil.rmtree(source_path, onerror=lambda _fn, _path, exc: record_exception('store.migration_cleanup_failed', exc[1]))
-        else:
-            try:
+        if not source_path.exists() and not source_path.is_symlink():
+            continue
+        try:
+            if source_path.is_dir() and not source_path.is_symlink():
+                shutil.rmtree(source_path, onerror=lambda _function, path, details: record_exception('store.migration_source_cleanup_failed', details[1], data_home=path))
+            else:
                 source_path.unlink(missing_ok=True)
-            except OSError:
-                record_exception('store.recovered')
-                pass
+        except OSError as exc:
+            record_exception('store.migration_source_cleanup_failed', exc, data_home=source)
 
 
 def _rewrite_blob_paths_in_database(db_path: Path, old_blob_dir: Path, new_blob_dir: Path) -> None:
@@ -202,7 +245,7 @@ def _rewrite_blob_paths_in_database(db_path: Path, old_blob_dir: Path, new_blob_
 
 
 def utc_now() -> str:
-    return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def safe_name(value: str, fallback: str = "Untitled") -> str:
@@ -249,7 +292,7 @@ def _atomic_copy_verified(source_path: Path, target_path: Path, expected_hash: s
             try:
                 temporary_path.chmod(0o600)
             except OSError:
-                record_exception('store.recovered')
+                record_exception('store.permission_apply_failed', data_home=target_path.parent)
                 pass
             os.replace(temporary_path, target_path)
             temporary_path = None
@@ -347,7 +390,10 @@ def _name_parts_from_json(value: str) -> StructuredFileName:
     try:
         data = json.loads(value)
     except (TypeError, json.JSONDecodeError):
-        record_exception('store.recovered')
+        record_event('store.name_data_invalid')
+        data = {}
+    if not isinstance(data, dict):
+        record_event('store.name_data_invalid')
         data = {}
     return StructuredFileName(
         series_abbr=str(data.get("series_abbr", "")),
@@ -365,12 +411,28 @@ def _note_from_json(value: str) -> str:
     try:
         data = json.loads(value)
     except (TypeError, json.JSONDecodeError):
-        record_exception('store.recovered')
+        record_event('store.name_data_invalid')
+        return ""
+    if not isinstance(data, dict):
+        record_event('store.name_data_invalid')
         return ""
     return _normalize_note(data.get("note", ""))
 
 
+_LEGACY_NAME_FORBIDDEN_CHARS = set('<>:"/\\|?*')
+
+
+def _clean_legacy_display_name(value: str) -> str:
+    """Make names saved by older versions safe for the current naming rules."""
+    cleaned = "".join(
+        "_" if ord(character) < 32 or ord(character) == 127 or character in _LEGACY_NAME_FORBIDDEN_CHARS else character
+        for character in str(value)
+    )
+    return " ".join(cleaned.split())
+
+
 def _legacy_name_parts(display_name: str) -> StructuredFileName:
+    display_name = _clean_legacy_display_name(display_name) or "Untitled"
     parsed = parse_structured_file_name(display_name)
     if parsed is not None:
         try:
@@ -388,7 +450,10 @@ def _legacy_name_parts(display_name: str) -> StructuredFileName:
         authors="",
         extension=path.suffix,
     )
-    build_structured_file_name(fallback)
+    try:
+        build_structured_file_name(fallback)
+    except ValueError:
+        fallback = StructuredFileName("", "", "Untitled", "", "1", "", "")
     return fallback
 
 
@@ -428,14 +493,14 @@ class LibraryStore:
             try:
                 directory.chmod(0o700)
             except OSError:
-                record_exception('store.recovered', data_home=self.home)
+                record_exception('store.permission_apply_failed', data_home=self.home)
                 pass
         for path in (self.db_path, self.db_path.with_name("library.db-wal"), self.db_path.with_name("library.db-shm")):
             if path.exists() and not path.is_symlink():
                 try:
                     path.chmod(0o600)
                 except OSError:
-                    record_exception('store.recovered', data_home=self.home)
+                    record_exception('store.permission_apply_failed', data_home=self.home)
                     pass
 
     @silent_background('cache.stale_temporary_cleanup_failed')
@@ -450,7 +515,7 @@ class LibraryStore:
                 if not path.is_symlink() and path.is_file() and path.stat().st_mtime < cutoff:
                     path.unlink()
             except OSError:
-                record_exception('store.recovered', data_home=self.home)
+                record_exception('store.temporary_cleanup_failed', data_home=self.home)
                 continue
 
     def shortcuts(self) -> dict[str, str]:
@@ -622,7 +687,7 @@ class LibraryStore:
                     continue
                 entries.append(((entry / file_name).stat().st_mtime_ns, entry))
             except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
-                record_exception('store.recovered', data_home=self.home)
+                record_event('store.cache_manifest_invalid', data_home=self.home)
                 continue
 
         # Later-edited open copies win when the same document was opened twice.
@@ -637,7 +702,7 @@ class LibraryStore:
             document_id = int(manifest["document_id"])
             file_name = str(manifest["file_name"])
         except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
-            record_exception('store.recovered', data_home=self.home)
+            record_event('store.cache_manifest_invalid', data_home=self.home)
             return False
 
         if Path(file_name).name != file_name:
@@ -648,7 +713,7 @@ class LibraryStore:
         try:
             cached_hash, _size = sha256_file(cached_path)
         except OSError:
-            record_exception('store.recovered', data_home=self.home)
+            record_exception('store.cache_entry_hash_failed', data_home=self.home)
             if strict:
                 raise
             return False
@@ -660,7 +725,7 @@ class LibraryStore:
         try:
             self.replace_document_content(document_id, cached_path)
         except (OSError, ValueError):
-            record_exception('store.recovered', data_home=self.home)
+            record_exception('store.open_cache_writeback_failed', data_home=self.home)
             if strict:
                 raise
             return False
@@ -670,7 +735,7 @@ class LibraryStore:
         try:
             os.utime(cache_dir, None)
         except OSError:
-            record_exception('store.recovered', data_home=self.home)
+            record_event('store.cache_touch_failed', data_home=self.home)
             pass
 
     def clear_cache(self, cache_name: str) -> int:
@@ -744,11 +809,11 @@ class LibraryStore:
                 try:
                     stored_path.unlink()
                 except FileNotFoundError:
-                    record_exception('store.recovered', data_home=self.home)
+                    record_event('store.blob_already_missing', data_home=self.home)
                     pass
                 except OSError:
                     # Keep the database entry if its file cannot be removed.
-                    record_exception('store.recovered', data_home=self.home)
+                    record_exception('store.blob_unlink_failed', data_home=self.home)
                     continue
 
                 with self.transaction():
@@ -780,7 +845,7 @@ class LibraryStore:
             try:
                 entries.append((path, path.stat().st_mtime, self._cache_entry_size(path)))
             except OSError:
-                record_exception('store.recovered', data_home=self.home)
+                record_event('store.cache_entry_stat_failed', data_home=self.home)
                 continue
         return entries
 
@@ -790,7 +855,7 @@ class LibraryStore:
             try:
                 return path.stat().st_size
             except OSError:
-                record_exception('store.recovered')
+                record_event('store.cache_entry_stat_failed')
                 return 0
         if not path.is_dir():
             return 0
@@ -801,7 +866,7 @@ class LibraryStore:
             try:
                 size += child.stat().st_size
             except OSError:
-                record_exception('store.recovered')
+                record_event('store.cache_entry_stat_failed')
                 continue
         return size
 
@@ -813,7 +878,7 @@ class LibraryStore:
             else:
                 path.unlink()
         except OSError:
-            record_exception('store.recovered')
+            record_exception('store.cache_entry_remove_failed')
             return 0
         return size
 
@@ -1156,12 +1221,7 @@ class LibraryStore:
             index += 1
         return f"{base} ({index})"
 
-    def _unique_item_name_parts(
-        self,
-        folder_id: int,
-        parts: StructuredFileName,
-        exclude_item_id: Optional[int] = None,
-    ) -> tuple[str, StructuredFileName]:
+    def _item_name_parts(self, parts: StructuredFileName) -> tuple[str, StructuredFileName]:
         parts = normalize_structured_file_name(parts)
         return build_structured_file_name(parts), parts
 
@@ -1253,7 +1313,7 @@ class LibraryStore:
                 )
                 document_id = int(cursor.lastrowid)
             parts = self._coerce_name_parts(name_parts, source_path.name)
-            name, parts = self._unique_item_name_parts(folder_id, parts)
+            name, parts = self._item_name_parts(parts)
             cursor = self.conn.execute(
                 """
                 INSERT INTO items(folder_id, document_id, display_name, name_data, created_at, updated_at)
@@ -1325,7 +1385,7 @@ class LibraryStore:
         parts = self._coerce_name_parts(name_parts, item.display_name) if name_parts is not None else item.name_parts
         now = utc_now()
         with self.transaction():
-            name, parts = self._unique_item_name_parts(target_folder_id, parts)
+            name, parts = self._item_name_parts(parts)
             cursor = self.conn.execute(
                 """
                 INSERT INTO items(folder_id, document_id, display_name, name_data, created_at, updated_at)
@@ -1379,7 +1439,7 @@ class LibraryStore:
         item = self.get_item(item_id)
         parts = self._coerce_name_parts(name_parts, item.display_name)
         with self.conn:
-            name, parts = self._unique_item_name_parts(item.folder_id, parts, exclude_item_id=item_id)
+            name, parts = self._item_name_parts(parts)
             self.conn.execute(
                 "UPDATE items SET display_name = ?, name_data = ?, updated_at = ? WHERE id = ?",
                 (name, _name_parts_to_json(parts, item.note if note is None else note), utc_now(), item_id),
@@ -1394,7 +1454,12 @@ class LibraryStore:
             self.conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
 
     def delete_underlying_file(self, item_id: int) -> int:
-        """Permanently remove a hash blob and every mirror that references it."""
+        """Permanently remove a hash blob and every mirror that references it.
+
+        The blob is first renamed to a temporary name in the same directory so a
+        failed database transaction can restore it; the temporary file is only
+        removed after the database commit succeeded.
+        """
         item = self.get_item(item_id)
         document_rows = self.conn.execute(
             "SELECT id FROM documents WHERE current_hash = ?",
@@ -1411,29 +1476,50 @@ class LibraryStore:
                 tuple(document_ids),
             ).fetchone()[0]
         )
+
+        original_path = item.stored_path
+        temporary_path = original_path.with_name(f".bookmanager-tmp-{uuid.uuid4().hex}")
+        renamed = False
         try:
-            item.stored_path.unlink()
+            original_path.rename(temporary_path)
+            renamed = True
         except FileNotFoundError:
-            record_exception('store.recovered', data_home=self.home)
-            pass
+            record_event('store.blob_already_missing', data_home=self.home)
         except OSError as exc:
             raise ValueError(f"无法删除底层文件：{exc}") from exc
 
-        with self.conn:
-            self.conn.execute(
-                f"DELETE FROM items WHERE document_id IN ({placeholders})",
-                tuple(document_ids),
-            )
-            self.conn.execute(
-                f"DELETE FROM documents WHERE id IN ({placeholders})",
-                tuple(document_ids),
-            )
-            self.conn.execute("DELETE FROM blobs WHERE sha256 = ?", (item.sha256,))
+        try:
+            with self.conn:
+                self.conn.execute(
+                    f"DELETE FROM items WHERE document_id IN ({placeholders})",
+                    tuple(document_ids),
+                )
+                self.conn.execute(
+                    f"DELETE FROM documents WHERE id IN ({placeholders})",
+                    tuple(document_ids),
+                )
+                self.conn.execute("DELETE FROM blobs WHERE sha256 = ?", (item.sha256,))
+        except BaseException:
+            if renamed:
+                try:
+                    temporary_path.rename(original_path)
+                except OSError as restore_error:
+                    record_exception('store.blob_restore_failed', restore_error, data_home=self.home)
+            raise
+
+        if renamed:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                record_event('store.blob_already_missing', data_home=self.home)
+            except OSError as exc:
+                # Startup cleanup removes stale temporary files on the next launch.
+                record_exception('store.blob_unlink_failed', exc, data_home=self.home)
         return item_count
 
     def move_item(self, item_id: int, target_folder_id: int) -> None:
         item = self.get_item(item_id)
-        name, parts = self._unique_item_name_parts(target_folder_id, item.name_parts, exclude_item_id=item_id)
+        name, parts = self._item_name_parts(item.name_parts)
         with self.conn:
             self.conn.execute(
                 "UPDATE items SET folder_id = ?, display_name = ?, name_data = ?, updated_at = ? WHERE id = ?",
@@ -1470,38 +1556,6 @@ class LibraryStore:
                 (now, document_id),
             )
         return document_id
-
-    def search(self, keyword: str) -> list[tuple[str, Item]]:
-        keyword = keyword.strip()
-        if not keyword:
-            return []
-        pattern = f"%{keyword}%"
-        rows = self.conn.execute(
-            """
-            SELECT i.id, i.folder_id, i.document_id, i.display_name, i.name_data, b.sha256, b.size, b.mime,
-                   b.stored_path, d.updated_at
-            FROM items i
-            JOIN documents d ON d.id = i.document_id
-            JOIN blobs b ON b.sha256 = d.current_hash
-            WHERE i.display_name LIKE ?
-            ORDER BY i.display_name
-            """,
-            (pattern,),
-        ).fetchall()
-        results: list[tuple[str, Item]] = [(self.folder_path(row["folder_id"]), self._item_from_row(row)) for row in rows]
-
-        for item in self._all_unique_documents():
-            if item.mime.startswith("text/") or item.stored_path.suffix.lower() in {".md", ".py", ".txt", ".csv", ".json", ".xml", ".html"}:
-                try:
-                    text = item.stored_path.read_text(encoding="utf-8", errors="ignore")
-                except OSError:
-                    record_exception('store.recovered', data_home=self.home)
-                    continue
-                if keyword.lower() in text.lower():
-                    path = self.folder_path(item.folder_id)
-                    if not any(existing.id == item.id for _, existing in results):
-                        results.append((path, item))
-        return results
 
     def search_unique_documents(
         self,
@@ -1593,21 +1647,6 @@ class LibraryStore:
         ).fetchall()
         results = [(self.folder_path(row["folder_id"]), self._item_from_row(row)) for row in rows]
         return sorted(results, key=lambda result: (result[1].display_name.lower(), result[0].lower()))
-
-    def _all_unique_documents(self) -> Iterable[Item]:
-        rows = self.conn.execute(
-            """
-            SELECT MIN(i.id) AS id, i.folder_id, i.document_id, i.display_name, i.name_data, b.sha256, b.size,
-                   b.mime, b.stored_path, d.updated_at
-            FROM items i
-            JOIN documents d ON d.id = i.document_id
-            JOIN blobs b ON b.sha256 = d.current_hash
-            GROUP BY i.document_id
-            ORDER BY i.display_name
-            """
-        ).fetchall()
-        return [self._item_from_row(row) for row in rows]
-
 
 def structured_name_matches(parts: StructuredFileName, filters: tuple[str, str, str]) -> bool:
     values = (parts.main_title.lower(), parts.subtitle.lower(), parts.authors.lower())

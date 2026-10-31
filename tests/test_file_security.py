@@ -7,7 +7,13 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from bookmanager.file_security import validate_supported_document
+from bookmanager.file_security import (
+    UNSAFE_SYSTEM_OPEN_EXTENSIONS,
+    UnsafeFileTypeError,
+    ensure_safe_system_open,
+    system_open_extension,
+    validate_supported_document,
+)
 from bookmanager.naming import StructuredFileName
 from bookmanager.store import LibraryStore, sha256_file
 
@@ -100,6 +106,29 @@ class FileSecurityTests(unittest.TestCase):
             self.assertEqual(len(store.search_unique_documents("Security", limit=3)), 3)
         finally:
             store.close()
+
+
+    def test_executable_and_script_extensions_are_rejected_for_system_open(self):
+        for extension in sorted(UNSAFE_SYSTEM_OPEN_EXTENSIONS):
+            with self.subTest(extension=extension), self.assertRaises(ValueError):
+                ensure_safe_system_open(f"Book{extension}")
+        for value in ("Book.EXE", "Book.Ps1", "Book.exe.", "Book.exe ", "Book.JS"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                ensure_safe_system_open(value)
+
+    def test_dangerous_open_error_is_stable_and_user_readable(self):
+        with self.assertRaises(UnsafeFileTypeError) as raised:
+            ensure_safe_system_open("setup.exe")
+        self.assertEqual(raised.exception.error_type, "unsafe_file_type")
+        self.assertIn("不允许用系统默认程序打开", str(raised.exception))
+
+    def test_document_extensions_remain_openable(self):
+        for value in ("Book.pdf", "Book.epub", "Book.djvu", "Book.txt", "Book.md", "Book.jpg", ""):
+            with self.subTest(value=value):
+                ensure_safe_system_open(value)
+        ensure_safe_system_open()
+        self.assertEqual(system_open_extension("Book.PDF"), ".pdf")
+        self.assertEqual(system_open_extension("Book.exe. "), ".exe")
 
 
 if __name__ == "__main__":
