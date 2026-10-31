@@ -265,7 +265,7 @@ def title_case(value: str) -> str:
             tokens[index] = f"{match.group('prefix')}{match.group('word').lower()}{match.group('suffix')}"
             continue
         tokens[index] = re.sub(
-            r"[A-Za-z]+(?:['’][sS])?",
+            r"[A-Za-z]+(?:[’'][A-Za-z]+)*",
             _capitalize_title_word,
             token,
         )
@@ -274,10 +274,16 @@ def title_case(value: str) -> str:
 
 def _capitalize_title_word(match: re.Match[str]) -> str:
     word = match.group(0)
-    possessive = re.search(r"(?P<apostrophe>['’])[sS]$", word)
-    stem = word[: possessive.start()] if possessive else word
-    capitalized = stem[:1].upper() + stem[1:].lower()
-    return capitalized + (f"{possessive.group('apostrophe')}s" if possessive else "")
+    letters = [character for character in word if character.isalpha()]
+    # Keep acronyms and brand spellings such as "AI", "HTML" and "iOS" untouched.
+    if any(character.isupper() for character in letters[1:]):
+        return word
+    apostrophe = re.search(r"[’']", word)
+    if apostrophe:
+        head = word[: apostrophe.start()]
+        tail = word[apostrophe.end():]
+        return f"{head[:1].upper()}{head[1:].lower()}{apostrophe.group(0)}{tail.lower()}"
+    return f"{word[:1].upper()}{word[1:].lower()}"
 
 
 def split_author_segment(value: str) -> tuple[str, str]:
@@ -378,6 +384,8 @@ def _validate_field(label: str, value: str, allow_dot: bool = False) -> None:
     text = value.strip()
     if not text:
         raise NamingValidationError(f"{label}不能为空", NAME_FIELD_KEYS[label])
+    if any(ord(character) < 32 or ord(character) == 127 for character in text):
+        raise NamingValidationError(f"{label}包含换行、制表符等控制字符，请删除后重试。", NAME_FIELD_KEYS[label])
     forbidden = WINDOWS_FORBIDDEN_CHARS - ({"."} if allow_dot else set())
     bad_chars = sorted(ch for ch in forbidden if ch in text)
     if bad_chars:
