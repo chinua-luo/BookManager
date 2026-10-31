@@ -13,6 +13,15 @@ test('renderer bridge paths are explicitly allowlisted', () => {
   assert.equal(allowedBridgePath('GET', '/api/import/requests/request-1'), true)
   assert.equal(allowedBridgePath('POST', '/api/import/requests/request-1'), false)
   assert.equal(allowedBridgePath('GET', '/api/import/requests/../settings'), false)
+  assert.equal(allowedBridgePath('GET', '/api/import/folder/progress/job-1'), true)
+  assert.equal(allowedBridgePath('GET', '/api/import/folder/progress/job_1-x'), true)
+  assert.equal(allowedBridgePath('GET', '/api/import/folder/progress/'), false)
+  assert.equal(allowedBridgePath('GET', '/api/import/folder/progress/../settings'), false)
+  assert.equal(allowedBridgePath('POST', '/api/import/folder/progress/job-1'), false)
+  assert.equal(allowedBridgePath('POST', '/api/import/folder/cancel/job-1'), true)
+  assert.equal(allowedBridgePath('POST', '/api/import/folder/cancel/'), false)
+  assert.equal(allowedBridgePath('POST', '/api/import/folder/cancel/job-1/../x'), false)
+  assert.equal(allowedBridgePath('GET', '/api/import/folder/cancel/job-1'), false)
   assert.equal(allowedBridgePath('POST', '/api/shutdown'), false)
   assert.equal(allowedBridgePath('GET', '/api/tree?token=secret'), false)
   assert.equal(allowedBridgePath('POST', '/../api/search'), false)
@@ -20,5 +29,7 @@ test('renderer bridge paths are explicitly allowlisted', () => {
 
 test('oversized renderer payloads are rejected', () => {
   assert.doesNotThrow(() => assertAllowedBridgeRequest('POST', '/api/search', { query: 'book' }))
+  assert.doesNotThrow(() => assertAllowedBridgeRequest('POST', '/api/import/folder/cancel/job-1', {}))
+  assert.doesNotThrow(() => assertAllowedBridgeRequest('GET', '/api/import/folder/progress/job-1'))
   assert.throws(() => assertAllowedBridgeRequest('POST', '/api/search', { query: 'x'.repeat(1024 * 1024) }))
 })

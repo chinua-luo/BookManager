@@ -1,11 +1,4 @@
-import { mountViewer } from '@file-viewer/web'
-import ebookRenderer from '@file-viewer/renderer-epub'
-import imageRenderer from '@file-viewer/renderer-image'
-import pdfRenderer from '@file-viewer/renderer-pdf'
-import pptxRenderer from '@file-viewer/renderer-pptx'
-import spreadsheetRenderer from '@file-viewer/renderer-spreadsheet'
-import textRenderer from '@file-viewer/renderer-text'
-import wordRenderer from '@file-viewer/renderer-word'
+import { viewerLoader } from './viewer-loader.js'
 import { createDjvuPreview, isDjvuExtension } from './djvu-preview.js'
 import { bindFileActivation } from './file-activation.js'
 import { createPreviewCoordinator } from './preview-coordinator.js'
@@ -17,6 +10,7 @@ import { createImportController, importSummaryText } from './import-controller.j
 import { folderTargets, MAX_IMPORT_TARGETS } from './folder-targets.js'
 import { createRequestSequence } from './request-sequence.js'
 import { createPaginationState, LOAD_MORE_THRESHOLD_PX, mergePage, nextPageOffset, PAGE_SIZE, paginationCountText, shouldLoadMore } from './pagination.js'
+import { normalizeProgress, PROGRESS_POLL_INTERVAL_MS, progressText, shouldStopPolling } from './import-progress.js'
 import { isNavigationKey, nextRowIndex } from './selection.js'
 import { dialogKeyAction, focusTrapTarget, isContextMenuKey } from './dialog-keyboard.js'
 import { acceleratorFromKeyboardEvent } from './shortcut-capture.js'
@@ -81,14 +75,26 @@ window.addEventListener('resize', () => {
 })
 
 const viewerHost = document.createElement('div'); viewerHost.className = 'viewer-host'; preview.append(viewerHost)
-const viewer = mountViewer(viewerHost, { options: { rendererMode: 'replace', renderers: [pdfRenderer, wordRenderer, spreadsheetRenderer, pptxRenderer, ebookRenderer, imageRenderer, textRenderer], locale: 'zh-CN', theme: 'light', toolbar: false, search: false, fit: 'width', pdf: { defaultNavigationVisible: false, thumbnails: false } } })
 viewerHost.hidden = true
+let viewer = null
+let viewerPromise = null
+const viewerOptions = { rendererMode: 'replace', locale: 'zh-CN', theme: 'light', toolbar: false, search: false, fit: 'width', pdf: { defaultNavigationVisible: false, thumbnails: false } }
+function ensureViewer() {
+  if (viewer) return Promise.resolve(viewer)
+  if (!viewerPromise) {
+    viewerPromise = viewerLoader.load().then(({ mountViewer, renderers }) => {
+      viewer = mountViewer(viewerHost, { options: { ...viewerOptions, renderers } })
+      return viewer
+    }).catch(issue => { viewerPromise = null; throw issue })
+  }
+  return viewerPromise
+}
 const djvuHost = document.createElement('div'); djvuHost.className = 'djvu-viewer-host'; djvuHost.hidden = true; preview.append(djvuHost)
 const djvuPreview = createDjvuPreview(djvuHost)
 const previewResources = createPreviewResourceManager({
   unloadViewer: reason => {
     try {
-      const api = viewer.getApi?.()
+      const api = viewer?.getApi?.()
       if (!api?.unload) return Promise.resolve()
       return Promise.resolve(api.unload(reason)).catch(issue => console.warn('释放预览资源失败:', issue))
     } catch (issue) { console.warn('释放预览资源失败:', issue); return Promise.resolve() }
@@ -162,10 +168,12 @@ const previewCoordinator = createPreviewCoordinator({
     if (!layoutReady) throw new Error('预览区域未能在限定时间内就绪')
     const url = await window.bookManager.documentUrl(item.documentId)
     if (!isCurrent()) return
+    const activeViewer = await ensureViewer()
+    if (!isCurrent()) return
     await previewResources.settle()
-    await viewer.load({ url, filename: item.displayName, size: item.size })
+    await activeViewer.load({ url, filename: item.displayName, size: item.size })
     if (isCurrent() && viewerHost.getBoundingClientRect().width > 0) {
-      await viewer.fitToView({ mode: 'width', resize: 'until-interaction' })
+      await activeViewer.fitToView({ mode: 'width', resize: 'until-interaction' })
     }
   }
 })
@@ -570,7 +578,26 @@ async function selectFolder(id) {
   appendPage(payload); folderSummary(payload)
   return true
 }
-function renderTree(nodes) { const list = document.createElement('ul'); nodes.forEach(folder => { const item = document.createElement('li'); const details = document.createElement('details'); details.open = expandedFolderIds.has(folder.id); details.addEventListener('toggle', () => { if (details.open) expandedFolderIds.add(folder.id); else expandedFolderIds.delete(folder.id) }); const summary = document.createElement('summary'); summary.addEventListener('click', event => { if (event.target === summary) selectFolder(folder.id).catch(error) }); const button = document.createElement('button'); button.type = 'button'; button.dataset.folderId = String(folder.id); button.textContent = folder.name; if (folder.id === selectedFolderId) { button.classList.add('current'); button.setAttribute('aria-current', 'true') }; button.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); selectFolder(folder.id).catch(error) }); button.addEventListener('contextmenu', event => openContext(event, { kind: 'folder', folder })); rowFolders.set(button, folder); summary.append(button); details.append(summary); if (folder.children.length) details.append(renderTree(folder.children)); item.append(details); list.append(item) }); return list }
+function renderTree(nodes) { const list = document.createElement('ul'); nodes.forEach(folder => { const item = document.createElement('li'); const details = document.createElement('details'); details.open = expandedFolderIds.has(folder.id); const summary = document.createElement('summary'); const button = document.createElement('button'); button.type = 'button'; button.dataset.folderId = String(folder.id); button.textContent = folder.name; if (folder.id === selectedFolderId) { button.classList.add('current'); button.setAttribute('aria-current', 'true') }; rowFolders.set(button, folder); summary.append(button); details.append(summary); if (folder.children.length) details.append(renderTree(folder.children)); item.append(details); list.append(item) }); return list }
+function treeFolderId(element) { const button = element?.closest?.('button[data-folder-id]'); return button ? Number(button.dataset.folderId) : null }
+function handleTreeClick(event) {
+  const button = event.target.closest?.('button[data-folder-id]')
+  if (button) { event.preventDefault(); event.stopPropagation(); const id = Number(button.dataset.folderId); if (Number.isFinite(id)) selectFolder(id).catch(error); return }
+  const summary = event.target.closest?.('summary')
+  if (summary && event.target === summary) { const id = treeFolderId(summary.querySelector('button[data-folder-id]')); if (Number.isFinite(id)) selectFolder(id).catch(error) }
+}
+function handleTreeContextMenu(event) {
+  const button = event.target.closest?.('button[data-folder-id]'); if (!button) return
+  const folder = rowFolders.get(button); if (!folder) return
+  openContext(event, { kind: 'folder', folder })
+}
+function handleTreeToggle(event) {
+  const details = event.target
+  if (details?.tagName !== 'DETAILS' || !folderTree.contains(details)) return
+  const id = treeFolderId(details.querySelector('summary > button[data-folder-id]'))
+  if (!Number.isFinite(id)) return
+  if (details.open) expandedFolderIds.add(id); else expandedFolderIds.delete(id)
+}
 async function refresh(select = selectedFolderId) { const request = refreshRequests.begin(); const data = await window.bookManager.tree(); if (!refreshRequests.isCurrent(request)) return false; if (libraryId !== data.libraryId) { libraryId = data.libraryId; importController = createImportController({ api: window.bookManager, storage: localStorage, libraryId }) }; tree = data.folders; folderTree.replaceChildren(renderTree(tree)); const id = findFolder(select) ? select : tree[0]?.id; if (id) return selectFolder(id); return true }
 
 async function openDefault(item = selectedItem) { if (!item) throw new Error('请先选择文件'); if (await window.bookManager.openDocument(item.id, item.displayName)) message(`已用系统默认方式打开：${item.displayName}`) }
@@ -593,7 +620,70 @@ async function importFile() {
   try { await refresh(target); message(importSummaryText(result)) }
   catch (issue) { console.error(issue); notice({ title: '文件已导入', msg: `${importSummaryText(result)} 列表刷新失败，请刷新书库或重新打开程序。`, errorType: 'import_refresh_failed', level: 'warning' }) }
 }
-async function importFolder() { const path = await window.bookManager.selectFolder('选择要添加的文件夹'); if (!path) return; const text = await promptValue('为文件夹内书籍添加标签', '标签（以逗号分隔，可留空）', '', true); if (text === null) return; const result = await window.bookManager.post('/api/import/folder', { path, folderId: selectedFolderId, tags: text ? text.split(',') : [] }); await refresh(result.folderId); message(`已添加文件夹，导入 ${result.fileCount} 个文件。`); const warning = importSummary(result); if (warning) notice(warning) }
+async function importFolder() {
+  const path = await window.bookManager.selectFolder('选择要添加的文件夹')
+  if (!path) return
+  const text = await promptValue('为文件夹内书籍添加标签', '标签（以逗号分隔，可留空）', '', true)
+  if (text === null) return
+  const jobId = crypto.randomUUID()
+  const folderId = selectedFolderId
+  const content = document.createElement('div'); content.className = 'form-stack'
+  const progressLine = element('p', 'dialog-hint import-progress-text', '正在导入：正在检查文件…')
+  progressLine.setAttribute('role', 'status'); progressLine.setAttribute('aria-live', 'polite')
+  content.append(progressLine)
+  let running = true
+  let cancelRequested = false
+  let pollTimer = null
+  let dialog = null
+  const stopPolling = () => { if (pollTimer === null) return; clearInterval(pollTimer); pollTimer = null }
+  const applyProgress = value => {
+    const progress = normalizeProgress(value)
+    if (!cancelRequested) {
+      const nextText = progressText(progress)
+      if (progressLine.textContent !== nextText) progressLine.textContent = nextText
+    }
+    if (shouldStopPolling(progress)) stopPolling()
+  }
+  const pollProgress = async () => {
+    try {
+      const progress = await window.bookManager.get(`/api/import/folder/progress/${jobId}`)
+      if (running) applyProgress(progress)
+    } catch (issue) {
+      // Transient progress read failures (including the first poll before the
+      // backend records the job) must not stop the import or leak a rejection.
+      console.warn('读取导入进度失败:', issue)
+    }
+  }
+  dialog = modal('正在导入文件夹', content, {
+    canDismiss: () => !running,
+    onDismiss: stopPolling,
+    buttons: [{ label: '取消导入', danger: true, action: async () => {
+      if (!running || cancelRequested) return
+      cancelRequested = true
+      progressLine.textContent = '正在取消导入，请稍候…'
+      try { await window.bookManager.post(`/api/import/folder/cancel/${jobId}`, {}) }
+      catch (issue) { if (running) { cancelRequested = false; console.error(issue); error(issue) } }
+    } }]
+  })
+  message('正在导入文件夹…')
+  pollTimer = setInterval(() => { pollProgress() }, PROGRESS_POLL_INTERVAL_MS)
+  try {
+    const result = await window.bookManager.post('/api/import/folder', { path, folderId, tags: text ? text.split(',') : [], jobId })
+    running = false; stopPolling(); dialog.close()
+    await refresh(result.folderId)
+    message(`已添加文件夹，导入 ${result.fileCount} 个文件。`)
+    const warning = importSummary(result); if (warning) notice(warning)
+  } catch (issue) {
+    running = false; stopPolling(); dialog.close()
+    const info = notificationFromError(issue)
+    if (cancelRequested || info.errorType === 'import_cancelled') {
+      message('已取消导入，本次未保留任何文件。')
+      notice({ title: '导入已取消', msg: '已取消导入，本次未保留任何文件。', errorType: 'import_cancelled', level: 'warning' })
+      return
+    }
+    throw issue
+  } finally { stopPolling() }
+}
 async function renameItem(item = selectedItem) { if (!item) throw new Error('请先选择文件'); const details = await nameDialog('按规则重命名', item); if (!details) return; await window.bookManager.post(`/api/items/${item.id}/rename`, details); await refresh(selectedFolderId); message('已重命名；底层文件未复制或改名。') }
 async function moveItem(item) { const target = await chooseFolder('选择移动目标文件夹'); if (!target) return; await window.bookManager.post(`/api/items/${item.id}/move`, { targetFolderId: target }); await refresh(selectedFolderId); message('镜像文件已移动。') }
 async function mirrorItem(item) { const target = await chooseFolder('选择镜像目标文件夹'); if (!target) return; await window.bookManager.post(`/api/items/${item.id}/mirror`, { targetFolderId: target }); await refresh(selectedFolderId); message('镜像已创建。') }
@@ -791,6 +881,10 @@ folderTree.addEventListener('keydown', event => {
   if (isContextMenuKey(event)) { if (openContextForRow(focusedRow(folderTree))) event.preventDefault(); return }
   moveListSelection(event, folderTree, () => Number(document.activeElement?.dataset.folderId) || selectedFolderId)
 })
+// One delegated listener per tree event kind; renderTree never binds per-node handlers.
+folderTree.addEventListener('click', handleTreeClick)
+folderTree.addEventListener('contextmenu', handleTreeContextMenu)
+folderTree.addEventListener('toggle', handleTreeToggle, true)
 
 appMenu.querySelectorAll('summary').forEach(summary => summary.addEventListener('click', () => { for (const menu of appMenu.querySelectorAll('details')) if (menu !== summary.parentElement) menu.open = false }))
 openMenuSummary?.addEventListener('click', event => { if (selectedItem) return; event.preventDefault(); message('请先在文件列表中选择一个文件。') })
