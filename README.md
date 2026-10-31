@@ -8,7 +8,7 @@ BookManager 是一个本地电子书与文档管理工具。它使用 SQLite 保
 - **层级书库**：支持创建、重命名、移动、删除文件夹，以及标准排序和系列编号排序。
 - **导入与拖放**：单文件导入可多选目标文件夹，一次导入、多处镜像；也可导入完整目录；目录层级会转换为书库层级，文件统一进入底层 Blob 库。
 - **结构化命名**：保存系列、编号、主标题、副标题、版本、作者、备注和标签，并支持从文件名及 PDF、DJVU、EPUB 元数据生成候选信息。
-- **文档预览**：右侧内嵌预览 PDF、EPUB、DOCX、XLSX、PPTX、常见图片和纯文本；DJVU 使用 Python/DjVuLibre 渲染回退。
+- **文档预览**：右侧内嵌预览 PDF、EPUB、DOCX、XLSX、PPTX、常见图片和纯文本；DJVU 由 Electron 内置的 DjVu.js 直接预览。
 - **搜索与标签**：可分别搜索底层唯一文件、镜像文件、标题和标签；同一底层文件的多个镜像会分组显示。
 - **系统集成**：双击或右键可用系统默认程序打开文件；打开缓存中的改动可同步回底层文件。
 - **缓存与数据迁移**：可设置缓存保留时间、容量上限和退出清理策略，也可迁移整个数据目录。
@@ -48,13 +48,12 @@ BookManager 是一个本地电子书与文档管理工具。它使用 SQLite 保
 ## 架构
 
 ```text
-run.py                  启动入口，优先启动 Electron，缺失时回退到 Tk 界面
+run.py                  启动入口，只启动 Electron 界面；缺少匹配运行时则提示并退出
 bookmanager/
   store.py              SQLite、文件夹、镜像和 Blob 存储
   bridge.py             Electron 与 Python 之间的受控本地 API
   naming.py             命名解析与规则化
   metadata.py           文档元数据提取
-  rendering.py          PDF/DJVU/EPUB 回退渲染
   crawler.py            系列爬取接口
 electron/
   main.mjs              Electron 主进程
@@ -75,7 +74,7 @@ Electron 只通过 `document_id` 请求文件，Python 后端负责解析实际 
 
 ## 安装与运行
 
-Python 依赖：
+需要 Python 3.10 或更高版本。Python 依赖：
 
 ```bash
 python -m pip install -r requirements.txt
