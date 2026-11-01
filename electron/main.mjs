@@ -10,6 +10,7 @@ import { acquireSingleInstance } from './single-instance.mjs'
 import { checkFrontend, startupFailure } from './startup-checks.mjs'
 import { createMainLogger } from './diagnostics.mjs'
 import { ensureInstanceIdentity } from './instance-identity.mjs'
+import { createApiBaseResolver } from './api-base.mjs'
 import { businessError, userError, notificationFromError, createFatalReporter } from './user-errors.mjs'
 import { normalizeFolderPageParams } from './src/pagination.js'
 
@@ -31,6 +32,9 @@ let mainWindow = null
 let quitting = false
 const reportFatal = createFatalReporter((title, msg) => dialog.showErrorBox(title, msg))
 const primaryInstance = acquireSingleInstance(app, () => mainWindow)
+// The backend publishes its dynamic loopback URL only through the ready event.
+// bridgeUrl stays the source for page loading, navigation and document origins.
+const resolveApiBase = createApiBaseResolver(() => bridgeUrl)
 
 function pythonCommand() {
   if (process.env.BOOKMANAGER_PYTHON) {
@@ -42,8 +46,7 @@ function pythonCommand() {
 }
 
 function bridgeFetch(pathname, options = {}) {
-  if (!bridgeUrl) throw new Error('BookManager bridge is not ready')
-  return fetch(`${bridgeUrl}${pathname}`, {
+  return fetch(`${resolveApiBase()}${pathname}`, {
     ...options,
     headers: { Authorization: `Bearer ${token}`, ...(options.headers || {}) }
   }).catch(error => {
