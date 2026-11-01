@@ -9,6 +9,7 @@ import { assertAllowedBridgeRequest } from './ipc-policy.mjs'
 import { acquireSingleInstance } from './single-instance.mjs'
 import { checkFrontend, startupFailure } from './startup-checks.mjs'
 import { createMainLogger } from './diagnostics.mjs'
+import { ensureInstanceIdentity } from './instance-identity.mjs'
 import { businessError, userError, notificationFromError, createFatalReporter } from './user-errors.mjs'
 import { normalizeFolderPageParams } from './src/pagination.js'
 
@@ -338,6 +339,10 @@ if (primaryInstance) app.whenReady().then(async () => {
     console.error = (...values) => { persistError(...values); originalError(...values) }
     process.on('uncaughtException', error => { console.error('Uncaught main-process error:', error); reportFatal('main', '程序异常', '程序发生严重错误，请保存可保存的内容并重启软件') })
     process.on('unhandledRejection', error => { console.error('Unhandled main-process rejection:', error); reportFatal('main', '程序异常', '程序发生严重错误，请保存可保存的内容并重启软件') })
+    // Diagnostics are ready before the identity is read so failures below are
+    // persisted. The ID stays in the main process: it is not written to the
+    // library database, sent to the renderer, or attached to the ready event.
+    await ensureInstanceIdentity(app.getPath('userData'))
     await checkFrontend(staticDir)
     if (process.platform === 'darwin' && app.dock) app.dock.setIcon(appIcon)
     await startBridge()

@@ -35,12 +35,30 @@ test('frontend preflight rejects missing DjVu assets and external or escaping en
 })
 
 test('fatal startup reasons have specific safe system messages', () => {
-  for (const type of ['dependency_missing', 'python_missing', 'data_permission', 'data_corrupt', 'disk_full', 'frontend_missing']) {
+  for (const type of ['dependency_missing', 'python_missing', 'data_permission', 'data_corrupt', 'disk_full', 'frontend_missing', 'instance_identity_invalid', 'instance_identity_unavailable', 'instance_identity_timeout']) {
     const notice = notificationFromError(startupFailure(type))
     assert.equal(notice.level, 'fatal'); assert.equal(notice.errorType, type)
     assert.doesNotMatch(notice.msg, /Traceback|ENOENT|EACCES/)
   }
   assert.equal(notificationFromError(startupFailure('Traceback secret')).errorType, 'startup_failed')
+})
+
+test('instance identity failures explain the problem without leaking internals', () => {
+  const expectations = {
+    instance_identity_invalid: /安装实例标识.*损坏/,
+    instance_identity_unavailable: /无法读取或创建安装实例标识/,
+    instance_identity_timeout: /初始化安装实例标识超时/
+  }
+  for (const [type, message] of Object.entries(expectations)) {
+    const notice = notificationFromError(startupFailure(type))
+    assert.equal(notice.level, 'fatal')
+    assert.equal(notice.errorType, type)
+    assert.match(notice.title, /安装身份/)
+    assert.match(notice.msg, message)
+    for (const value of [notice.title, notice.msg]) {
+      assert.doesNotMatch(value, /\.instance-id|BookManagerData|EACCES|EPERM|ENOENT|Traceback|Error:|\/Users\/|[A-Za-z]:\\/)
+    }
+  }
 })
 
 test('main process diagnostics persist Error stacks and redact tokens', async t => {

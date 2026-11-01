@@ -10,6 +10,9 @@ const failures = {
   data_unavailable: ['数据目录不可用', '无法访问书库数据目录，请检查目录位置和存储设备'],
   frontend_missing: ['界面文件缺失', '界面构建文件缺失或损坏，请重新构建或安装软件'],
   python_missing: ['依赖缺失', '未能启动 Python，请检查 Python 是否安装及启动路径配置'],
+  instance_identity_invalid: ['安装身份异常', '安装实例标识无效或已损坏，为避免混淆已停止启动，请重新安装软件或联系技术支持'],
+  instance_identity_unavailable: ['安装身份不可用', '无法读取或创建安装实例标识，请检查用户数据目录的权限和剩余磁盘空间后重试'],
+  instance_identity_timeout: ['安装身份初始化超时', '初始化安装实例标识超时，请关闭其他 BookManager 进程后重试'],
   startup_failed: ['程序启动失败', '无法启动后端服务，请检查 Python 环境、数据目录权限和剩余磁盘空间后重试']
 }
 
