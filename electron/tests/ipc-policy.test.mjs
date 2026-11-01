@@ -35,6 +35,19 @@ test('renderer bridge paths are explicitly allowlisted', () => {
   assert.equal(allowedBridgePath('POST', '/../api/search'), false)
 })
 
+test('main-process-only local item paths stay out of the renderer allowlist', () => {
+  for (const path of ['/api/items/9/open', '/api/items/9/location']) {
+    assert.equal(allowedBridgePath('GET', path), false)
+    assert.equal(allowedBridgePath('POST', path), false)
+    assert.throws(() => assertAllowedBridgeRequest('GET', path), TypeError)
+  }
+  // Settings deliberately exposes dataHome to the renderer.
+  assert.equal(allowedBridgePath('GET', '/api/settings'), true)
+  assert.doesNotThrow(() => assertAllowedBridgeRequest('GET', '/api/settings'))
+  // Export receipts deliberately expose the chosen targetPath to the renderer.
+  assert.doesNotThrow(() => assertAllowedBridgeRequest('POST', '/api/folders/12/export', { targetPath: '/tmp/export' }))
+})
+
 test('oversized renderer payloads are rejected', () => {
   assert.doesNotThrow(() => assertAllowedBridgeRequest('POST', '/api/search', { query: 'book' }))
   assert.doesNotThrow(() => assertAllowedBridgeRequest('POST', '/api/import/folder/cancel/job-1', {}))
