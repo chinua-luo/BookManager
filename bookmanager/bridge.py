@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .crawler import crawl_into_library, new_crawl_stats
+from .exporting import ExportProblem, export_folder
 from .file_copy import clone_or_copy
 from .file_security import ensure_safe_system_open
 from .importing import ImportProblem, import_file, import_status, target_ids, validate_request_id
@@ -72,7 +73,7 @@ IMPORT_STATUS_PATTERN = re.compile(r"^/api/import/requests/(?P<request_id>[A-Za-
 FOLDER_PATH_PATTERN = re.compile(r"^/api/folders/(?P<folder_id>\d+)/contents$")
 ITEM_OPEN_PATH_PATTERN = re.compile(r"^/api/items/(?P<item_id>\d+)/open$")
 ITEM_LOCATION_PATH_PATTERN = re.compile(r"^/api/items/(?P<item_id>\d+)/location$")
-FOLDER_ACTION_PATH_PATTERN = re.compile(r"^/api/folders/(?P<folder_id>\d+)/(?P<action>rename|move|delete)$")
+FOLDER_ACTION_PATH_PATTERN = re.compile(r"^/api/folders/(?P<folder_id>\d+)/(?P<action>rename|move|delete|export)$")
 ITEM_ACTION_PATH_PATTERN = re.compile(r"^/api/items/(?P<item_id>\d+)/(?P<action>rename|move|mirror|delete|delete-underlying)$")
 FOLDER_IMPORT_PROGRESS_PATTERN = re.compile(r"^/api/import/folder/progress/(?P<job_id>[A-Za-z0-9_-]{1,80})$")
 FOLDER_IMPORT_CANCEL_PATTERN = re.compile(r"^/api/import/folder/cancel/(?P<job_id>[A-Za-z0-9_-]{1,80})$")
@@ -94,6 +95,7 @@ FOLDER_OPERATION_NAMES = {
     "rename": ("folder.rename", "重命名文件夹"),
     "move": ("folder.move", "移动文件夹"),
     "delete": ("folder.delete", "删除文件夹"),
+    "export": ("folder.export", "导出文件夹"),
 }
 ITEM_OPERATION_NAMES = {
     "rename": ("file.rename", "重命名文件"),
@@ -360,6 +362,11 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             self._operation_details = details
             self._handle_post(parsed.path, payload)
             document_name = self._operation_document_name
+        except ExportProblem as exc:
+            details["export_error_type"] = exc.export_error_type
+            if not details.get("replayed"):
+                self._log_request_operation(operation, started, "failure", document_name, details, exc)
+            self._send_failure(exc, HTTPStatus(exc.http_status))
         except (OSError, ValueError) as exc:
             if not details.get("replayed"):
                 self._log_request_operation(operation, started, "failure", document_name, details, exc)
@@ -414,7 +421,18 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         if folder_match:
             store = self.server.open_store()
             try:
-                details["folder_name"] = store.get_folder(int(folder_match.group("folder_id"))).name
+                try:
+                    details["folder_name"] = store.get_folder(int(folder_match.group("folder_id"))).name
+                except ValueError as error:
+                    # Export has a dedicated 404 contract; other folder actions
+                    # keep their existing generic folder failure mapping.
+                    if folder_match.group("action") == "export":
+                        raise ExportProblem(
+                            "export_folder_missing",
+                            "源文件夹不存在或已被删除，请刷新后重试。",
+                            http_status=404,
+                        ) from error
+                    raise
             finally:
                 store.close()
         elif request_path == "/api/import/file":
@@ -645,13 +663,42 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
     def _folder_action(self, folder_id: int, action: str, payload: dict[str, Any]) -> None:
         store = self.server.open_store()
         try:
-            if action == "rename":
+            if action == "export":
+                target_path = payload.get("targetPath")
+                if not isinstance(target_path, str) or not target_path.strip():
+                    raise ExportProblem("export_target_invalid", "请选择导出目标文件夹。")
+                target_parent_name = Path(target_path.strip()).expanduser().name
+                if target_parent_name:
+                    self._operation_details["target_folder"] = target_parent_name
+                result = export_folder(store, folder_id, target_path.strip())
+                self._operation_details.update(
+                    {
+                        "file_count": result.file_count,
+                        "folder_count": result.folder_count,
+                        "copied_bytes": result.copied_bytes,
+                    }
+                )
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "folderId": folder_id,
+                        "folderName": result.target_path.name,
+                        "targetPath": str(result.target_path),
+                        "fileCount": result.file_count,
+                        "folderCount": result.folder_count,
+                        "copiedBytes": result.copied_bytes,
+                    },
+                )
+            elif action == "rename":
                 store.rename_folder(folder_id, str(payload.get("name", "")))
             elif action == "move":
                 store.move_folder(folder_id, int(payload["targetFolderId"]))
             elif action == "delete":
                 store.delete_folder(folder_id)
-            self._send_json(HTTPStatus.OK, {"ok": True})
+            else:
+                raise ValueError("不支持的文件夹操作")
+            if action != "export":
+                self._send_json(HTTPStatus.OK, {"ok": True})
         finally:
             store.close()
 
@@ -1255,9 +1302,14 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         super().end_headers()
 
     def _send_failure(self, error: BaseException, status: HTTPStatus) -> None:
-        rejection_type = getattr(error, 'import_error_type', '') or getattr(error, 'error_type', '')
-        if isinstance(error, NamingValidationError) or rejection_type in {'invalid_targets', 'target_missing', 'invalid_request_id', 'request_conflict', 'import_pending', 'unsafe_file_type'}:
+        export_type = getattr(error, 'export_error_type', '')
+        rejection_type = getattr(error, 'import_error_type', '') or getattr(error, 'error_type', '') or export_type
+        if isinstance(error, NamingValidationError) or rejection_type in {'invalid_targets', 'target_missing', 'invalid_request_id', 'request_conflict', 'import_pending', 'unsafe_file_type', 'export_conflict', 'export_target_invalid', 'export_source_missing', 'export_folder_missing'}:
             record_event('bridge.validation_rejected', data_home=self.server.library_home, request_path=urllib.parse.urlparse(self.path).path, reason=str(error))
+        elif export_type == 'export_failed':
+            # The service records export.failed with its traceback before raising;
+            # avoid a second bridge-level record for the same failure.
+            pass
         else:
             record_exception('bridge.request_failed', error, data_home=self.server.library_home, request_path=urllib.parse.urlparse(self.path).path)
         if not getattr(self, '_response_started', False):

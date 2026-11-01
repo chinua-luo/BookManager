@@ -7,6 +7,15 @@ from typing import Any
 from .naming import NamingValidationError
 
 
+EXPORT_FAILURE_MESSAGES = {
+    'export_conflict': '目标位置已存在同名文件夹，请更换位置或先处理现有文件夹',
+    'export_target_invalid': '导出位置无效，请选择书库外可写入的文件夹',
+    'export_source_missing': '书库中有文件缺失或不可读取，无法完整导出',
+    'export_folder_missing': '要导出的文件夹不存在，请刷新后重试',
+    'export_failed': '导出失败，请检查源文件和目标位置后重试',
+}
+
+
 def failure_details(error: BaseException | str, path: str = '', status: int = 400) -> dict[str, str]:
     # Inspect types and known validations, never expose arbitrary exception text.
     text = str(error)
@@ -17,6 +26,9 @@ def failure_details(error: BaseException | str, path: str = '', status: int = 40
         kind, msg = 'permission_denied', '无法访问所需文件，请检查文件夹权限'
     elif status == 401:
         kind, msg = 'request_rejected', '本地请求未通过安全检查，请重启软件后重试'
+    elif getattr(error, 'export_error_type', ''):
+        kind = str(error.export_error_type)
+        msg = EXPORT_FAILURE_MESSAGES.get(kind, '导出失败，请检查源文件和目标位置后重试')
     elif status == 404:
         kind, msg = 'not_found', '请求的文件、文件夹或功能不存在，请刷新后重试'
     elif '请求内容过大' in text:
