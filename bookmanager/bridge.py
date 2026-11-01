@@ -1197,23 +1197,16 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
     def _send_document(self, document_id: int) -> None:
         store = self.server.open_store()
         try:
-            row = store.conn.execute(
-                """
-                SELECT b.stored_path, b.mime, b.size
-                FROM documents AS d
-                JOIN blobs AS b ON b.sha256 = d.current_hash
-                WHERE d.id = ?
-                """,
-                (document_id,),
-            ).fetchone()
-            if row is None:
+            document = store.document_blob(document_id)
+            if document is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "Document not found"})
                 return
-            path = Path(str(row["stored_path"]))
+            path = document.stored_path
             if not path.is_file():
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "Document content missing"})
                 return
-            self._stream_file(path, str(row["mime"]) or mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+            mime = document.mime or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            self._stream_file(path, mime)
         finally:
             store.close()
 

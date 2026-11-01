@@ -381,6 +381,15 @@ class PreparedBlob:
 
 
 @dataclass(frozen=True)
+class DocumentBlob:
+    """Local content resolved from one document's current blob reference."""
+
+    stored_path: Path
+    mime: str
+    size: int
+
+
+@dataclass(frozen=True)
 class CacheSettings:
     policy: str
     open_days: int
@@ -1610,6 +1619,25 @@ class LibraryStore:
         if row is None:
             raise ValueError(f"Item {item_id} does not exist")
         return self._item_from_row(row)
+
+    def document_blob(self, document_id: int) -> DocumentBlob | None:
+        """Resolve ``documents.current_hash`` to its local blob row, if present."""
+        row = self.conn.execute(
+            """
+            SELECT b.stored_path, b.mime, b.size
+            FROM documents AS d
+            JOIN blobs AS b ON b.sha256 = d.current_hash
+            WHERE d.id = ?
+            """,
+            (document_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return DocumentBlob(
+            stored_path=Path(str(row["stored_path"])),
+            mime=str(row["mime"]),
+            size=int(row["size"]),
+        )
 
     def _item_from_row(self, row: sqlite3.Row, tags: tuple[str, ...] | None = None) -> Item:
         name_parts, note = _parse_name_data(row["name_data"])
