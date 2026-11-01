@@ -337,6 +337,41 @@ class FolderStats:
 
 
 @dataclass(frozen=True)
+class ExportFolder:
+    """One subfolder of an exported folder, with its path below the export root."""
+
+    id: int
+    parent_id: Optional[int]
+    name: str
+    relative_parts: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ExportItem:
+    """One virtual item resolved to the underlying blob a folder export copies."""
+
+    item_id: int
+    folder_id: int
+    document_id: int
+    display_name: str
+    name_parts: StructuredFileName
+    relative_parts: tuple[str, ...]
+    stored_path: Path
+    size: int
+
+
+@dataclass(frozen=True)
+class FolderExportSnapshot:
+    """Everything a folder export needs, resolved in one read-only pass."""
+
+    folder: Folder
+    folders: tuple[ExportFolder, ...]
+    items: tuple[ExportItem, ...]
+    missing_files: tuple[Path, ...]
+    stats: FolderStats
+
+
+@dataclass(frozen=True)
 class PreparedBlob:
     """A copy-hashed source file staged outside any write transaction."""
 
@@ -1344,6 +1379,92 @@ class LibraryStore:
             (folder_id,),
         ).fetchall()
         return [int(row["id"]) for row in rows]
+
+    def folder_export_snapshot(self, folder_id: int) -> FolderExportSnapshot:
+        """Resolve a folder subtree for export without changing any stored state.
+
+        Subfolders come back in tree order, empty ones included. Items carry the
+        underlying blob path and size, and physically absent blobs are listed
+        separately so a caller can refuse the whole export before copying.
+        """
+        folder = self.get_folder(folder_id)
+        folder_ids = self._descendant_folder_ids(folder.id)
+        placeholders = ",".join("?" for _ in folder_ids)
+        rows = self.conn.execute(
+            f"SELECT id, parent_id, name FROM folders WHERE id IN ({placeholders})",
+            tuple(folder_ids),
+        ).fetchall()
+        nodes = {int(row["id"]): (row["parent_id"], str(row["name"])) for row in rows}
+
+        def relative_parts(current_id: int) -> tuple[str, ...]:
+            parts: list[str] = []
+            while current_id != folder.id:
+                node = nodes.get(current_id)
+                if node is None:
+                    return tuple()
+                parent_id, name = node
+                parts.append(name)
+                if parent_id is None:
+                    break
+                current_id = int(parent_id)
+            parts.reverse()
+            return tuple(parts)
+
+        folders = tuple(
+            sorted(
+                (
+                    ExportFolder(int(row["id"]), row["parent_id"], str(row["name"]), relative_parts(int(row["id"])))
+                    for row in rows
+                    if int(row["id"]) != folder.id
+                ),
+                key=lambda entry: (entry.relative_parts, entry.id),
+            )
+        )
+        item_rows = self.conn.execute(
+            f"""
+            SELECT i.id AS item_id, i.folder_id, i.document_id, i.display_name, i.name_data,
+                   b.size, b.stored_path
+            FROM items i
+            JOIN documents d ON d.id = i.document_id
+            JOIN blobs b ON b.sha256 = d.current_hash
+            WHERE i.folder_id IN ({placeholders})
+            ORDER BY i.display_name, i.id
+            """,
+            tuple(folder_ids),
+        ).fetchall()
+        items: list[ExportItem] = []
+        missing: list[Path] = []
+        for row in item_rows:
+            parts, _note = _parse_name_data(row["name_data"])
+            try:
+                # Reuse the canonical naming the library stores; a legacy name that
+                # cannot be rebuilt must not abort the whole snapshot.
+                _name, parts = self._item_name_parts(parts)
+            except ValueError:
+                pass
+            stored_path = Path(row["stored_path"])
+            if not stored_path.is_file():
+                missing.append(stored_path)
+            items.append(
+                ExportItem(
+                    item_id=int(row["item_id"]),
+                    folder_id=int(row["folder_id"]),
+                    document_id=int(row["document_id"]),
+                    display_name=str(row["display_name"]),
+                    name_parts=parts,
+                    relative_parts=relative_parts(int(row["folder_id"])),
+                    stored_path=stored_path,
+                    size=int(row["size"]),
+                )
+            )
+        items.sort(key=lambda entry: (entry.relative_parts, entry.display_name.casefold(), entry.item_id))
+        return FolderExportSnapshot(
+            folder=folder,
+            folders=folders,
+            items=tuple(items),
+            missing_files=tuple(missing),
+            stats=self.folder_stats(folder.id),
+        )
 
     def create_folder(self, parent_id: int, name: str) -> int:
         name = safe_name(name, "New Folder")
