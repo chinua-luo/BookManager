@@ -7,6 +7,9 @@ __pycache__/
 .venv/
 venv/
 
+# Local agent instructions
+/AGENTS.md
+
 # User library data and legacy database
 BookManagerData/
 bookmanager/library.db
