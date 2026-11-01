@@ -11,7 +11,8 @@ export function userError(value, context = '') {
     [/网址|URL|https?:|系列编号/i, '网址无效', '请输入有效的公开网址或 Springer 系列编号', 'invalid_url']
   ]
   for (const [pattern, title, msg, errorType] of rules) if (pattern.test(raw)) return { title, msg, errorType, level: 'error' }
-  const labels = context.includes('/import') ? ['导入失败', '文件导入失败，请检查文件是否可读取且内容完整']
+  const labels = context.includes('/export') ? ['导出失败', '文件夹导出失败，请检查导出位置是否可写或是否已存在同名文件夹后重试']
+    : context.includes('/import') ? ['导入失败', '文件导入失败，请检查文件是否可读取且内容完整']
     : context.includes('/search') ? ['搜索失败', '搜索执行失败，请检查搜索条件后重试']
     : context.includes('/crawl') ? ['爬取失败', '未能完成爬取，请检查网址、网络连接和站点访问限制']
     : context.includes('/settings/cache/clear') ? ['缓存清理失败', '未能清理缓存，请关闭正在使用缓存文件的程序后重试']
@@ -34,7 +35,7 @@ export function notificationFromError(value) {
 }
 export function businessError(value, context, fatal = false) {
   const structured = value && typeof value === 'object' && typeof value.error_type === 'string' && typeof value.msg === 'string'
-  const titles = { library_changed: '当前书库已变化', import_state_unavailable: '导入记录无法保存或读取', import_unknown: '导入结果待确认', invalid_targets: '请选择存放文件夹', target_missing: '目标文件夹已失效', request_conflict: '导入请求冲突', import_pending: '导入结果待确认', import_interrupted: '导入已中断', invalid_request_id: '导入请求无效', source_changed: '源文件已变化', library_busy: '书库繁忙', invalid_name: '名称填写有误', unsafe_address: '安全拦截', unsafe_file_type: '文件类型受限', disk_full: '磁盘空间不足', permission_denied: '权限不足', import_partial: '部分导入失败', import_failed: '导入失败', search_failed: '搜索失败', crawl_failed: '爬取失败', crawl_partial: '爬取结果提醒', crawl_fallback: '未能下载文档', cache_clear_failed: '缓存清理失败', migration_failed: '迁移失败', settings_failed: '设置保存失败', folder_operation_failed: '文件夹操作失败', document_operation_failed: '文件操作失败' }
+  const titles = { library_changed: '当前书库已变化', import_state_unavailable: '导入记录无法保存或读取', import_unknown: '导入结果待确认', invalid_targets: '请选择存放文件夹', target_missing: '目标文件夹已失效', request_conflict: '导入请求冲突', import_pending: '导入结果待确认', import_interrupted: '导入已中断', invalid_request_id: '导入请求无效', source_changed: '源文件已变化', library_busy: '书库繁忙', invalid_name: '名称填写有误', unsafe_address: '安全拦截', unsafe_file_type: '文件类型受限', disk_full: '磁盘空间不足', permission_denied: '权限不足', import_partial: '部分导入失败', import_failed: '导入失败', search_failed: '搜索失败', crawl_failed: '爬取失败', crawl_partial: '爬取结果提醒', crawl_fallback: '未能下载文档', cache_clear_failed: '缓存清理失败', migration_failed: '迁移失败', settings_failed: '设置保存失败', folder_operation_failed: '文件夹操作失败', document_operation_failed: '文件操作失败', export_conflict: '导出目标已存在', export_target_invalid: '导出位置无效', export_source_missing: '导出源文件缺失', export_folder_missing: '文件夹不存在', export_failed: '导出失败' }
   const notice = structured ? { title: titles[value.error_type] || '操作提醒', msg: value.msg, errorType: value.error_type, level: value.level === 'warning' ? 'warning' : 'error' } : fatal ? { title: '程序异常', msg: '后端服务连接失败，请重启软件', errorType: 'backend', level: 'fatal' } : userError(value, context)
   return new Error(`BM_NOTICE:${JSON.stringify(notice)}`)
 }

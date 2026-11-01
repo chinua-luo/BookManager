@@ -83,6 +83,34 @@ test('raw exceptions and IPC decorations become readable business messages', () 
   assert.equal(notificationFromError('BM_NOTICE:broken').title, '操作失败')
 })
 
+test('folder export failures map to curated Chinese titles', () => {
+  const titles = {
+    export_conflict: '导出目标已存在',
+    export_target_invalid: '导出位置无效',
+    export_source_missing: '导出源文件缺失',
+    export_folder_missing: '文件夹不存在',
+    export_failed: '导出失败'
+  }
+  for (const [errorType, title] of Object.entries(titles)) {
+    const encoded = businessError({ error_type: errorType, msg: '导出目标已存在，请更换位置' }, '/api/folders/3/export')
+    const notice = notificationFromError(new Error(`Error invoking remote method: Error: ${encoded.message}`))
+    assert.equal(notice.title, title)
+    assert.equal(notice.errorType, errorType)
+    assert.equal(notice.level, 'error')
+    assert.equal(notice.msg, '导出目标已存在，请更换位置')
+  }
+})
+
+test('unstructured export failures fall back to an export hint without raw details', () => {
+  const encoded = businessError('Traceback: secret /Users/hidden', '/api/folders/7/export')
+  const notice = notificationFromError(new Error(`Error invoking remote method: Error: ${encoded.message}`))
+  assert.equal(notice.title, '导出失败')
+  assert.match(notice.msg, /导出位置/)
+  assert.doesNotMatch(notice.msg, /Traceback|secret|hidden/)
+  assert.equal(notice.errorType, 'operation_failed:/api/folders/7/export')
+  assert.equal(userError('导出中断', '/api/folders/7/export').title, '导出失败')
+})
+
 test('ten-file import with five failures produces a single warning with no raw details', () => {
   const warning = importSummary({ fileCount: 5, errors: Array(5).fill('Traceback: secret') })
   assert.equal(warning.level, 'warning')

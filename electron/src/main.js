@@ -8,6 +8,7 @@ import { businessError, notificationFromError, importSummary, crawlSummary } fro
 import { submitNameForm } from './name-validation.js'
 import { createImportController, importSummaryText } from './import-controller.js'
 import { folderTargets, MAX_IMPORT_TARGETS } from './folder-targets.js'
+import { EXPORT_DIALOG_TITLE, exportDialogHint, exportDialogRows, exportSuccessMessage } from './folder-export.js'
 import { createRequestSequence } from './request-sequence.js'
 import { createPaginationState, LOAD_MORE_THRESHOLD_PX, mergePage, nextPageOffset, PAGE_SIZE, paginationCountText, shouldLoadMore } from './pagination.js'
 import { normalizeProgress, PROGRESS_POLL_INTERVAL_MS, progressText, shouldStopPolling } from './import-progress.js'
@@ -289,9 +290,9 @@ function contextButton(label, action, parent = contextElement) { const button = 
 function showContext(target, clientX, clientY, focusFirst = false) {
   contextTarget = target; contextElement.replaceChildren(); contextElement.setAttribute('role', 'menu'); contextElement.setAttribute('aria-label', target.kind === 'folder' ? '文件夹操作' : '文件操作')
   if (target.kind === 'folder') {
-    contextButton('打开文件夹', 'folder-open'); contextButton('新建子文件夹', 'folder-create'); contextButton('重命名文件夹', 'folder-rename'); contextButton('移动', 'folder-move')
+    contextButton('打开文件夹', 'folder-open'); contextButton('新建子文件夹', 'folder-create'); contextButton('重命名文件夹', 'folder-rename'); contextButton('移动', 'folder-move'); contextButton('导出文件夹…', 'folder-export')
     const sortButton = contextButton('排序方式', '')
-    const sortMenu = document.createElement('div'); sortMenu.className = 'context-submenu'; sortMenu.hidden = true; sortMenu.style.top = '124px'; sortMenu.setAttribute('role', 'menu')
+    const sortMenu = document.createElement('div'); sortMenu.className = 'context-submenu'; sortMenu.hidden = true; sortMenu.style.top = '154px'; sortMenu.setAttribute('role', 'menu')
     contextButton(currentSort(target.folder.id) === '标准' ? '标准（当前）' : '标准', 'sort-standard', sortMenu)
     contextButton(currentSort(target.folder.id) === '序列' ? '序列（当前）' : '序列', 'sort-series', sortMenu)
     sortButton.setAttribute('aria-haspopup', 'menu'); sortButton.setAttribute('aria-expanded', 'false')
@@ -613,6 +614,45 @@ async function createFolder(parent = selectedFolderId) { const name = await prom
 async function renameFolder(folder) { const name = await promptValue('重命名文件夹', '新的文件夹名称', folder.name); if (!name) return; await window.bookManager.post(`/api/folders/${folder.id}/rename`, { name }); await refresh(folder.id); message('文件夹已重命名。') }
 async function moveFolder(folder) { const target = await chooseFolder('选择移动目标文件夹', folder.id); if (!target) return; await window.bookManager.post(`/api/folders/${folder.id}/move`, { targetFolderId: target }); await refresh(folder.id); message('文件夹已移动。') }
 async function deleteFolder(folder) { if (!(await ask('删除文件夹', `删除“${folder.name}”及其子文件夹、镜像文件？底层 Hash 文件不会删除。`, true))) return; await window.bookManager.post(`/api/folders/${folder.id}/delete`, {}); await refresh(folder.parentId || tree[0]?.id); message('文件夹及镜像文件已删除。') }
+async function exportFolder(folder) {
+  const page = await window.bookManager.folderPage(folder.id, 0, 1)
+  const folderName = page.folder?.name || folder.name
+  const stats = page.stats || {}
+  const sourcePath = folderTargets(tree, [folder.id])[0]?.path || folderName
+  const targetPath = await window.bookManager.selectFolder('选择导出位置（将在其中创建同名文件夹）')
+  if (!targetPath) return
+  const content = document.createElement('div'); content.className = 'form-stack'
+  const details = document.createElement('dl'); details.className = 'export-details'
+  details.style.cssText = 'display:grid;grid-template-columns:auto minmax(0,1fr);gap:6px 14px;margin:0'
+  for (const row of exportDialogRows({ folderPath: sourcePath, targetPath, folderName, itemCount: stats.itemCount, folderCount: stats.folderCount, uniqueSize: stats.uniqueSize })) {
+    const term = element('dt', '', row.label); term.style.color = '#69737b'
+    const value = element('dd', '', row.value); value.style.cssText = 'margin:0;overflow-wrap:anywhere'
+    details.append(term, value)
+  }
+  content.append(element('p', 'dialog-hint', exportDialogHint(folderName)), details)
+  let submitting = false
+  const dialog = modal(EXPORT_DIALOG_TITLE, content, { nested: true, buttons: [
+    { label: '取消', action: close => close() },
+    { label: '开始导出', primary: true, action: async close => {
+      if (submitting) return
+      submitting = true
+      const buttons = [...dialog.panel.querySelectorAll('button')]
+      buttons.forEach(button => { button.disabled = true })
+      dialog.panel.querySelector('.primary').textContent = '正在导出…'
+      try {
+        const result = await window.bookManager.post(`/api/folders/${folder.id}/export`, { targetPath })
+        close()
+        notice({ title: '导出完成', msg: exportSuccessMessage({ ...result, folderName: result.folderName || folderName }), errorType: 'export_complete', level: 'success' })
+      } catch (issue) {
+        close()
+        error(issue)
+      } finally {
+        submitting = false
+        buttons.forEach(button => { button.disabled = false })
+      }
+    } }
+  ] })
+}
 async function importFile() {
   if (!importController) { notice({ title: '书库尚未连接', msg: '请等待书库加载完成后重试。', errorType: 'library_loading' }); return }
   if (importController.restoreIssue) { error(importController.restoreIssue); return }
@@ -847,10 +887,10 @@ async function cacheSettings() {
     { label: '保存设置', primary: true, action: async close => { const selected = value('policy').value; const requested = { openDays: Number(value('openDays').value), renderDays: Number(value('renderDays').value), maxGb: Number(value('maxBytes').value), targetGb: Number(value('targetBytes').value), clearOpenOnExit: value('clearOpenOnExit').checked }; const preset = cachePresets[selected]; const matchesPreset = preset && preset.openDays === requested.openDays && preset.renderDays === requested.renderDays && preset.maxGb === requested.maxGb && preset.targetGb === requested.targetGb && preset.clearOpenOnExit === requested.clearOpenOnExit; await window.bookManager.post('/api/settings/cache', { policy: matchesPreset ? selected : '自定义', openDays: requested.openDays, renderDays: requested.renderDays, maxBytes: Math.round(requested.maxGb * 1024 ** 3), targetBytes: Math.round(requested.targetGb * 1024 ** 3), clearOpenOnExit: requested.clearOpenOnExit }); close(); message('缓存设置已保存。') }}]
   })
 }
-function help() { const content = element('div', 'form-stack'); ['添加：导入文件或整个文件夹。', '新建文件夹：在当前文件夹下创建虚拟文件夹。', '打开：用系统默认程序打开文件，或显示底层 Hash 文件。', '按规则重命名：编辑系列、标题、版本、作者、备注与标签。', '保存打开缓存改动：把经系统默认程序修改的缓存副本写回底层文件，并同步所有镜像。', '爬取系列：输入网址或 Springer 系列编号；高级选项可在确认风险后抓取当前页面的一层同站链接。', '右键菜单：文件夹可新建、重命名、移动、排序、删除；文件可打开、复制、移动、镜像、替换、删除。选中后也可按 Shift+F10 或菜单键打开，按 Escape 关闭。', '预览：单击文件预览，双击用系统默认程序打开。'].forEach(text => content.append(element('p', '', text))); modal('功能介绍', content, { buttons: [{ label: '关闭', primary: true, action: close => close() }] }) }
+function help() { const content = element('div', 'form-stack'); ['添加：导入文件或整个文件夹。', '新建文件夹：在当前文件夹下创建虚拟文件夹。', '打开：用系统默认程序打开文件，或显示底层 Hash 文件。', '按规则重命名：编辑系列、标题、版本、作者、备注与标签。', '导出文件夹：选择父目录后递归复制为同名文件夹，文件名使用全量规则名，同名目录不会被覆盖。', '保存打开缓存改动：把经系统默认程序修改的缓存副本写回底层文件，并同步所有镜像。', '爬取系列：输入网址或 Springer 系列编号；高级选项可在确认风险后抓取当前页面的一层同站链接。', '右键菜单：文件夹可新建、重命名、移动、导出、排序、删除；文件可打开、复制、移动、镜像、替换、删除。选中后也可按 Shift+F10 或菜单键打开，按 Escape 关闭。', '预览：单击文件预览，双击用系统默认程序打开。'].forEach(text => content.append(element('p', '', text))); modal('功能介绍', content, { buttons: [{ label: '关闭', primary: true, action: close => close() }] }) }
 async function shortcutDialog() { shortcuts = (await window.bookManager.get('/api/shortcuts')).shortcuts || {}; const actions = [['import-file', '导入文件'], ['create-folder', '新建文件夹'], ['open-selected', '打开文件'], ['rename-selected', '按规则重命名'], ['search', '搜索'], ['crawl', '爬取系列'], ['save-text', '保存打开缓存改动']]; const content = document.createElement('div'); content.className = 'shortcut-grid'; actions.forEach(([action, label]) => { const name = document.createElement('div'); name.textContent = label; const input = document.createElement('input'); input.readOnly = true; input.placeholder = '点击后按键设置；退格清除'; input.value = shortcuts[action] || ''; input.addEventListener('keydown', async event => { const accelerator = acceleratorFromKeyboardEvent(event); if (accelerator === null) return; event.preventDefault(); try { shortcuts = (await window.bookManager.post('/api/settings/shortcuts', { action, accelerator })).shortcuts; input.value = shortcuts[action] || '' } catch (issue) { error(issue) } }); content.append(name, input) }); modal('快捷键', content, { wide: true, buttons: [{ label: '关闭', primary: true, action: close => close() }] }) }
 
-async function contextAction(action) { const target = contextTarget; closeContext(); if (!target) return; const folder = target.folder; const item = target.item; if (action === 'folder-open') return selectFolder(folder.id); if (action === 'folder-create') return createFolder(folder.id); if (action === 'folder-rename') return renameFolder(folder); if (action === 'folder-move') return moveFolder(folder); if (action === 'folder-delete') return deleteFolder(folder); if (action === 'sort-standard' || action === 'sort-series') { sortModes.set(folder.id, action === 'sort-series' ? '序列' : '标准'); await selectFolder(selectedFolderId); message(`当前文件夹及子文件夹已按“${sortModes.get(folder.id)}”排序。`); return } if (action === 'file-open') return openDefault(item); if (action === 'file-location') return showLocation(item); if (action === 'file-copy') { await window.bookManager.copyFileName(item.displayName); message('已复制文件名。'); return } if (action === 'file-delete') return deleteItem(item); if (action === 'file-delete-underlying') return deleteUnderlying(item); if (action === 'file-rename') return renameItem(item); if (action === 'file-move') return moveItem(item); if (action === 'file-mirror') return mirrorItem(item); if (action === 'file-replace') return replaceDocument(item) }
+async function contextAction(action) { const target = contextTarget; closeContext(); if (!target) return; const folder = target.folder; const item = target.item; if (action === 'folder-open') return selectFolder(folder.id); if (action === 'folder-create') return createFolder(folder.id); if (action === 'folder-rename') return renameFolder(folder); if (action === 'folder-move') return moveFolder(folder); if (action === 'folder-export') return exportFolder(folder); if (action === 'folder-delete') return deleteFolder(folder); if (action === 'sort-standard' || action === 'sort-series') { sortModes.set(folder.id, action === 'sort-series' ? '序列' : '标准'); await selectFolder(selectedFolderId); message(`当前文件夹及子文件夹已按“${sortModes.get(folder.id)}”排序。`); return } if (action === 'file-open') return openDefault(item); if (action === 'file-location') return showLocation(item); if (action === 'file-copy') { await window.bookManager.copyFileName(item.displayName); message('已复制文件名。'); return } if (action === 'file-delete') return deleteItem(item); if (action === 'file-delete-underlying') return deleteUnderlying(item); if (action === 'file-rename') return renameItem(item); if (action === 'file-move') return moveItem(item); if (action === 'file-mirror') return mirrorItem(item); if (action === 'file-replace') return replaceDocument(item) }
 async function action(name) { closeMenus(); if (name === 'import-file') return importFile(); if (name === 'add-folder') return importFolder(); if (name === 'create-folder') return createFolder(); if (name === 'open-selected') return openDefault(); if (name === 'show-location-selected') return showLocation(); if (name === 'rename-selected') return renameItem(); if (name === 'save-text') return saveOpenCacheChanges(); if (name === 'crawl') return crawl(); if (name === 'data-location') return dataLocation(); if (name === 'cache-settings') return cacheSettings(); if (name === 'help') return help(); if (name === 'shortcuts') return shortcutDialog(); if (name === 'search') return openSearch() }
 
 function moveListSelection(event, container, folderIdForParent) {

@@ -19,6 +19,7 @@ const POST_PATHS = new Set([
 const GET_PATTERNS = [/^\/api\/import\/requests\/[A-Za-z0-9_-]{1,80}$/, /^\/api\/folders\/\d+\/contents$/, /^\/api\/import\/folder\/progress\/[A-Za-z0-9_-]{1,80}$/]
 const POST_PATTERNS = [
   /^\/api\/folders\/\d+\/(?:rename|move|delete)$/,
+  /^\/api\/folders\/\d+\/export$/,
   /^\/api\/items\/\d+\/(?:rename|move|mirror|delete|delete-underlying)$/,
   /^\/api\/documents\/\d+\/replace$/,
   /^\/api\/import\/folder\/cancel\/[A-Za-z0-9_-]{1,80}$/
