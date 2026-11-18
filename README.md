@@ -118,6 +118,10 @@ Electron 只通过 `document_id` 请求文件，Python 后端负责解析实际 
 
 此方式仍是从源码运行，不是独立安装包；项目目录及其本地依赖需要保留。Windows 不适用本脚本。可选的 DJVU 文本提取工具 `djvutxt` 需要另行安装。
 
+### Windows 一键初始化与启动
+
+下载源码并解压后，双击项目目录中的 `start_windows.bat`。需要事先安装 Python 3.10 或更新版本（包含 Windows Python 启动器 `py`），以及包含 npm/npx 的 Node.js 22.12 或更新版本；安装后如命令仍找不到，请关闭并重新打开终端。脚本联网下载固定版本 pnpm，并在项目目录中创建 `.venv`、安装依赖、构建前端及启动 Electron；不会自动安装系统级工具，也不会上传书库。失败时请查看窗口中的具体提示后重试。也可在命令提示符执行 `start_windows.bat --setup-only`，只安装和构建，不启动软件。保留项目目录，启动后可在界面导入书籍；这不是独立安装包。Windows 首次完整安装、窗口启动和导书需在 Windows 环境中验证。
+
 ### 手动安装
 
 需要 Python 3.10 或更高版本。Python 依赖：
