@@ -56,7 +56,10 @@ def export_folder(store: LibraryStore, folder_id: int, target_parent: str | Path
     ``OSError``/``PermissionError`` type so the HTTP layer can map them.
     """
     folder = _source_folder(store, folder_id)
-    snapshot = store.folder_export_snapshot(folder.id)
+    try:
+        snapshot = store.folder_export_snapshot(folder.id)
+    except ValueError as error:
+        raise ExportProblem("export_source_missing", "书库文件路径无效或包含软链接，本次未导出。") from error
     parent = _target_parent(store, target_parent)
     # The stored folder name becomes the exported directory name, so it gets the
     # same traversal checks as every nested folder name.

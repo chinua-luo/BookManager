@@ -5,6 +5,8 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
+import stat
 import shutil
 import sqlite3
 import tempfile
@@ -225,6 +227,40 @@ def delete_library_source_data(source: Path) -> None:
         except OSError as exc:
             record_exception('store.migration_source_cleanup_failed', exc, data_home=source)
 
+
+def managed_blob_path(blob_dir: Path, stored_path: str | Path, blob_hash: str) -> Path:
+    """Validate an untrusted database path before exposing or mutating a blob.
+
+    Legacy extensionless blobs retain the same hash/shard layout. Missing
+    files are allowed for repair and deletion, but existing components must
+    be real directories and a regular file, never symbolic links.
+    """
+    if not isinstance(blob_hash, str) or re.fullmatch(r"[0-9a-f]{64}", blob_hash) is None:
+        raise ValueError("Invalid managed blob hash")
+    raw = str(stored_path)
+    path = Path(raw)
+    if not path.is_absolute() or ".." in path.parts or (os.name != "nt" and "\\" in raw) or "\x00" in raw:
+        raise ValueError("Invalid managed blob path")
+    root = blob_dir.parent.resolve() / blob_dir.name
+    # Resolve aliases above the trusted library home (e.g. macOS /var),
+    # never below it. Perform I/O via the trusted prefix, not the DB prefix.
+    if path.parent.parent.name != root.name or path.parent.parent.parent.resolve() != root.parent.resolve():
+        raise ValueError("Blob path is outside managed storage")
+    relative = Path(path.parent.name) / path.name
+    path = root / relative
+    if (len(relative.parts) != 2 or relative.parts[0] != blob_hash[:2]
+            or re.fullmatch(re.escape(blob_hash) + r"(?:\.[A-Za-z0-9]+)?", relative.name) is None):
+        raise ValueError("Blob path does not match its hash")
+    for candidate in (root, root / relative.parts[0], path):
+        try:
+            mode = candidate.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(mode) or (os.name == "nt" and candidate.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT) or not (stat.S_ISREG(mode) if candidate == path else stat.S_ISDIR(mode)):
+            raise ValueError("Managed blob path contains a link or invalid file type")
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise ValueError("Blob path escapes managed storage")
+    return path
 
 def _rewrite_blob_paths_in_database(db_path: Path, old_blob_dir: Path, new_blob_dir: Path) -> None:
     conn = sqlite3.connect(str(db_path))
@@ -559,6 +595,8 @@ class LibraryStore:
         self.blob_dir = self.home / "blobs"
         self.db_path = self.home / "library.db"
         self.home.mkdir(parents=True, exist_ok=True)
+        if self.blob_dir.is_symlink():
+            raise ValueError("Invalid managed blob directory")
         self.blob_dir.mkdir(parents=True, exist_ok=True)
         self._secure_library_permissions()
         self.conn = sqlite3.connect(str(self.db_path))
@@ -1022,7 +1060,10 @@ class LibraryStore:
             reclaimed_bytes = 0
             for row in rows:
                 blob_hash = str(row["sha256"])
-                stored_path = Path(str(row["stored_path"]))
+                try:
+                    stored_path = managed_blob_path(self.blob_dir, row["stored_path"], blob_hash)
+                except ValueError:
+                    continue
                 try:
                     stored_path.unlink()
                 except FileNotFoundError:
@@ -1432,7 +1473,7 @@ class LibraryStore:
         item_rows = self.conn.execute(
             f"""
             SELECT i.id AS item_id, i.folder_id, i.document_id, i.display_name, i.name_data,
-                   b.size, b.stored_path
+                   b.sha256, b.size, b.stored_path
             FROM items i
             JOIN documents d ON d.id = i.document_id
             JOIN blobs b ON b.sha256 = d.current_hash
@@ -1451,7 +1492,7 @@ class LibraryStore:
                 _name, parts = self._item_name_parts(parts)
             except ValueError:
                 pass
-            stored_path = Path(row["stored_path"])
+            stored_path = managed_blob_path(self.blob_dir, row["stored_path"], row["sha256"])
             if not stored_path.is_file():
                 missing.append(stored_path)
             items.append(
@@ -1624,7 +1665,7 @@ class LibraryStore:
         """Resolve ``documents.current_hash`` to its local blob row, if present."""
         row = self.conn.execute(
             """
-            SELECT b.stored_path, b.mime, b.size
+            SELECT b.sha256, b.stored_path, b.mime, b.size
             FROM documents AS d
             JOIN blobs AS b ON b.sha256 = d.current_hash
             WHERE d.id = ?
@@ -1634,7 +1675,7 @@ class LibraryStore:
         if row is None:
             return None
         return DocumentBlob(
-            stored_path=Path(str(row["stored_path"])),
+            stored_path=managed_blob_path(self.blob_dir, row["stored_path"], row["sha256"]),
             mime=str(row["mime"]),
             size=int(row["size"]),
         )
@@ -1652,7 +1693,7 @@ class LibraryStore:
             sha256=row["sha256"],
             size=row["size"],
             mime=row["mime"],
-            stored_path=Path(row["stored_path"]),
+            stored_path=managed_blob_path(self.blob_dir, row["stored_path"], row["sha256"]),
             updated_at=row["updated_at"],
         )
 
@@ -1769,9 +1810,7 @@ class LibraryStore:
             (prepared.sha256,),
         ).fetchone()
         if existing is not None:
-            stored_path = Path(existing["stored_path"])
-            if stored_path.is_symlink():
-                raise ValueError("底层文件不能是软链接")
+            stored_path = managed_blob_path(self.blob_dir, existing["stored_path"], prepared.sha256)
             if stored_path.exists():
                 prepared.temp_path.unlink(missing_ok=True)
                 return stored_path
@@ -1784,9 +1823,11 @@ class LibraryStore:
                 )
             return stored_path
 
-        subdir = self.blob_dir / prepared.sha256[:2]
-        subdir.mkdir(parents=True, exist_ok=True)
-        stored_path = subdir / f"{prepared.sha256}{extension}"
+        stored_path = managed_blob_path(
+            self.blob_dir,
+            Path(os.path.abspath(self.blob_dir)) / prepared.sha256[:2] / f"{prepared.sha256}{extension}", prepared.sha256
+        )
+        stored_path.parent.mkdir(parents=True, exist_ok=True)
         os.replace(prepared.temp_path, stored_path)
         try:
             with self.transaction():
@@ -1814,14 +1855,14 @@ class LibraryStore:
                 row = self.conn.execute("SELECT stored_path FROM blobs WHERE sha256 = ?", (blob_hash,)).fetchone()
                 if row is None:
                     return
+                stored_path = managed_blob_path(self.blob_dir, row["stored_path"], blob_hash)
                 self.conn.execute("DELETE FROM blobs WHERE sha256 = ?", (blob_hash,))
-                stored_path = Path(row["stored_path"])
             try:
                 if not stored_path.is_symlink():
                     stored_path.unlink(missing_ok=True)
             except OSError:
                 record_exception('store.blob_unlink_failed', data_home=self.home)
-        except (OSError, sqlite3.Error):
+        except (ValueError, OSError, sqlite3.Error):
             record_exception('store.blob_release_failed', data_home=self.home)
 
     def _ensure_blob(self, source_path: Path, blob_hash: str, size: int, mime: str, extension: str, *, allow_rename: bool = True) -> Path:
@@ -1834,11 +1875,12 @@ class LibraryStore:
             (blob_hash,),
         ).fetchone()
         if existing is not None:
-            stored_path = Path(existing["stored_path"])
-            if stored_path.is_symlink():
-                raise ValueError("底层文件不能是软链接")
+            stored_path = managed_blob_path(self.blob_dir, existing["stored_path"], blob_hash)
             if allow_rename and extension and stored_path.exists() and not stored_path.suffix:
-                renamed_path = stored_path.with_name(f"{stored_path.name}{extension}")
+                renamed_path = managed_blob_path(
+            self.blob_dir,
+                    stored_path.with_name(f"{stored_path.name}{extension}"), blob_hash
+                )
                 if not renamed_path.exists():
                     stored_path.rename(renamed_path)
                     stored_path = renamed_path
@@ -1851,9 +1893,11 @@ class LibraryStore:
                 _atomic_copy_verified(source_path, stored_path, blob_hash)
             return stored_path
 
-        subdir = self.blob_dir / blob_hash[:2]
-        subdir.mkdir(parents=True, exist_ok=True)
-        stored_path = subdir / f"{blob_hash}{extension}"
+        stored_path = managed_blob_path(
+            self.blob_dir,
+            Path(os.path.abspath(self.blob_dir)) / blob_hash[:2] / f"{blob_hash}{extension}", blob_hash
+        )
+        stored_path.parent.mkdir(parents=True, exist_ok=True)
         _atomic_copy_verified(source_path, stored_path, blob_hash)
         with self.transaction():
             self.conn.execute(
