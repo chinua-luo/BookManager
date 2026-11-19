@@ -248,9 +248,30 @@ class MultiImportTests(unittest.TestCase):
         self.assertEqual(import_status(self.store, 'dead')['state'], 'failed')
         self.store.conn.execute("INSERT INTO import_requests VALUES(?,?,?,?,?,?,?)", ('live', 'fingerprint', '', 12345, 'pending', '{}', 'now'))
         self.store.conn.commit()
-        with mock.patch('bookmanager.importing.os.kill'):
-            self.assertEqual(import_status(self.store, 'live')['state'], 'pending')
+        with mock.patch('bookmanager.importing._owner_may_be_alive', return_value=True):
+            self.assertEqual(import_status(self.store, 'live'), {'state': 'pending', 'requestId': 'live'})
+        with mock.patch('bookmanager.importing._owner_may_be_alive', return_value=False):
+            self.assertEqual(import_status(self.store, 'live')['errorType'], 'import_interrupted')
         self.assertEqual(import_status(self.store, 'missing')['state'], 'not_found')
+
+    def test_windows_owner_probe_never_signals_and_closes_handle(self):
+        import ctypes
+        from ctypes import wintypes
+        from bookmanager.importing import _owner_may_be_alive
+        kernel = mock.Mock()
+        with (mock.patch('bookmanager.importing.os.name', 'nt'),
+              mock.patch.object(ctypes, 'WinDLL', create=True, return_value=kernel),
+              mock.patch('os.kill', side_effect=AssertionError('unexpected signal'))):
+            kernel.OpenProcess.return_value = 123
+            for result, expected in ((258, True), (0, False), (0xffffffff, True)):
+                kernel.WaitForSingleObject.return_value = result
+                self.assertEqual(_owner_may_be_alive(17), expected)
+            kernel.OpenProcess.assert_called_with(0x00100000, False, 17)
+            self.assertEqual(kernel.CloseHandle.call_count, 3)
+            kernel.OpenProcess.return_value = 0
+            for error, expected in ((5, True), (87, False)):
+                with mock.patch.object(ctypes, 'get_last_error', create=True, return_value=error):
+                    self.assertEqual(_owner_may_be_alive(17), expected)
 
     def test_concurrent_same_request_does_not_duplicate_and_reports_pending(self):
         entered = threading.Event(); release = threading.Event(); results = []; errors = []

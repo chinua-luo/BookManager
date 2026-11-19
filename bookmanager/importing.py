@@ -22,6 +22,8 @@ MAX_IMPORT_TARGETS = 100
 REQUEST_ID = re.compile(r'^[A-Za-z0-9_-]{1,80}$')
 _active: set[tuple[str, str]] = set()
 _guard = threading.Lock()
+# Stored in the pending receipt only. A restarted desktop backend has a new owner.
+_SESSION = uuid.uuid4().hex
 
 
 class ImportProblem(ValueError):
@@ -58,6 +60,35 @@ def _row_result(row) -> dict[str, Any]:
     return {'requestId': row['request_id'], 'state': row['state'], **json.loads(row['result_json'])}
 
 
+def _owner_may_be_alive(pid: int) -> bool:
+    if not 0 < pid <= 0x7fffffff:
+        return False
+    if os.name == 'nt':
+        # SYNCHRONIZE is observation-only. Never send a signal on Windows.
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel.OpenProcess(0x00100000, False, pid)
+        if not handle:
+            return ctypes.get_last_error() != 87  # only invalid PID proves absence
+        try:
+            return kernel.WaitForSingleObject(handle, 0) != 0
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)  # POSIX existence check only
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
 def import_status(store: LibraryStore, request_id: str) -> dict[str, Any]:
     validate_request_id(request_id)
     row = store.conn.execute('SELECT * FROM import_requests WHERE request_id = ?', (request_id,)).fetchone()
@@ -66,21 +97,17 @@ def import_status(store: LibraryStore, request_id: str) -> dict[str, Any]:
     if row['state'] == 'pending':
         with _guard:
             active = _key(store, request_id) in _active
-        alive = True
-        if row['owner_pid'] != os.getpid():
-            try:
-                os.kill(row['owner_pid'], 0)
-            except ProcessLookupError:
-                alive = False
-            except PermissionError:
-                pass
-        elif not active:
-            alive = False
+        if row['owner_pid'] == os.getpid():
+            alive = active and json.loads(row['result_json']).get('session') == _SESSION
+        else:
+            alive = _owner_may_be_alive(row['owner_pid'])
         if not alive:
             failure = {'errorType': 'import_interrupted', 'message': '上次导入被中断，本次新增记录已回滚，请重新导入。'}
             with store.transaction():
                 store.conn.execute("UPDATE import_requests SET state='failed', result_json=? WHERE request_id=? AND state='pending'", (json.dumps(failure, ensure_ascii=False), request_id))
             row = store.conn.execute('SELECT * FROM import_requests WHERE request_id=?', (request_id,)).fetchone()
+    if row['state'] == 'pending':
+        return {'requestId': request_id, 'state': 'pending'}
     return _row_result(row)
 
 
@@ -137,7 +164,7 @@ def import_file(store: LibraryStore, source: Path, folder_ids: list[int], parts:
             raise ImportProblem('import_pending', '上次导入结果仍待确认，请查询结果后再操作。')
         with store.transaction():
             _check_targets(store, folder_ids)
-            store.conn.execute('INSERT INTO import_requests(request_id,fingerprint,owner_pid,state,created_at) VALUES(?,?,?,\'pending\',?)', (request_id, fingerprint, os.getpid(), utc_now()))
+            store.conn.execute('INSERT INTO import_requests(request_id,fingerprint,owner_pid,state,result_json,created_at) VALUES(?,?,?,\'pending\',?,?)', (request_id, fingerprint, os.getpid(), json.dumps({'session': _SESSION}), utc_now()))
         registered = True
         if source.is_symlink() or not source.is_file():
             raise ImportProblem('file_unavailable', '源文件不存在、不可读取或为软链接，请重新选择。')
