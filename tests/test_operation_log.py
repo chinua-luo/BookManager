@@ -108,7 +108,7 @@ class OperationLoggerTests(unittest.TestCase):
 
         migrate_library_home(source, target)
 
-        self.assertFalse((source / "logs").exists())
+        self.assertEqual(self.records(source)[0]["event"], "folder.create")
         self.assertEqual(self.records(target)[0]["event"], "folder.create")
 
 

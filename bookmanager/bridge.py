@@ -10,6 +10,8 @@ import threading
 import time
 import urllib.parse
 import uuid
+from contextlib import contextmanager
+from functools import wraps
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -30,6 +32,7 @@ from .store import (
     Item,
     LibraryStore,
     copy_library_home_atomically,
+    configured_library_home,
     delete_library_source_data,
     normalize_tag_names,
     safe_name,
@@ -176,12 +179,56 @@ def truncate_open_cache_file_name(file_name: str, max_bytes: int = MAX_OPEN_CACH
     return f"{truncated or 'bookmanager'}{suffix}"
 
 
+class _MigrationGate:
+    """Allow concurrent requests, but drain them before changing library homes."""
+
+    def __init__(self) -> None:
+        self.condition = threading.Condition()
+        self.readers = 0
+        self.writer = False
+        self.waiting_writers = 0
+
+    @contextmanager
+    def hold(self, exclusive: bool = False):
+        with self.condition:
+            if exclusive:
+                self.waiting_writers += 1
+                try:
+                    self.condition.wait_for(lambda: not self.writer and self.readers == 0)
+                    self.writer = True
+                finally:
+                    self.waiting_writers -= 1
+            else:
+                self.condition.wait_for(lambda: not self.writer and self.waiting_writers == 0)
+                self.readers += 1
+        try:
+            yield
+        finally:
+            with self.condition:
+                if exclusive:
+                    self.writer = False
+                else:
+                    self.readers -= 1
+                self.condition.notify_all()
+
+
+def _migration_guard(method):
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        server = getattr(self, "server", self)
+        exclusive = urllib.parse.urlparse(getattr(self, "path", "")).path == "/api/settings/data/migrate"
+        with server._migration_gate.hold(exclusive):
+            return method(self, *args, **kwargs)
+    return guarded
+
+
 class BridgeServer(ThreadingHTTPServer):
     # A handful of renderer windows plus startup probes never need dozens of
     # sockets; a larger listen backlog absorbs short bursts instead.
     request_queue_size = 64
 
     def __init__(self, address: tuple[str, int], library_home: Path | None, token: str, static_dir: Path) -> None:
+        self._migration_gate = _MigrationGate()
         self._request_slots = threading.BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
         super().__init__(address, BridgeRequestHandler)
         self.library_home = library_home
@@ -225,6 +272,7 @@ class BridgeServer(ThreadingHTTPServer):
         finally:
             self._request_slots.release()
 
+    @_migration_guard
     def _apply_startup_cache_policy(self) -> None:
         try:
             store = self.open_store()
@@ -318,6 +366,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         self._send_security_headers()
         self.end_headers()
 
+    @_migration_guard
     def do_GET(self) -> None:  # noqa: N802
         self._response_started = False
         parsed = urllib.parse.urlparse(self.path)
@@ -338,6 +387,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 if not getattr(self, '_response_started', False):
                     self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, 'Frontend unavailable')
 
+    @_migration_guard
     def do_POST(self) -> None:  # noqa: N802
         self._response_started = False
         with diagnostic_scope(self.server.library_home):
@@ -1052,33 +1102,16 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             return
         if target.exists() and any(target.iterdir()):
             raise ValueError("新的数据文件夹必须为空")
-        target_existed = target.exists()
-        copied = False
-        configured = False
+        # Keep both verified copies if saving configuration fails: replacement may
+        # already have succeeded before an error was reported. Never delete a home
+        # that persistent configuration could now reference.
+        copy_library_home_atomically(source, target)
         try:
-            # Copy first: a failure here leaves both the source and the config untouched.
-            copied = copy_library_home_atomically(source, target)
             set_configured_library_home(target)
-            configured = True
-            # Only remove the old copy after the new library and its config are durable.
-            delete_library_source_data(source)
-        except Exception:
-            if configured:
-                try:
-                    set_configured_library_home(source)
-                except OSError as rollback_error:
-                    record_exception('data_home.config_rollback_failed', rollback_error, data_home=source)
-            if copied:
-                try:
-                    shutil.rmtree(target)
-                except OSError as cleanup_error:
-                    record_exception('data_home.target_cleanup_failed', cleanup_error, data_home=target)
-                if target_existed:
-                    try:
-                        target.mkdir(parents=True, exist_ok=True)
-                    except OSError as restore_error:
-                        record_exception('data_home.target_restore_failed', restore_error, data_home=target)
-            raise
+        except OSError:
+            if configured_library_home() != target:
+                raise
+            # Replacement succeeded; keep live and persisted homes in agreement.
         self.server.library_home = target
         self.server.operation_logger.set_data_home(target)
         record_event("data_home.migrated", data_home=target)

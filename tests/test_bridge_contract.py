@@ -368,7 +368,7 @@ class BridgeContractTests(unittest.TestCase):
             self.server.open_store()
         store_class.assert_called_once_with(self.server.library_home, run_maintenance=False)
 
-    def test_data_migration_copies_then_writes_config_then_deletes_source(self):
+    def test_data_migration_copies_then_writes_config_and_retains_source(self):
         import bookmanager.store as store_module
 
         source = self.server.library_home
@@ -398,28 +398,59 @@ class BridgeContractTests(unittest.TestCase):
             status, result = self.request('/api/settings/data/migrate', {'path': str(target)})
         self.assertEqual(status, 200)
         self.assertTrue(result['ok'])
-        self.assertEqual(events, ['copy', 'config', 'delete'])
+        self.assertEqual(events, ['copy', 'config'])
         self.assertEqual(self.server.library_home, target.resolve())
         self.assertTrue((target / 'library.db').is_file())
-        self.assertFalse((source / 'library.db').exists())
+        self.assertTrue((source / 'library.db').exists())
 
-    def test_data_migration_rolls_back_config_and_target_when_source_removal_fails(self):
+    def test_data_migration_config_failure_retains_both_copies(self):
         source = self.server.library_home
         target = self.root / 'moved-data'
         settings_path = self.root / 'settings.json'
-
         with (
             mock.patch('bookmanager.store.SETTINGS_PATH', settings_path),
-            mock.patch('bookmanager.bridge.delete_library_source_data', side_effect=OSError('cannot delete source')),
+            mock.patch('bookmanager.bridge.set_configured_library_home', side_effect=OSError('config failed')),
         ):
             status, result = self.request('/api/settings/data/migrate', {'path': str(target)})
-
         self.assertEqual(status, 400)
-        self.assertEqual(result['error_type'], 'migration_failed')
         self.assertEqual(self.server.library_home, source)
-        self.assertEqual(json.loads(settings_path.read_text(encoding='utf-8'))['data_home'], str(source.resolve()))
-        self.assertFalse(target.exists())
+        self.assertFalse(settings_path.exists())
+        self.assertTrue((target / 'library.db').is_file())
         self.assertTrue((source / 'library.db').is_file())
+
+    def test_data_migration_config_error_after_replace_preserves_configured_home(self):
+        from bookmanager.store import set_configured_library_home
+        source = self.server.library_home
+        target = self.root / 'moved-data'
+        settings_path = self.root / 'settings.json'
+        def save_then_fail(home):
+            set_configured_library_home(home)
+            raise OSError('error after replacement')
+        with (
+            mock.patch('bookmanager.store.SETTINGS_PATH', settings_path),
+            mock.patch('bookmanager.bridge.set_configured_library_home', side_effect=save_then_fail),
+        ):
+            status, _ = self.request('/api/settings/data/migrate', {'path': str(target)})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.server.library_home, target.resolve())
+        self.assertEqual(json.loads(settings_path.read_text(encoding='utf-8'))['data_home'], str(target.resolve()))
+        self.assertTrue((target / 'library.db').is_file())
+        self.assertTrue((source / 'library.db').is_file())
+
+    def test_migration_waits_for_active_library_work(self):
+        from bookmanager.bridge import _MigrationGate
+        gate = _MigrationGate()
+        import threading
+        entered = threading.Event()
+        def migrate():
+            with gate.hold(exclusive=True):
+                entered.set()
+        with gate.hold():
+            worker = threading.Thread(target=migrate)
+            worker.start()
+            self.assertFalse(entered.wait(0.05))
+        worker.join(3)
+        self.assertTrue(entered.is_set())
 
     def test_data_migration_copy_failure_leaves_config_and_source_untouched(self):
         source = self.server.library_home

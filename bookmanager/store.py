@@ -138,10 +138,8 @@ def set_configured_library_home(home: Path) -> None:
 
 
 def migrate_library_home(source: Path, target: Path) -> None:
-    """Copy the complete data directory atomically, then remove the old source files."""
-    if not copy_library_home_atomically(source, target):
-        return
-    delete_library_source_data(source)
+    """Publish a verified copy while retaining the source for recovery."""
+    copy_library_home_atomically(source, target)
 
 
 def copy_library_home_atomically(source: Path, target: Path) -> bool:
@@ -154,6 +152,8 @@ def copy_library_home_atomically(source: Path, target: Path) -> bool:
     target = target.expanduser().resolve()
     if source == target:
         return False
+    if source in target.parents or target in source.parents:
+        raise OSError("源和目标数据文件夹不能互相包含")
     if not source.joinpath("library.db").exists():
         raise OSError(f"找不到资料库数据库：{source / 'library.db'}")
     if target.exists() and (not target.is_dir() or any(target.iterdir())):
@@ -163,16 +163,33 @@ def copy_library_home_atomically(source: Path, target: Path) -> bool:
     staging = target.parent / f"{MIGRATION_STAGING_PREFIX}{target.name}-{uuid.uuid4().hex}"
     try:
         staging.mkdir()
+        # SQLite backup includes committed WAL frames in one consistent snapshot.
+        if (source / "library.db").is_symlink():
+            raise OSError("数据库不能为软链接")
+        source_db = sqlite3.connect((source / "library.db").as_uri() + "?mode=ro", uri=True)
+        staged_db = sqlite3.connect(str(staging / "library.db"))
+        try:
+            source_db.backup(staged_db)
+        finally:
+            staged_db.close()
+            source_db.close()
         for name in LIBRARY_DATA_NAMES:
+            if name.startswith("library.db"):
+                continue
             source_path = source / name
+            if source_path.is_symlink():
+                raise OSError("迁移源目录含有软链接")
             if not source_path.exists():
                 continue
             target_path = staging / name
             if source_path.is_dir():
-                shutil.copytree(source_path, target_path)
+                shutil.copytree(source_path, target_path, symlinks=True, copy_function=shutil.copy2)
             else:
                 shutil.copy2(source_path, target_path)
+        if any(path.is_symlink() for path in staging.rglob("*")):
+            raise OSError("迁移目录含有软链接")
         _rewrite_blob_paths_in_database(staging / "library.db", source / "blobs", target / "blobs")
+        _validate_migration_staging(staging, target)
         (staging / MIGRATION_COMPLETE_MARKER).write_text(utc_now(), encoding="utf-8")
         if target.exists():
             target.rmdir()
@@ -188,6 +205,27 @@ def copy_library_home_atomically(source: Path, target: Path) -> bool:
     except OSError:
         record_exception('store.migration_marker_cleanup_failed', data_home=target)
     return True
+
+
+def _validate_migration_staging(staging: Path, target: Path) -> None:
+    """Verify the exact staged snapshot and every blob before publication."""
+    conn = sqlite3.connect(str(staging / "library.db"))
+    try:
+        if conn.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+            raise OSError("迁移数据库完整性校验失败")
+        if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise OSError("迁移数据库外键校验失败")
+        for digest, size, stored_path in conn.execute("SELECT sha256, size, stored_path FROM blobs"):
+            try:
+                relative = Path(stored_path).relative_to(target / "blobs")
+                blob = (staging / "blobs" / relative).resolve()
+                blob.relative_to((staging / "blobs").resolve())
+            except ValueError as exc:
+                raise OSError("迁移 Blob 路径不在资料库内") from exc
+            if sha256_file(blob) != (digest, size):
+                raise OSError("迁移 Blob 完整性校验失败")
+    finally:
+        conn.close()
 
 
 def _remove_stale_migration_staging(target: Path) -> None:
@@ -268,14 +306,10 @@ def _rewrite_blob_paths_in_database(db_path: Path, old_blob_dir: Path, new_blob_
         rows = conn.execute("SELECT sha256, stored_path FROM blobs").fetchall()
         updates: list[tuple[str, str]] = []
         for sha256, stored_path in rows:
-            stored_blob_path = Path(stored_path)
             try:
-                relative_path = stored_blob_path.relative_to(old_blob_dir)
-            except ValueError:
-                try:
-                    relative_path = stored_blob_path.resolve().relative_to(old_blob_dir.resolve())
-                except ValueError:
-                    continue
+                relative_path = managed_blob_path(old_blob_dir, stored_path, sha256).relative_to(old_blob_dir)
+            except ValueError as exc:
+                raise OSError("迁移 Blob 路径无效") from exc
             updates.append((str(new_blob_dir / relative_path), str(sha256)))
         if updates:
             conn.executemany("UPDATE blobs SET stored_path = ? WHERE sha256 = ?", updates)

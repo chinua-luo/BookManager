@@ -43,7 +43,7 @@ class LibraryMigrationTests(unittest.TestCase):
     def staging_paths(self):
         return [path for path in self.root.iterdir() if path.name.startswith(MIGRATION_STAGING_PREFIX)]
 
-    def test_successful_migration_moves_the_library_and_removes_the_source(self):
+    def test_successful_migration_copies_the_library_and_retains_the_source(self):
         source = self.root / 'old'
         target = self.root / 'new'
         target.mkdir()  # preflight creates the empty target before migrating
@@ -52,8 +52,8 @@ class LibraryMigrationTests(unittest.TestCase):
         migrate_library_home(source, target)
 
         self.assertTrue((target / 'library.db').is_file())
-        self.assertFalse((source / 'library.db').exists())
-        self.assertFalse((source / 'blobs').exists())
+        self.assertTrue((source / 'library.db').exists())
+        self.assertTrue((source / 'blobs').exists())
         self.assertEqual(self.staging_paths(), [])
         self.assertFalse((target / MIGRATION_COMPLETE_MARKER).exists())
         store = LibraryStore(target)
@@ -212,12 +212,75 @@ class LibraryMigrationTests(unittest.TestCase):
         self.assertEqual(resolved, target)
         self.assertTrue(migrated)
         self.assertTrue((target / 'library.db').is_file())
-        self.assertFalse((source / 'library.db').exists())
+        self.assertTrue((source / 'library.db').exists())
         store = LibraryStore(resolved)
         try:
             self.assertEqual(store.get_item(item_id).name_parts.extension, '.txt')
         finally:
             store.close()
+
+    def test_nested_homes_are_rejected_before_creating_staging(self):
+        source = self.root / 'old'
+        self.make_library(source)
+        for target in (source / 'child', self.root):
+            with self.subTest(target=target), self.assertRaisesRegex(OSError, '不能互相包含'):
+                migrate_library_home(source, target)
+        self.assertFalse((source / 'child').exists())
+        self.assertEqual(self.staging_paths(), [])
+
+    def test_backup_includes_committed_wal_without_copying_sidecars(self):
+        source, target = self.root / 'old', self.root / 'new'
+        store = LibraryStore(source)
+        try:
+            store.conn.execute('PRAGMA wal_autocheckpoint = 0')
+            with store.conn:
+                store.conn.execute("UPDATE folders SET name = 'WAL name' WHERE id = 1")
+            self.assertTrue((source / 'library.db-wal').exists())
+            import shutil
+            original = shutil.copy2
+            def copy(src, dst, *args, **kwargs):
+                self.assertFalse(Path(src).name.startswith('library.db'))
+                return original(src, dst, *args, **kwargs)
+            with mock.patch('bookmanager.store.shutil.copy2', side_effect=copy):
+                migrate_library_home(source, target)
+            with sqlite3.connect(target / 'library.db') as conn:
+                self.assertEqual(conn.execute('SELECT name FROM folders WHERE id = 1').fetchone()[0], 'WAL name')
+        finally:
+            store.close()
+
+    def test_invalid_blob_or_foreign_key_never_publishes_target(self):
+        for corruption in ('hash', 'missing', 'foreign_key', 'outside'):
+            with self.subTest(corruption=corruption):
+                source, target = self.root / corruption, self.root / (corruption + '-target')
+                item = self.make_library(source)
+                if corruption == 'hash':
+                    item.stored_path.write_bytes(b'corrupt')
+                elif corruption == 'missing':
+                    item.stored_path.unlink()
+                else:
+                    with sqlite3.connect(source / 'library.db') as conn:
+                        if corruption == 'foreign_key':
+                            conn.execute('UPDATE items SET document_id = 999999')
+                        else:
+                            conn.execute('UPDATE blobs SET stored_path = ?', (str(self.root / 'Book.txt'),))
+                with self.assertRaises(OSError):
+                    migrate_library_home(source, target)
+                self.assertFalse(target.exists())
+                self.assertTrue((source / 'library.db').exists())
+                self.assertEqual(self.staging_paths(), [])
+
+    def test_staged_corruption_is_detected_before_publication(self):
+        source, target = self.root / 'old', self.root / 'new'
+        self.make_library(source)
+        from bookmanager.store import _rewrite_blob_paths_in_database
+        def corrupt(db, old, new):
+            _rewrite_blob_paths_in_database(db, old, new)
+            db.write_bytes(b'not sqlite')
+        with mock.patch('bookmanager.store._rewrite_blob_paths_in_database', side_effect=corrupt):
+            with self.assertRaises(OSError):
+                migrate_library_home(source, target)
+        self.assertFalse(target.exists())
+        self.assertTrue((source / 'library.db').exists())
 
     def test_legacy_name_parts_cleans_unsupported_characters(self):
         for dirty in (

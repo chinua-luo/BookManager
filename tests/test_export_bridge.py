@@ -76,7 +76,9 @@ class ExportBridgeTests(unittest.TestCase):
         body = response.read()
         status = response.status
         connection.close()
-        return status, json.loads(body)
+        # Response bytes may arrive before the handler finishes writing its log.
+        with self.server._migration_gate.hold(exclusive=True):
+            return status, json.loads(body)
 
     def diagnostics(self) -> list[dict[str, object]]:
         log_dir = self.server.library_home / "logs"

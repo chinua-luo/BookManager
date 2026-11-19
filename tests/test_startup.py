@@ -104,7 +104,7 @@ class StartupTests(unittest.TestCase):
                 home, _capabilities = preflight(None, self.static)
         self.assertEqual(home, self.home)
         self.assertTrue((self.home / 'library.db').is_file())
-        self.assertFalse((source / 'library.db').exists())
+        self.assertTrue((source / 'library.db').exists())
 
     def test_real_bootstrap_outputs_structured_failure_and_persistent_traceback(self):
         # A real subprocess validates the preflight/lifecycle boundary without a GUI.
@@ -161,6 +161,6 @@ class StartupTests(unittest.TestCase):
                 home, _capabilities = preflight(None, self.static)
         self.assertEqual(home, self.home)
         self.assertTrue((self.home / 'library.db').is_file())
-        self.assertFalse((source / 'library.db').exists())
+        self.assertTrue((source / 'library.db').exists())
         self.assertEqual([path for path in self.root.iterdir() if path.name.startswith('.bookmanager-migration-')], [])
         self.assertFalse((self.home / '.bookmanager-migration-complete').exists())
