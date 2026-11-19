@@ -916,7 +916,7 @@ class LibraryStore:
                 record_event('store.cache_manifest_invalid', data_home=self.home)
                 continue
 
-        # Later-edited open copies win when the same document was opened twice.
+        # Apply independent edits deterministically; divergent copies are retained.
         for _modified_at, entry in sorted(entries, key=lambda value: value[0]):
             if self._sync_open_cache_entry(entry, strict=strict):
                 changed_count += 1
@@ -939,8 +939,7 @@ class LibraryStore:
         row = self.conn.execute(
             "SELECT current_hash FROM documents WHERE id = ?", (document_id,)
         ).fetchone()
-        if row is None:
-            return False
+        current_hash = str(row['current_hash']) if row else None
         try:
             cached_stat = cached_path.stat()
         except OSError:
@@ -959,7 +958,7 @@ class LibraryStore:
         if (
             source_hash
             and manifest_stat == (cached_stat.st_size, cached_stat.st_mtime_ns)
-            and str(row["current_hash"]) == source_hash
+            and current_hash == source_hash
         ):
             return False
         try:
@@ -969,18 +968,23 @@ class LibraryStore:
             if strict:
                 raise
             return False
-        if cached_hash == str(row["current_hash"]):
-            return False
+        if cached_hash == source_hash:
+            return False  # This copy was never edited, even if the library moved on.
         try:
-            document_id = self.replace_document_content(document_id, cached_path)
+            if cached_hash == current_hash:
+                manifest.update(source_hash=cached_hash, size=cached_stat.st_size, mtime_ns=cached_stat.st_mtime_ns)
+                self._write_open_cache_manifest(cache_dir, manifest)
+                return False
+            if current_hash != source_hash:
+                raise ValueError('打开副本与书库版本冲突')
+            document_id = self.replace_document_content(document_id, cached_path, expected_hash=source_hash, copy_hash=cached_hash)
         except (OSError, ValueError):
             record_exception('store.open_cache_writeback_failed', data_home=self.home)
             if strict:
                 raise
             return False
         try:
-            stat = cached_path.stat()
-            manifest.update(document_id=document_id, source_hash=cached_hash, size=stat.st_size, mtime_ns=stat.st_mtime_ns)
+            manifest.update(document_id=document_id, source_hash=cached_hash, size=cached_stat.st_size, mtime_ns=cached_stat.st_mtime_ns)
             self._write_open_cache_manifest(cache_dir, manifest)
         except OSError:
             record_exception('store.cache_manifest_invalid', data_home=self.home)
@@ -2095,7 +2099,7 @@ class LibraryStore:
                 ),
             )
 
-    def replace_document_content(self, document_id: int, source_path: Path) -> int:
+    def replace_document_content(self, document_id: int, source_path: Path, *, expected_hash: str | None = None, copy_hash: str | None = None) -> int:
         source_path = Path(source_path)
         if source_path.is_symlink() or not source_path.is_file():
             raise ValueError("文件路径无效或为软链接")
@@ -2109,10 +2113,14 @@ class LibraryStore:
             prepared.temp_path.unlink(missing_ok=True)
             raise
         blob_hash = prepared.sha256
-        existing_document_id = self._find_document_by_hash(blob_hash)
         now = utc_now()
 
-        with self.conn:
+        with self.transaction():
+            if expected_hash is not None:
+                current = self.conn.execute('SELECT current_hash FROM documents WHERE id=?', (document_id,)).fetchone()
+                if not current or current[0] != expected_hash or blob_hash != copy_hash:
+                    raise ValueError('打开副本与书库版本冲突；已保留副本，请从 open_cache 另存后处理。')
+            existing_document_id = self._find_document_by_hash(blob_hash)
             if existing_document_id is not None and existing_document_id != document_id:
                 self.conn.execute(
                     "UPDATE items SET document_id = ?, updated_at = ? WHERE document_id = ?",

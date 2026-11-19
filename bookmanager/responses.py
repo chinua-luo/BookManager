@@ -53,6 +53,8 @@ def failure_details(error: BaseException | str, path: str = '', status: int = 40
         kind, msg = 'search_failed', '搜索执行失败，请检查搜索条件后重试'
     elif '/crawl' in path:
         kind, msg = 'crawl_failed', '爬取失败，请检查网址、网络连接和站点访问限制'
+    elif '打开副本与书库版本冲突' in text:
+        kind, msg = 'open_cache_conflict', '书库和打开副本的版本不同。已保留两份内容，请从 open_cache 另存编辑稿后处理。'
     elif '/settings/cache/clear' in path:
         kind, msg = 'cache_clear_failed', '缓存清理失败，请关闭正在使用缓存文件的程序后重试'
     elif '/settings/data' in path:

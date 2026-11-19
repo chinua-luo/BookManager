@@ -52,7 +52,7 @@ class OpenCacheSyncTests(unittest.TestCase):
         self.assertEqual(item.stored_path.read_text(encoding="utf-8"), "changed")
         self.assertEqual(self.store.sync_open_cache_changes(), 0)
 
-    def test_last_modified_copy_wins_and_can_restore_original_content(self) -> None:
+    def test_divergent_copies_preserved_and_conflict_blocks_cleanup(self) -> None:
         older = self.open_copy("older")
         newer = self.open_copy("newer")
         older.write_text("older edit", encoding="utf-8")
@@ -61,10 +61,13 @@ class OpenCacheSyncTests(unittest.TestCase):
         os.utime(older, (now - 10, now - 10))
         os.utime(newer, (now, now))
 
-        self.assertEqual(self.store.sync_open_cache_changes(), 2)
+        self.assertEqual(self.store.sync_open_cache_changes(), 1)
+        with self.assertRaisesRegex(ValueError, "冲突"):
+            self.store.clear_cache("open_cache")
+        self.assertEqual(newer.read_text(encoding="utf-8"), "newer edit")
         self.assertEqual(
             self.store.get_item(self.item_id).stored_path.read_text(encoding="utf-8"),
-            "newer edit",
+            "older edit",
         )
 
         older.write_text("original", encoding="utf-8")
@@ -75,6 +78,14 @@ class OpenCacheSyncTests(unittest.TestCase):
             "original",
         )
 
+
+    def test_old_unedited_copy_does_not_revert_replacement(self):
+        self.open_copy("old")
+        self.source.write_bytes(b"replacement")
+        item = self.store.get_item(self.item_id)
+        self.store.replace_document_content(item.document_id, self.source)
+        self.assertEqual(self.store.sync_open_cache_changes(strict=True), 0)
+        self.assertEqual(self.store.get_item(self.item_id).stored_path.read_bytes(), b"replacement")
 
     def test_unedited_open_copies_are_not_hashed_again(self) -> None:
         cached_path = self.open_copy("fast-path")
