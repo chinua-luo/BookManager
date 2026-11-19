@@ -160,14 +160,26 @@ def _create_staging(parent: Path) -> Path:
 
 
 def _write_tree(snapshot: FolderExportSnapshot, staging: Path) -> None:
-    """Materialise empty folders first, then copy every item exactly once."""
-    for entry in snapshot.folders:
-        _inside(staging, entry.relative_parts).mkdir(parents=True, exist_ok=True)
+    """Allocate directories and files in one namespace per exported parent."""
     used_names: dict[tuple[str, ...], set[str]] = {}
+    paths: dict[tuple[str, ...], Path] = {(): staging}
+
+    def directory(parts: tuple[str, ...]) -> Path:
+        if parts not in paths:
+            parent = directory(parts[:-1])
+            names = used_names.setdefault(parts[:-1], set())
+            name = _unique_file_name(names, _safe_folder_name(parts[-1]), directory=True)
+            paths[parts] = parent / name
+            paths[parts].mkdir()
+        return paths[parts]
+
+    for entry in snapshot.folders:
+        directory(entry.relative_parts)
     for entry in snapshot.items:
+        parent = directory(entry.relative_parts)
         names = used_names.setdefault(entry.relative_parts, set())
         name = _unique_file_name(names, _item_file_name(entry))
-        clone_or_copy(entry.stored_path, _inside(staging, entry.relative_parts) / name)
+        clone_or_copy(entry.stored_path, parent / name)
 
 
 def _inside(root: Path, relative_parts: tuple[str, ...]) -> Path:
@@ -210,27 +222,61 @@ def _fallback_file_name(display_name: str, suffix: str) -> str:
     return name
 
 
-def _unique_file_name(used: set[str], name: str) -> str:
-    """Append `` (2)``, `` (3)`` … before the extension until the name is free."""
-    if name.casefold() not in used:
-        used.add(name.casefold())
+def _unique_file_name(used: set[str], name: str, *, directory: bool = False) -> str:
+    """Reserve a Unicode/case-insensitive name, including generated suffixes."""
+    import unicodedata
+
+    def key(value: str) -> str:
+        return unicodedata.normalize("NFC", unicodedata.normalize("NFC", value).casefold())
+
+    if key(name) not in used:
+        used.add(key(name))
         return name
     path = Path(name)
-    stem, suffix = (path.stem, path.suffix) if path.stem else (name, "")
+    stem, suffix = (path.stem, path.suffix) if not directory and path.stem else (name, "")
     index = 2
     while True:
         candidate = f"{stem} ({index}){suffix}"
-        if candidate.casefold() not in used:
-            used.add(candidate.casefold())
+        if key(candidate) not in used:
+            used.add(key(candidate))
             return candidate
         index += 1
 
 
+def _rename_exclusive(staging: Path, target: Path) -> None:
+    """Atomically publish without replacing any destination; never fall back."""
+    import ctypes
+    import sys
+
+    if sys.platform == "win32":
+        # Windows rename fails if the destination exists (including directories).
+        os.rename(staging, target)
+        return
+    if sys.platform not in {"darwin", "linux"}:
+        raise OSError(errno.ENOTSUP, "Exclusive directory rename is unsupported")
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        if sys.platform == "darwin":
+            rename = libc.renamex_np
+            rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+            arguments = (os.fsencode(staging), os.fsencode(target), 0x00000004)  # RENAME_EXCL
+        else:
+            rename = libc.renameat2
+            rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+            arguments = (-100, os.fsencode(staging), -100, os.fsencode(target), 1)  # RENAME_NOREPLACE
+    except AttributeError as error:
+        raise OSError(errno.ENOTSUP, "Exclusive directory rename is unavailable") from error
+    rename.restype = ctypes.c_int
+    if rename(*arguments) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+
+
 def _commit_staging(staging: Path, target: Path, folder: Folder) -> None:
     try:
-        os.replace(staging, target)
+        _rename_exclusive(staging, target)
     except OSError as error:
-        if error.errno in {errno.EEXIST, errno.ENOTEMPTY, errno.ENOTDIR}:
+        if error.errno in {errno.EEXIST, errno.ENOTEMPTY, errno.ENOTDIR} or getattr(error, "winerror", None) in {80, 183}:
             raise _conflict(folder) from error
         raise
 
